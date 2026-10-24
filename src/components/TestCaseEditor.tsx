@@ -1,0 +1,80 @@
+import type { TestCase } from "../api";
+
+interface Props {
+  tests: TestCase[];
+  onChange: (tests: TestCase[]) => void;
+  trimWhitespace: boolean;
+  onTrimChange: (v: boolean) => void;
+}
+
+let nextId = 1000;
+export const newTestCase = (n: number): TestCase => ({
+  id: nextId++,
+  name: `Test ${n}`,
+  input: "",
+  expected: "",
+});
+
+export function TestCaseEditor({ tests, onChange, trimWhitespace, onTrimChange }: Props) {
+  const update = (id: number, patch: Partial<TestCase>) =>
+    onChange(tests.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+
+  return (
+    <section className="card">
+      <div className="card-header">
+        <h2>Testfälle</h2>
+        <label className="inline small">
+          <input
+            type="checkbox"
+            checked={trimWhitespace}
+            onChange={(e) => onTrimChange(e.target.checked)}
+          />{" "}
+          Leerzeichen am Zeilenende und Leerzeilen am Ende ignorieren
+        </label>
+      </div>
+      {tests.length === 0 && <p className="muted">Noch keine Testfälle angelegt.</p>}
+      {tests.map((t) => (
+        <div key={t.id} className="testcase">
+          <div className="row">
+            <input
+              className="test-name"
+              value={t.name}
+              onChange={(e) => update(t.id, { name: e.target.value })}
+              aria-label="Name des Testfalls"
+            />
+            <button
+              className="danger"
+              onClick={() => onChange(tests.filter((x) => x.id !== t.id))}
+              title="Testfall entfernen"
+            >
+              Entfernen
+            </button>
+          </div>
+          <div className="io">
+            <label>
+              Eingabe (stdin)
+              <textarea
+                rows={4}
+                value={t.input}
+                spellCheck={false}
+                onChange={(e) => update(t.id, { input: e.target.value })}
+              />
+            </label>
+            <label>
+              Erwartete Ausgabe (stdout)
+              <textarea
+                rows={4}
+                value={t.expected}
+                spellCheck={false}
+                onChange={(e) => update(t.id, { expected: e.target.value })}
+              />
+            </label>
+          </div>
+        </div>
+      ))}
+      <button onClick={() => onChange([...tests, newTestCase(tests.length + 1)])}>
+        + Testfall hinzufügen
+      </button>
+    </section>
+  );
+}
