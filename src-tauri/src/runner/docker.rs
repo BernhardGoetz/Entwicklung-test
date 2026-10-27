@@ -1,7 +1,11 @@
 //! Thin layer over the Docker Engine API (bollard): engine discovery,
-//! image pulls and a hardened, short-lived sandbox container.
+//! image pulls/loads and a hardened, short-lived sandbox container.
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -9,9 +13,11 @@ use bollard::container::LogOutput;
 use bollard::exec::StartExecResults;
 use bollard::models::{ContainerCreateBody, ExecConfig, HostConfig, ResourcesUlimits};
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ImportImageOptionsBuilder,
+    RemoveContainerOptionsBuilder, TagImageOptionsBuilder,
 };
 use bollard::Docker;
+use bytes::Bytes;
 use futures_util::StreamExt;
 use serde::Serialize;
 
@@ -44,7 +50,8 @@ pub fn candidate_hosts() -> Vec<String> {
     {
         return vec![h];
     }
-    // Podman's pipe as reported by `podman machine inspect` (Windows only).
+    // Podman's pipe (Windows) or machine socket (macOS) as reported by
+    // `podman machine inspect`.
     let mut hosts: Vec<String> = engine::discovered_podman_host().into_iter().collect();
     #[cfg(unix)]
     {
@@ -141,6 +148,142 @@ pub async fn pull_image(
             percent,
         });
     }
+    Ok(())
+}
+
+/// Architecture of the engine (its Linux VM on Windows/macOS) as reported
+/// by `/version`, e.g. `amd64` or `arm64`.
+pub async fn engine_arch(docker: &Docker) -> Option<String> {
+    docker
+        .version()
+        .await
+        .ok()
+        .and_then(|v| v.arch)
+        .filter(|a| !a.is_empty())
+}
+
+/// Counts the compressed bytes read from the archive (for progress).
+struct CountingReader<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Image name or ID from a `/images/load` status line
+/// (`Loaded image: <ref>` / `Loaded image ID: sha256:…`; Podman may list
+/// several names separated by commas).
+pub fn parse_loaded(line: &str) -> Vec<String> {
+    let line = line.trim();
+    let rest = line
+        .strip_prefix("Loaded image ID:")
+        .or_else(|| line.strip_prefix("Loaded image:"))
+        .or_else(|| line.strip_prefix("Loaded image(s):"));
+    rest.map(|r| {
+        r.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Loads a gzip-compressed `docker save` archive into the engine's image
+/// store (`POST /images/load`, also offered by Podman's compat API). The
+/// archive is decompressed here and streamed as plain tar, so it works the
+/// same for Docker and Podman. Returns the names/IDs the engine reported.
+pub async fn load_image_archive(
+    docker: &Docker,
+    archive: &Path,
+    image: &str,
+    mut on_progress: impl FnMut(Option<u8>),
+) -> Result<Vec<String>, RunnerError> {
+    let shown = archive.display().to_string();
+    let err = |detail: String| RunnerError::ImageLoad(shown.clone(), detail);
+    let file = std::fs::File::open(archive).map_err(|e| err(e.to_string()))?;
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let read = Arc::new(AtomicU64::new(0));
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+    let counter = read.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut gz = flate2::read::GzDecoder::new(CountingReader {
+            inner: std::io::BufReader::new(file),
+            count: counter,
+        });
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let item = match gz.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => Ok(Bytes::copy_from_slice(&buf[..n])),
+                Err(e) => Err(e),
+            };
+            let failed = item.is_err();
+            if tx.blocking_send(item).is_err() || failed {
+                break;
+            }
+        }
+    });
+    let body = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let opts = ImportImageOptionsBuilder::default().quiet(true).build();
+    let mut stream = docker.import_image_stream(opts, body, None);
+
+    let mut loaded = Vec::new();
+    let mut ticker = tokio::time::interval(Duration::from_millis(500));
+    let result = loop {
+        tokio::select! {
+            item = stream.next() => match item {
+                None => break Ok(()),
+                Some(Err(e)) => break Err(err(e.to_string())),
+                Some(Ok(info)) => {
+                    if let Some(msg) = info.error_detail.and_then(|d| d.message) {
+                        break Err(err(msg));
+                    }
+                    for text in [info.stream, info.status].into_iter().flatten() {
+                        loaded.extend(parse_loaded(&text));
+                    }
+                }
+            },
+            _ = ticker.tick() => {
+                let done = read.load(Ordering::Relaxed);
+                on_progress((total > 0).then(|| ((done * 100) / total).min(100) as u8));
+            }
+        }
+    };
+    drop(stream);
+    let _ = reader.await;
+    result?;
+    on_progress(Some(100));
+    if loaded.is_empty() && !image_exists(docker, image).await? {
+        return Err(err("Die Engine hat kein geladenes Image gemeldet.".into()));
+    }
+    Ok(loaded)
+}
+
+/// Splits `registry/repo:tag` into repository and tag (default `latest`).
+pub fn split_ref(image: &str) -> (&str, &str) {
+    match image.rfind(':') {
+        Some(i) if !image[i + 1..].contains('/') => (&image[..i], &image[i + 1..]),
+        _ => (image, "latest"),
+    }
+}
+
+/// Tags `source` (name or ID) as `target`.
+pub async fn tag_image(docker: &Docker, source: &str, target: &str) -> Result<(), RunnerError> {
+    let (repo, tag) = split_ref(target);
+    let opts = TagImageOptionsBuilder::default()
+        .repo(repo)
+        .tag(tag)
+        .build();
+    docker.tag_image(source, Some(opts)).await?;
     Ok(())
 }
 
@@ -406,6 +549,33 @@ mod tests {
             .expect("fsize ulimit");
         assert_eq!(fsize.soft, Some(FSIZE_LIMIT));
         assert_eq!(fsize.hard, Some(FSIZE_LIMIT));
+    }
+
+    #[test]
+    fn loaded_lines_are_parsed() {
+        assert_eq!(
+            parse_loaded("Loaded image: ghcr.io/x/code-pruefer-python:1.0\n"),
+            vec!["ghcr.io/x/code-pruefer-python:1.0"]
+        );
+        assert_eq!(
+            parse_loaded("Loaded image ID: sha256:abc"),
+            vec!["sha256:abc"]
+        );
+        assert_eq!(parse_loaded("Loaded image: a:1, b:2"), vec!["a:1", "b:2"]);
+        assert!(parse_loaded("Loading layer 12 MB").is_empty());
+    }
+
+    #[test]
+    fn refs_split_into_repo_and_tag() {
+        assert_eq!(
+            split_ref("ghcr.io/x/code-pruefer-java:0.2.0"),
+            ("ghcr.io/x/code-pruefer-java", "0.2.0")
+        );
+        assert_eq!(
+            split_ref("localhost:5000/img"),
+            ("localhost:5000/img", "latest")
+        );
+        assert_eq!(split_ref("img"), ("img", "latest"));
     }
 
     #[test]

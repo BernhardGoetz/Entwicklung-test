@@ -42,6 +42,13 @@ winget-Aufruf) und `src-tauri/windows/installer.nsi` – das unveränderte Tauri
 `hooks.nsh` einfügt. Bei einem Update der Tauri-CLI das Template neu kopieren und diese
 Stelle (`CODE_PRUEFER_CUSTOM_PAGES`) wieder einfügen.
 
+### macOS
+
+Die DMGs (`*_aarch64.dmg` für Apple Silicon, `*_x64.dmg` für Intel) sind noch nicht
+signiert/notarisiert. Gatekeeper blockiert deshalb den ersten Start: im Finder
+Rechtsklick auf „Code-Prüfer“ → **Öffnen** → „Öffnen“ bestätigen. Alternativ im
+Terminal: `xattr -dr com.apple.quarantine "/Applications/Code-Prüfer.app"`.
+
 ### Engine-Auswahl und automatischer Start
 
 Die gewählte Engine wird so ermittelt (erste Quelle gewinnt):
@@ -57,11 +64,15 @@ Die gewählte Engine wird so ermittelt (erste Quelle gewinnt):
 Beim Start der App (bzw. wenn die Prüfung ergibt, dass die Engine nicht läuft) startet
 der Code-Prüfer die gewählte Engine und wartet, bis sie antwortet (alle 2 s, max. 120 s):
 
-- **Docker Desktop:** `Docker Desktop.exe` wird gestartet (macOS: `open -a Docker`).
+- **Docker Desktop:** `Docker Desktop.exe` wird gestartet (macOS:
+  `open -a /Applications/Docker.app`; Socket `~/.docker/run/docker.sock`).
 - **Podman:** existiert noch keine Maschine, wird einmalig `podman machine init`
   ausgeführt (lädt ein VM-Image, kann einige Minuten dauern), danach
   `podman machine start`. Unter Windows verbindet sich die App über die Named Pipe, die
-  `podman machine inspect` meldet (Standard: `\\.\pipe\podman-machine-default`).
+  `podman machine inspect` meldet (Standard: `\\.\pipe\podman-machine-default`), unter
+  macOS über den Socket der Maschine (`podman machine inspect`, Podman 5:
+  `$TMPDIR/podman/podman-machine-default-api.sock`). Der `podman`-Befehl wird auch ohne
+  PATH unter `/opt/podman/bin`, `/opt/homebrew/bin` und `/usr/local/bin` gefunden.
 - **Linux:** kein automatischer Start (Systemdienst) – bitte Docker bzw. Podman selbst
   starten.
 
@@ -74,8 +85,36 @@ zuerst probiert. Mit der Umgebungsvariable `DOCKER_HOST` (z. B.
 `unix:///pfad/zum/podman.sock` oder `npipe:////./pipe/podman-machine-default`) lässt
 sich der Endpunkt explizit festlegen; sie hat Vorrang vor der Engine-Auswahl.
 
-Beim ersten Prüfen einer Sprache wird das passende Runner-Image heruntergeladen
-(Fortschritt wird angezeigt); danach funktioniert die Prüfung offline.
+### Runner-Images (Python, Java)
+
+Release-Installer enthalten die Runner-Images als komprimierte Archive
+(`images/code-pruefer-<sprache>-<arch>.tar.gz` im Ressourcenordner der App). Sobald die
+Engine läuft, lädt die App fehlende Images automatisch in die **gewählte** Engine
+(Docker und Podman verwenden dasselbe Image-Format, aber getrennte Image-Speicher) – ganz
+ohne Internet und ohne manuelles `docker build`. Fortschritt wird im Statusbalken angezeigt.
+
+Reihenfolge, wenn eine Sprache verwendet wird (`src-tauri/src/runner/images.rs`):
+
+1. Umgebungsvariable `CODE_PRUEFER_PYTHON_IMAGE` / `CODE_PRUEFER_JAVA_IMAGE` (exklusiv:
+   lokal vorhanden, sonst Download);
+2. das gepinnte Image `ghcr.io/bernhardgoetz/code-pruefer-<sprache>:<App-Version>` ist in
+   der Engine bereits vorhanden;
+3. Laden aus dem mitgelieferten Archiv (Engine-API `POST /images/load`, auch von Podman
+   unterstützt; das Archiv wird von der App entpackt und als Tar gestreamt). Trägt das
+   geladene Image einen anderen Namen, wird es auf die erwartete Referenz getaggt;
+4. Download von GHCR;
+5. lokal gebautes `code-pruefer-<sprache>:dev`;
+6. sonst eine deutsche Fehlermeldung mit Lösungsweg.
+
+Die Architektur des Archivs richtet sich nach der Engine (`amd64` / `arm64`, ersatzweise
+nach dem Rechner: `x86_64` → `amd64`, `aarch64` → `arm64`).
+
+**„Images aktualisieren“** (Button im Statusbalken) lädt die gepinnten Images dieser
+App-Version erneut von GHCR. Schlägt das fehl (offline, Registry nicht erreichbar), bleiben
+die vorhandenen Images nutzbar.
+
+Ressourcenordner: Windows (Installer und portable Version) = Ordner der `code-pruefer.exe`,
+also `<Programmordner>\images\…`; macOS = `Code-Prüfer.app/Contents/Resources/images/`.
 
 ## Sicherheit der Ausführung
 
@@ -130,9 +169,47 @@ npm run tauri dev
 cd src-tauri && cargo test -- --ignored --test-threads=1
 ```
 
-Veröffentlichte Images: `ghcr.io/bernhardgoetz/code-pruefer-python:0.1.0` und
-`ghcr.io/bernhardgoetz/code-pruefer-java:0.1.0` (multi-arch amd64/arm64, gebaut durch
-`.github/workflows/images.yml`).
+Integrationstest für das Laden aus einem Archiv:
+`cd src-tauri && cargo test --test image_bundle -- --ignored --test-threads=1`.
+
+### Image-Versionen und Release
+
+- Image-Referenz der App: `<IMAGE_REGISTRY>/code-pruefer-<sprache>:<version>` mit
+  `IMAGE_REGISTRY = ghcr.io/bernhardgoetz` (`runner/languages.rs`) und `<version>` =
+  `CARGO_PKG_VERSION`. `Cargo.toml`, `tauri.conf.json` und `package.json` müssen dieselbe
+  Version haben (Unit-Test `versions_are_in_sync`).
+- Release auslösen: Version in den drei Dateien erhöhen, committen, Tag `v<version>`
+  pushen (z. B. `git tag v0.2.0 && git push origin v0.2.0`). Alternativ
+  „Run workflow“ für `.github/workflows/release.yml` (Option „Entwurfs-Release anlegen“).
+- Der Workflow prüft Tag/Versionen/Registry-Namensraum, baut die Images multi-arch
+  (linux/amd64, linux/arm64), pusht sie als `:<version>` nach GHCR, exportiert daraus die
+  Archive je Architektur (`scripts/export-image-archives.sh`, `MODE=pull` – identische
+  Digests wie online), baut den Windows-Installer (windows-latest, MSVC, NSIS deutsch) und
+  die macOS-DMGs (Apple Silicon und Intel) mit eingebetteten Images
+  (`--config src-tauri/tauri.release.conf.json`) und legt ein **Entwurfs-Release** an.
+  macOS-Signatur/Notarisierung ist vorbereitet, läuft aber nur, wenn das Secret
+  `APPLE_CERTIFICATE` (plus `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+  `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`) gesetzt ist.
+- `.github/workflows/images.yml` baut die Images bei Änderungen nur noch als `:edge` /
+  `:sha-…`; Versions-Tags kommen ausschließlich aus dem Release-Workflow.
+- GHCR-Namen müssen klein geschrieben sein (der Workflow wandelt den Owner um).
+- **Noch zu prüfen:** Nach dem ersten Push sind GHCR-Pakete standardmäßig **privat**. Für
+  den Online-Pfad („Images aktualisieren“, Download-Fallback) müssen
+  `code-pruefer-python` und `code-pruefer-java` einmalig unter GitHub → Packages →
+  Package settings → „Change visibility“ auf **public** gestellt werden.
+
+Normale Builds (`npm run tauri build`, CI) enthalten keine Images und bleiben klein; die
+App funktioniert dann über GHCR bzw. `:dev`. Lokaler Build mit eingebetteten Images:
+
+```sh
+scripts/export-image-archives.sh amd64     # -> src-tauri/resources/images/*.tar.gz (nicht eingecheckt)
+npm run tauri build -- --config src-tauri/tauri.release.conf.json
+# Windows-Installer unter Linux:
+npm run tauri build -- --target x86_64-pc-windows-gnu --bundles nsis --config src-tauri/tauri.release.conf.json
+```
+
+Portable Windows-Version: den Ordner `images` (mit den Archiven) neben `code-pruefer.exe`
+legen – unter Windows ist der Tauri-Ressourcenordner immer der Ordner der exe.
 
 ### Projektstruktur
 
@@ -140,15 +217,22 @@ Veröffentlichte Images: `ghcr.io/bernhardgoetz/code-pruefer-python:0.1.0` und
 src/                     React-Frontend (Monaco-Editor, Testfälle, Ergebnisse)
 src-tauri/src/
   lib.rs                 Tauri-Commands: docker_status, get_engine, set_engine,
-                         start_engine, list_languages, run_tests
+                         start_engine, list_languages, run_tests,
+                         prepare_images, update_images
   docker_detect.rs       Erkennung: nicht installiert / nicht gestartet / ok
   engine.rs              Engine-Auswahl (Datei/Registry), Start, Podman-Pipe
   runner/mod.rs          Ablauf einer Prüfung, Bewertung der Testfälle
-  runner/docker.rs       Engine-Verbindung, Image-Pull, gehärteter Container
+  runner/docker.rs       Engine-Verbindung, Image-Pull/-Load, gehärteter Container
+  runner/images.rs       Image-Auflösung: vorhanden → Archiv → GHCR → :dev
   runner/languages.rs    Sprachtabelle (Image, Dateiname, Befehle, Zeitlimits)
   runner/compare.rs      Normalisierung, Zeilen-Diff, Ausgabebegrenzung
 src-tauri/windows/       NSIS-Installer: Template + Hooks (Engine-Auswahl, winget)
+src-tauri/tauri.release.conf.json
+                         Release-Overlay: bündelt resources/images/*.tar.gz
 images/                  Dockerfiles der Runner-Images
+scripts/export-image-archives.sh
+                         Image-Archive für das Installationspaket erzeugen
+.github/workflows/       ci.yml, images.yml (edge), release.yml (Tags v*)
 ```
 
 Eine neue Sprache benötigt einen Eintrag in `runner/languages.rs` und ein Dockerfile
@@ -160,7 +244,8 @@ unter `images/`.
 - Testfälle werden manuell eingegeben; keine Speicherung von Aufgaben/Testfällen.
 - Vergleich nur über stdout (exakt bzw. mit Whitespace-Toleranz).
 - Builds sind nicht signiert (Windows SmartScreen / macOS Gatekeeper warnen), kein
-  Auto-Update.
+  Auto-Update der App (die Images lassen sich über „Images aktualisieren“ neu laden).
+- Mit eingebetteten Images ist der Installer deutlich größer (Java-Image ≈ 200 MB).
 - Benötigt eine Container-Engine (Docker Desktop oder Podman); der Windows-Installer kann
   sie über winget nachinstallieren.
 

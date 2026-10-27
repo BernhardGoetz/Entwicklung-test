@@ -63,7 +63,17 @@ export interface RunReport {
 
 export type Progress =
   | { kind: "pull"; image: string; status: string; percent: number | null }
+  | { kind: "load"; image: string; percent: number | null }
   | { kind: "phase"; message: string };
+
+/** German text for a progress event (runs, image preparation and updates). */
+export function progressText(p: Progress | null): string {
+  if (!p) return "Läuft …";
+  if (p.kind === "phase") return p.message;
+  const pct = p.percent !== null ? ` ${p.percent} %` : "";
+  if (p.kind === "load") return `Lade Image ${p.image} aus dem Installationspaket (einmalig):${pct}`;
+  return `Lade Image ${p.image} herunter:${pct} ${p.status}`;
+}
 
 export interface RunRequest {
   language: string;
@@ -96,3 +106,17 @@ export const setEngine = (engine: Engine) => invoke<EngineChoice>("set_engine", 
 export const startEngine = () => invoke<DockerStatus>("start_engine");
 export const onEngineProgress = (cb: (message: string) => void): Promise<UnlistenFn> =>
   listen<string>("engine-progress", (e) => cb(e.payload));
+
+export interface ImagesReport {
+  /** Languages whose image was loaded (prepare) or updated (update). */
+  done: string[];
+  /** German, non-fatal error messages. */
+  errors: string[];
+}
+
+/** Loads bundled image archives into the active engine if images are missing. */
+export const prepareImages = () => invoke<ImagesReport>("prepare_images");
+/** Pulls the pinned runner images from GHCR ("Images aktualisieren"). */
+export const updateImages = () => invoke<ImagesReport>("update_images");
+export const onImagesProgress = (cb: (p: Progress) => void): Promise<UnlistenFn> =>
+  listen<Progress>("images-progress", (e) => cb(e.payload));

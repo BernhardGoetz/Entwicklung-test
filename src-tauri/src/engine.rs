@@ -83,7 +83,8 @@ const PODMAN_CMD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PODMAN_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
-/// Podman's named pipe as reported by `podman machine inspect` (Windows).
+/// Podman's API endpoint as reported by `podman machine inspect`
+/// (Windows: named pipe, macOS: unix socket of the machine).
 static PODMAN_PIPE: Mutex<Option<String>> = Mutex::new(None);
 static PODMAN_PIPE_QUERIED: AtomicBool = AtomicBool::new(false);
 static STARTING: AtomicBool = AtomicBool::new(false);
@@ -208,15 +209,31 @@ pub fn pipe_path_to_host(path: &str) -> Option<String> {
     Some(format!("npipe://{p}"))
 }
 
-/// The Podman pipe found by the last `podman machine inspect`, if any.
+/// Converts the machine's API socket path on macOS (Podman 5:
+/// `$TMPDIR/podman/podman-machine-default-api.sock`) into a bollard host.
+pub fn socket_path_to_host(path: &str) -> Option<String> {
+    let p = path.trim();
+    (p.starts_with('/') && p.len() > 1).then(|| format!("unix://{p}"))
+}
+
+/// Podman endpoint from one line of `podman machine inspect` output.
+fn podman_endpoint_to_host(line: &str) -> Option<String> {
+    if cfg!(windows) {
+        pipe_path_to_host(line)
+    } else {
+        socket_path_to_host(line)
+    }
+}
+
+/// The Podman endpoint found by the last `podman machine inspect`, if any.
 pub fn discovered_podman_host() -> Option<String> {
     PODMAN_PIPE.lock().ok().and_then(|g| g.clone())
 }
 
-/// On Windows with Podman chosen, asks Podman once for its pipe so
-/// `candidate_hosts` can use it. No-op elsewhere.
+/// On Windows and macOS with Podman chosen, asks Podman once for its
+/// endpoint (pipe or socket) so `candidate_hosts` can use it. No-op elsewhere.
 pub async fn ensure_podman_pipe() {
-    if !cfg!(windows) || current().engine != Engine::Podman {
+    if !cfg!(any(windows, target_os = "macos")) || current().engine != Engine::Podman {
         return;
     }
     if PODMAN_PIPE_QUERIED.swap(true, Ordering::SeqCst) {
@@ -226,18 +243,23 @@ pub async fn ensure_podman_pipe() {
 }
 
 async fn refresh_podman_pipe(machine: Option<&str>) {
-    if !cfg!(windows) {
+    if !cfg!(any(windows, target_os = "macos")) {
         return;
     }
     let Some(podman) = podman_path() else {
         return;
     };
-    let mut args = strings(PODMAN_PIPE_QUERY);
+    let query = if cfg!(windows) {
+        PODMAN_PIPE_QUERY
+    } else {
+        PODMAN_SOCKET_QUERY
+    };
+    let mut args = strings(query);
     args.extend(machine.map(String::from));
     if let Ok(out) = run_cmd(&podman, &args, PODMAN_QUERY_TIMEOUT).await {
         if let Some(host) = String::from_utf8_lossy(&out.stdout)
             .lines()
-            .find_map(pipe_path_to_host)
+            .find_map(podman_endpoint_to_host)
         {
             if let Ok(mut g) = PODMAN_PIPE.lock() {
                 *g = Some(host);
@@ -315,6 +337,12 @@ const PODMAN_PIPE_QUERY: &[&str] = &[
     "inspect",
     "--format",
     "{{.ConnectionInfo.PodmanPipe.Path}}",
+];
+const PODMAN_SOCKET_QUERY: &[&str] = &[
+    "machine",
+    "inspect",
+    "--format",
+    "{{.ConnectionInfo.PodmanSocket.Path}}",
 ];
 
 fn strings(args: &[&str]) -> Vec<String> {
@@ -619,6 +647,18 @@ mod tests {
         assert_eq!(pipe_path_to_host("<no value>"), None);
         assert_eq!(pipe_path_to_host(""), None);
         assert_eq!(pipe_path_to_host("\\\\.\\pipe\\"), None);
+    }
+
+    #[test]
+    fn socket_paths_become_unix_hosts() {
+        assert_eq!(
+            socket_path_to_host("/var/folders/x/T/podman/podman-machine-default-api.sock\n")
+                .as_deref(),
+            Some("unix:///var/folders/x/T/podman/podman-machine-default-api.sock")
+        );
+        assert_eq!(socket_path_to_host("<no value>"), None);
+        assert_eq!(socket_path_to_host("/"), None);
+        assert_eq!(socket_path_to_host(""), None);
     }
 
     #[test]

@@ -6,12 +6,14 @@ pub mod runner;
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use runner::{languages, RunReport, RunRequest, RunnerError};
+use runner::{docker, images, languages, RunReport, RunRequest, RunnerError};
 
 /// Event name for progress updates during a run (image pull, phases).
 pub const PROGRESS_EVENT: &str = "run-progress";
 /// Event name for status messages while the container engine starts.
 pub const ENGINE_EVENT: &str = "engine-progress";
+/// Event name for progress while images are prepared or updated.
+pub const IMAGES_EVENT: &str = "images-progress";
 
 #[tauri::command]
 async fn docker_status() -> docker_detect::DockerStatus {
@@ -52,6 +54,27 @@ async fn run_tests(app: AppHandle, request: RunRequest) -> Result<RunReport, Run
     .await
 }
 
+/// Loads bundled image archives into the active engine if the images are
+/// missing (called once the engine is up).
+#[tauri::command]
+async fn prepare_images(app: AppHandle) -> Result<images::ImagesReport, RunnerError> {
+    let docker = docker::connect().await?;
+    Ok(images::prepare_all(&docker, |p| {
+        let _ = app.emit(IMAGES_EVENT, p);
+    })
+    .await)
+}
+
+/// "Images aktualisieren": pulls the pinned images from GHCR.
+#[tauri::command]
+async fn update_images(app: AppHandle) -> Result<images::ImagesReport, RunnerError> {
+    let docker = docker::connect().await?;
+    Ok(images::update_all(&docker, |p| {
+        let _ = app.emit(IMAGES_EVENT, p);
+    })
+    .await)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -59,6 +82,12 @@ pub fn run() {
         .setup(|app| {
             if let Ok(dir) = app.path().app_config_dir() {
                 engine::init(dir);
+            }
+            // Release builds ship the runner images as archives in
+            // <resource_dir>/images (next to the .exe on Windows,
+            // Contents/Resources on macOS).
+            if let Ok(dir) = app.path().resource_dir() {
+                images::init_bundle_dir(dir.join(images::BUNDLE_SUBDIR));
             }
             Ok(())
         })
@@ -68,7 +97,9 @@ pub fn run() {
             set_engine,
             start_engine,
             list_languages,
-            run_tests
+            run_tests,
+            prepare_images,
+            update_images
         ])
         .run(tauri::generate_context!())
         .expect("Fehler beim Starten der Anwendung");

@@ -4,8 +4,15 @@
 use serde::Serialize;
 use std::time::Duration;
 
-/// Tag of the runner images published by `.github/workflows/images.yml`.
-pub const IMAGE_TAG: &str = "0.1.0";
+/// Registry namespace of the published runner images (GHCR names must be
+/// lowercase). `.github/workflows/release.yml` checks that it matches the
+/// repository owner it pushes to.
+pub const IMAGE_REGISTRY: &str = "ghcr.io/bernhardgoetz";
+
+/// Tag of the runner images = app version (`Cargo.toml`, kept equal to
+/// `tauri.conf.json` and `package.json`). The release workflow pushes the
+/// images as `<IMAGE_REGISTRY>/code-pruefer-<id>:<version>` for tag `v<version>`.
+pub const IMAGE_TAG: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone)]
 pub struct LanguageConfig {
@@ -13,7 +20,8 @@ pub struct LanguageConfig {
     pub id: &'static str,
     /// Display name for the UI.
     pub name: &'static str,
-    /// Image reference used when no override env var is set.
+    /// Image reference used when no override env var is set
+    /// (`<IMAGE_REGISTRY>/code-pruefer-<id>:<IMAGE_TAG>`).
     pub default_image: &'static str,
     /// Environment variable that overrides the image reference (local dev builds).
     pub image_env: &'static str,
@@ -35,23 +43,25 @@ pub struct LanguageConfig {
 }
 
 impl LanguageConfig {
-    /// Image reference, overridable via env var (e.g. `CODE_PRUEFER_PYTHON_IMAGE=code-pruefer-python:dev`).
-    pub fn image(&self) -> String {
+    /// Image set via env var (e.g. `CODE_PRUEFER_PYTHON_IMAGE=code-pruefer-python:dev`),
+    /// if it differs from the default image.
+    pub fn image_override(&self) -> Option<String> {
         std::env::var(self.image_env)
             .ok()
-            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != self.default_image)
+    }
+
+    /// Image reference, overridable via env var.
+    pub fn image(&self) -> String {
+        self.image_override()
             .unwrap_or_else(|| self.default_image.to_string())
     }
 
-    /// Images to look for locally, in order. An env override is used
-    /// exclusively; otherwise the published image comes first, then the
-    /// locally built `:dev` tag. Only the first entry is ever pulled.
-    pub fn image_candidates(&self) -> Vec<String> {
-        let image = self.image();
-        if image != self.default_image {
-            return vec![image];
-        }
-        vec![image, self.local_image.to_string()]
+    /// File name of the bundled image archive for an OCI architecture
+    /// (`amd64` / `arm64`), see `runner::images`.
+    pub fn archive_name(&self, arch: &str) -> String {
+        format!("code-pruefer-{}-{arch}.tar.gz", self.id)
     }
 }
 
@@ -59,7 +69,10 @@ pub static LANGUAGES: &[LanguageConfig] = &[
     LanguageConfig {
         id: "python",
         name: "Python 3.12",
-        default_image: "ghcr.io/bernhardgoetz/code-pruefer-python:0.1.0",
+        default_image: concat!(
+            "ghcr.io/bernhardgoetz/code-pruefer-python:",
+            env!("CARGO_PKG_VERSION")
+        ),
         image_env: "CODE_PRUEFER_PYTHON_IMAGE",
         local_image: "code-pruefer-python:dev",
         source_file: "main.py",
@@ -73,7 +86,10 @@ pub static LANGUAGES: &[LanguageConfig] = &[
     LanguageConfig {
         id: "java",
         name: "Java 21",
-        default_image: "ghcr.io/bernhardgoetz/code-pruefer-java:0.1.0",
+        default_image: concat!(
+            "ghcr.io/bernhardgoetz/code-pruefer-java:",
+            env!("CARGO_PKG_VERSION")
+        ),
         image_env: "CODE_PRUEFER_JAVA_IMAGE",
         local_image: "code-pruefer-java:dev",
         source_file: "Main.java",
@@ -172,14 +188,32 @@ mod tests {
     }
 
     #[test]
-    fn default_images_use_current_tag() {
+    fn default_images_follow_release_scheme() {
+        assert_eq!(IMAGE_REGISTRY, IMAGE_REGISTRY.to_lowercase());
         for l in LANGUAGES {
-            assert!(
-                l.default_image.ends_with(&format!(":{IMAGE_TAG}")),
-                "{}",
-                l.id
+            assert_eq!(
+                l.default_image,
+                format!("{IMAGE_REGISTRY}/code-pruefer-{}:{IMAGE_TAG}", l.id)
+            );
+            assert_eq!(
+                l.archive_name("arm64"),
+                format!("code-pruefer-{}-arm64.tar.gz", l.id)
             );
         }
+    }
+
+    /// The image tag is the Cargo version; the release workflow tags by the
+    /// app version, so all three version fields must agree.
+    #[test]
+    fn versions_are_in_sync() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let version_of = |file: &str| -> String {
+            let raw = std::fs::read_to_string(root.join(file)).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            v["version"].as_str().unwrap().to_string()
+        };
+        assert_eq!(version_of("tauri.conf.json"), IMAGE_TAG);
+        assert_eq!(version_of("../package.json"), IMAGE_TAG);
     }
 
     #[test]

@@ -5,13 +5,18 @@ import {
   getEngine,
   listLanguages,
   onEngineProgress,
+  onImagesProgress,
   onProgress,
+  prepareImages,
+  progressText,
   runTests,
   setEngine,
   startEngine,
+  updateImages,
   type DockerStatus,
   type Engine,
   type EngineChoice,
+  type ImagesReport,
   type LanguageInfo,
   type Progress,
   type RunReport,
@@ -24,11 +29,11 @@ import { ResultsPanel } from "./components/ResultsPanel";
 import { TaskStatement } from "./components/TaskStatement";
 import { TestCaseEditor, newTestCase } from "./components/TestCaseEditor";
 
-function progressText(p: Progress | null): string {
-  if (!p) return "Läuft …";
-  if (p.kind === "phase") return p.message;
-  const pct = p.percent !== null ? ` ${p.percent} %` : "";
-  return `Lade Image ${p.image} herunter (einmalig):${pct} ${p.status}`;
+function reportText(r: ImagesReport, what: string): string | null {
+  const parts: string[] = [];
+  if (r.done.length > 0) parts.push(`${what}: ${r.done.join(", ")}.`);
+  if (r.errors.length > 0) parts.push(r.errors.join(" "));
+  return parts.length > 0 ? parts.join(" ") : null;
 }
 
 export default function App() {
@@ -51,6 +56,47 @@ export default function App() {
   const [progress, setProgress] = useState<Progress | null>(null);
   const [report, setReport] = useState<RunReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Runner images: background preparation and "Images aktualisieren".
+  const [imagesBusy, setImagesBusy] = useState<string | null>(null);
+  const [imagesNote, setImagesNote] = useState<{ text: string; error: boolean } | null>(null);
+  const imagesPrepared = useRef(false);
+
+  const runImageTask = useCallback(
+    async (task: () => Promise<ImagesReport>, busyText: string, doneText: string, failText: string) => {
+      setImagesBusy(busyText);
+      setImagesNote(null);
+      try {
+        const r = await task();
+        const text = reportText(r, doneText);
+        if (text) setImagesNote({ text, error: r.errors.length > 0 });
+      } catch (e) {
+        setImagesNote({ text: `${failText} ${String(e)}`, error: true });
+      } finally {
+        setImagesBusy(null);
+      }
+    },
+    [],
+  );
+
+  // Once the engine runs: load bundled images that are missing (once per engine).
+  useEffect(() => {
+    if (docker?.state !== "ok" || imagesPrepared.current) return;
+    imagesPrepared.current = true;
+    void runImageTask(
+      prepareImages,
+      "Prüfe Runner-Images …",
+      "Images aus dem Installationspaket geladen",
+      "Images konnten nicht vorbereitet werden:",
+    );
+  }, [docker, runImageTask]);
+
+  const onUpdateImages = () =>
+    void runImageTask(
+      updateImages,
+      "Images werden aktualisiert …",
+      "Images aktualisiert",
+      "Aktualisierung fehlgeschlagen (nicht schlimm – die vorhandenen Images bleiben nutzbar):",
+    );
 
   const doStart = useCallback(async () => {
     const name = engineRef.current ? ENGINE_NAMES[engineRef.current.engine] : "Container-Engine";
@@ -86,6 +132,8 @@ export default function App() {
       setEngineChoice(choice);
       setStartError(null);
       autoStartTried.current = false;
+      // Each engine has its own image store.
+      imagesPrepared.current = false;
       refreshDocker();
     } catch (err) {
       setStartError(String(err));
@@ -107,18 +155,27 @@ export default function App() {
       })
       .catch((e) => setError(String(e)));
     const unlisten = onProgress(setProgress);
+    const unlistenImages = onImagesProgress((p) =>
+      setImagesBusy((prev) => (prev === null ? null : progressText(p))),
+    );
     // Only show engine messages while a start is in progress.
     const unlistenEngine = onEngineProgress((m) => setStarting((prev) => (prev === null ? null : m)));
     return () => {
       void unlisten.then((f) => f());
       void unlistenEngine.then((f) => f());
+      void unlistenImages.then((f) => f());
     };
   }, [refreshDocker]);
 
   const language = languages.find((l) => l.id === languageId);
   const code = codeByLang[languageId] ?? "";
   const canRun =
-    docker?.state === "ok" && starting === null && !running && tests.length > 0 && code.trim() !== "";
+    docker?.state === "ok" &&
+    starting === null &&
+    imagesBusy === null &&
+    !running &&
+    tests.length > 0 &&
+    code.trim() !== "";
 
   const onRun = async () => {
     setRunning(true);
@@ -153,6 +210,8 @@ export default function App() {
         starting={starting}
         startError={startError}
         busy={running}
+        images={{ busy: imagesBusy, note: imagesNote }}
+        onUpdateImages={onUpdateImages}
         onRetry={refreshDocker}
         onStart={() => void doStart()}
         onEngineChange={(e) => void onEngineChange(e)}
@@ -186,6 +245,7 @@ export default function App() {
               {running ? "Prüfe …" : "Prüfen"}
             </button>
             {running && <span className="muted">{progressText(progress)}</span>}
+            {!running && imagesBusy !== null && <span className="muted">{imagesBusy}</span>}
             {!running && docker?.state !== "ok" && (
               <span className="muted small">Zum Prüfen wird Docker oder Podman benötigt.</span>
             )}

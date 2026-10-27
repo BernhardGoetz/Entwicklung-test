@@ -2,6 +2,7 @@
 
 pub mod compare;
 pub mod docker;
+pub mod images;
 pub mod languages;
 
 use serde::{Deserialize, Serialize};
@@ -20,11 +21,15 @@ pub enum RunnerError {
     UnknownLanguage(String),
     #[error("Image {0} konnte nicht geladen werden: {1}")]
     ImagePull(String, String),
+    #[error("Image-Archiv {0} konnte nicht geladen werden: {1}")]
+    ImageLoad(String, String),
     #[error(
-        "Das Runner-Image für {language} ist nicht vorhanden (gesucht: {tried}) und konnte nicht \
-         heruntergeladen werden ({detail}). Bitte das Image einmalig lokal bauen – in PowerShell \
-         bzw. im Terminal im Projektordner, der den Ordner \"images\" enthält: \
-         docker build -t {local_image} images/{id} – und danach erneut auf „Prüfen“ klicken."
+        "Das Runner-Image für {language} ist nicht vorhanden (gesucht: {tried}). Es konnte weder \
+         aus dem Installationspaket geladen noch heruntergeladen werden ({detail}). Bitte die \
+         Internetverbindung prüfen und „Images aktualisieren“ klicken oder den Code-Prüfer neu \
+         installieren. Für Entwickler: das Image im Projektordner lokal bauen mit \
+         docker build -t {local_image} images/{id} (bei Podman „podman build …“) und danach \
+         erneut auf „Prüfen“ klicken."
     )]
     ImageMissing {
         language: String,
@@ -137,7 +142,14 @@ pub struct RunReport {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Progress {
     Pull(PullProgress),
-    Phase { message: String },
+    /// Loading a bundled image archive; `percent` of the archive read.
+    Load {
+        image: String,
+        percent: Option<u8>,
+    },
+    Phase {
+        message: String,
+    },
 }
 
 pub async fn run_submission(
@@ -159,7 +171,7 @@ pub async fn run_submission(
     let hint = languages::precheck(lang, &req.code);
 
     let docker = docker::connect().await?;
-    let image = resolve_image(&docker, lang, &mut on_progress).await?;
+    let image = images::ensure_image(&docker, lang, &mut on_progress).await?;
 
     on_progress(Progress::Phase {
         message: "Starte Container …".into(),
@@ -183,36 +195,6 @@ pub async fn run_submission(
         passed,
         tests,
     })
-}
-
-/// Picks the first locally available image candidate; if none is present,
-/// pulls the primary one. A failed pull becomes an actionable German error.
-async fn resolve_image(
-    docker: &bollard::Docker,
-    lang: &languages::LanguageConfig,
-    on_progress: &mut impl FnMut(Progress),
-) -> Result<String, RunnerError> {
-    let candidates = lang.image_candidates();
-    on_progress(Progress::Phase {
-        message: format!("Prüfe Image {} …", candidates[0]),
-    });
-    for image in &candidates {
-        if docker::image_exists(docker, image).await? {
-            return Ok(image.clone());
-        }
-    }
-    let primary = &candidates[0];
-    match docker::pull_image(docker, primary, |p| on_progress(Progress::Pull(p))).await {
-        Ok(()) => Ok(primary.clone()),
-        Err(RunnerError::ImagePull(_, detail)) => Err(RunnerError::ImageMissing {
-            language: lang.name.to_string(),
-            id: lang.id.to_string(),
-            tried: candidates.join(", "),
-            local_image: lang.local_image.to_string(),
-            detail: detail.trim().replace('\n', " "),
-        }),
-        Err(e) => Err(e),
-    }
 }
 
 type SandboxResult = (Option<StepOutput>, bool, Vec<TestResult>);
@@ -411,6 +393,7 @@ mod tests {
         };
         let msg = e.to_string();
         assert!(msg.contains("docker build -t code-pruefer-python:dev images/python"));
+        assert!(msg.contains("Images aktualisieren"));
         assert!(msg.contains("gesucht: a, b"));
         assert!(msg.contains("denied"));
     }

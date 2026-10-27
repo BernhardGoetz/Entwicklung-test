@@ -521,6 +521,8 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bollard",
+ "bytes",
+ "flate2",
  "futures-util",
  "serde",
  "serde_json",

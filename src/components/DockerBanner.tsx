@@ -48,8 +48,16 @@ function EngineSwitch({
   );
 }
 
+export interface ImagesState {
+  /** Progress text while images are prepared/updated, otherwise null. */
+  busy: string | null;
+  note: { text: string; error: boolean } | null;
+}
+
 interface Props {
   status: DockerStatus | null;
+  images: ImagesState;
+  onUpdateImages: () => void;
   engine: EngineChoice | null;
   /** Status message while the engine is being started, otherwise null. */
   starting: string | null;
@@ -62,6 +70,8 @@ interface Props {
 
 export function DockerBanner({
   status,
+  images,
+  onUpdateImages,
   engine,
   starting,
   startError,
@@ -87,12 +97,29 @@ export function DockerBanner({
   }
   if (status.state === "ok") {
     return (
-      <div className="banner ok banner-row">
-        <span>
-          ✓ {status.product} {status.version} läuft – Code wird lokal in isolierten Containern
-          ausgeführt.
-        </span>
-        {engineSwitch}
+      <div className="banner ok">
+        <div className="banner-row">
+          <span>
+            ✓ {status.product} {status.version} läuft – Code wird lokal in isolierten Containern
+            ausgeführt.
+          </span>
+          <span className="banner-actions">
+            <button
+              onClick={onUpdateImages}
+              disabled={busy || images.busy !== null}
+              title="Lädt die Runner-Images dieser Version neu von ghcr.io (Internet nötig)"
+            >
+              Images aktualisieren
+            </button>
+            {engineSwitch}
+          </span>
+        </div>
+        {images.busy !== null && <p className="images-status">⏳ {images.busy}</p>}
+        {images.busy === null && images.note && (
+          <p className={images.note.error ? "images-status images-error" : "images-status"}>
+            {images.note.text}
+          </p>
+        )}
       </div>
     );
   }

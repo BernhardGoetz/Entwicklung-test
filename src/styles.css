@@ -87,7 +87,9 @@ button.danger { color: var(--fail); }
 .banner.info { background: var(--card); color: var(--muted); }
 .banner a { color: inherit; font-weight: 600; }
 .banner-row { display: flex; align-items: center; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; }
-.banner-actions { display: inline-flex; gap: 8px; }
+.banner-actions { display: inline-flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; }
+.images-status { margin: 6px 0 0; font-size: 0.9em; }
+.images-status.images-error { color: var(--warn); }
 .engine-switch { display: inline-flex; align-items: center; gap: 6px; font-size: 0.9em; white-space: nowrap; }
 
 .summary { font-weight: 600; font-size: 15px; color: var(--fail); }

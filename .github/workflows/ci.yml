@@ -56,4 +56,6 @@ jobs:
           docker build -t code-pruefer-java:dev images/java
       - name: Docker-Integrationstests
         working-directory: src-tauri
-        run: cargo test --test docker_integration -- --ignored --test-threads=1
+        run: |
+          cargo test --test docker_integration -- --ignored --test-threads=1
+          cargo test --test image_bundle -- --ignored --test-threads=1
