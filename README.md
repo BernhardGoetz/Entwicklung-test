@@ -18,17 +18,61 @@ Docker-Container ausgeführt – es gibt keinen zentralen Server.
 
 ## Voraussetzungen
 
-Eine Docker-kompatible Container-Engine muss installiert und gestartet sein:
+Eine Docker-kompatible Container-Engine wird benötigt:
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) – kostenlos für
   private Nutzung/Bildung – bitte Lizenzbedingungen selbst prüfen.
-- oder [Podman Desktop](https://podman-desktop.io/) (Open Source). Unter macOS/Windows
-  muss die Podman-Maschine laufen (`podman machine start`).
+- oder [Podman](https://podman.io/) (Open Source). Unter macOS/Windows läuft Podman in
+  einer „Podman-Maschine“ (unter Windows auf Basis von WSL2).
+
+### Windows-Installer
+
+Der Installer (`Code-Prüfer_<version>_x64-setup.exe`) ist deutschsprachig und fragt auf
+der Seite **„Container-Engine“**, ob Docker Desktop (Standard) oder Podman verwendet
+werden soll. Ist die gewählte Engine nicht installiert, bietet er an, sie über `winget`
+zu installieren (`Docker.DockerDesktop` bzw. `RedHat.Podman`; Windows fragt nach
+Administratorrechten, ggf. ist ein Neustart nötig). Ohne `winget` wird die offizielle
+Download-Seite geöffnet. Schlägt die Installation der Engine fehl, wird der Code-Prüfer
+trotzdem installiert. Bei stiller/passiver Installation (`/S`, `/P`) wird nichts gefragt
+und nichts nachinstalliert.
+
+Umsetzung: `src-tauri/windows/hooks.nsh` (Installer-Hooks mit Auswahlseite und
+winget-Aufruf) und `src-tauri/windows/installer.nsi` – das unveränderte Tauri-Template
+(tauri-cli 2.12.4) mit **einer** Ergänzung vor der Installationsseite, die die Seite aus
+`hooks.nsh` einfügt. Bei einem Update der Tauri-CLI das Template neu kopieren und diese
+Stelle (`CODE_PRUEFER_CUSTOM_PAGES`) wieder einfügen.
+
+### Engine-Auswahl und automatischer Start
+
+Die gewählte Engine wird so ermittelt (erste Quelle gewinnt):
+
+1. `engine.json` im App-Konfigurationsordner (Windows:
+   `%APPDATA%\de.bernhardgoetz.codepruefer\engine.json`, Inhalt z. B.
+   `{"engine": "podman"}`) – wird geschrieben, wenn man die Engine in der App umstellt
+   (Auswahlfeld „Container-Engine“ im Statusbalken);
+2. Registry `HKCU\Software\Code-Pruefer`, Wert `Engine` (`docker` | `podman`) – wird
+   vom Installer geschrieben;
+3. Standard: Docker.
+
+Beim Start der App (bzw. wenn die Prüfung ergibt, dass die Engine nicht läuft) startet
+der Code-Prüfer die gewählte Engine und wartet, bis sie antwortet (alle 2 s, max. 120 s):
+
+- **Docker Desktop:** `Docker Desktop.exe` wird gestartet (macOS: `open -a Docker`).
+- **Podman:** existiert noch keine Maschine, wird einmalig `podman machine init`
+  ausgeführt (lädt ein VM-Image, kann einige Minuten dauern), danach
+  `podman machine start`. Unter Windows verbindet sich die App über die Named Pipe, die
+  `podman machine inspect` meldet (Standard: `\\.\pipe\podman-machine-default`).
+- **Linux:** kein automatischer Start (Systemdienst) – bitte Docker bzw. Podman selbst
+  starten.
+
+Die Engine wird nicht mit Windows gestartet, sondern nur mit dem Code-Prüfer.
 
 Die App erkennt die Engine automatisch (Docker-Socket, Docker-Desktop-Socket unter
-`~/.docker/run/docker.sock`, Podman-Sockets, Named Pipe `docker_engine` unter Windows).
-Mit der Umgebungsvariable `DOCKER_HOST` (z. B. `unix:///pfad/zum/podman.sock` oder
-`npipe:////./pipe/podman-machine-default`) lässt sich der Endpunkt explizit festlegen.
+`~/.docker/run/docker.sock`, Podman-Sockets, Named Pipes `docker_engine` und
+`podman-machine-default` unter Windows); die Endpunkte der gewählten Engine werden
+zuerst probiert. Mit der Umgebungsvariable `DOCKER_HOST` (z. B.
+`unix:///pfad/zum/podman.sock` oder `npipe:////./pipe/podman-machine-default`) lässt
+sich der Endpunkt explizit festlegen; sie hat Vorrang vor der Engine-Auswahl.
 
 Beim ersten Prüfen einer Sprache wird das passende Runner-Image heruntergeladen
 (Fortschritt wird angezeigt); danach funktioniert die Prüfung offline.
@@ -66,6 +110,9 @@ npm run build                      # Typecheck + Frontend-Build
 cd src-tauri && cargo test         # Unit-Tests
 cd src-tauri && cargo clippy --all-targets -- -D warnings
 npm run tauri build                # Installer (unsigniert) bauen
+
+# Windows-Installer unter Linux cross-kompilieren (benötigt mingw-w64 und nsis)
+npm run tauri build -- --target x86_64-pc-windows-gnu --bundles nsis
 ```
 
 ### Runner-Images lokal bauen
@@ -92,12 +139,15 @@ Veröffentlichte Images: `ghcr.io/bernhardgoetz/code-pruefer-python:0.1.0` und
 ```
 src/                     React-Frontend (Monaco-Editor, Testfälle, Ergebnisse)
 src-tauri/src/
-  lib.rs                 Tauri-Commands: docker_status, list_languages, run_tests
+  lib.rs                 Tauri-Commands: docker_status, get_engine, set_engine,
+                         start_engine, list_languages, run_tests
   docker_detect.rs       Erkennung: nicht installiert / nicht gestartet / ok
+  engine.rs              Engine-Auswahl (Datei/Registry), Start, Podman-Pipe
   runner/mod.rs          Ablauf einer Prüfung, Bewertung der Testfälle
   runner/docker.rs       Engine-Verbindung, Image-Pull, gehärteter Container
   runner/languages.rs    Sprachtabelle (Image, Dateiname, Befehle, Zeitlimits)
   runner/compare.rs      Normalisierung, Zeilen-Diff, Ausgabebegrenzung
+src-tauri/windows/       NSIS-Installer: Template + Hooks (Engine-Auswahl, winget)
 images/                  Dockerfiles der Runner-Images
 ```
 
@@ -111,7 +161,8 @@ unter `images/`.
 - Vergleich nur über stdout (exakt bzw. mit Whitespace-Toleranz).
 - Builds sind nicht signiert (Windows SmartScreen / macOS Gatekeeper warnen), kein
   Auto-Update.
-- Benötigt eine installierte Container-Engine (Docker Desktop oder Podman).
+- Benötigt eine Container-Engine (Docker Desktop oder Podman); der Windows-Installer kann
+  sie über winget nachinstallieren.
 
 Geplant für spätere Phasen: weitere Sprachen (C/C++/C#/JavaScript), signierter
 Aufgabenkatalog, Code-Signing, Updater, automatisch generierte Tests.

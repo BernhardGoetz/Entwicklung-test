@@ -529,6 +529,7 @@ dependencies = [
  "tauri-plugin-opener",
  "thiserror 2.0.21",
  "tokio",
+ "winreg",
 ]
 
 [[package]]
@@ -3832,6 +3833,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

@@ -1,10 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  ENGINE_NAMES,
   dockerStatus,
+  getEngine,
   listLanguages,
+  onEngineProgress,
   onProgress,
   runTests,
+  setEngine,
+  startEngine,
   type DockerStatus,
+  type Engine,
+  type EngineChoice,
   type LanguageInfo,
   type Progress,
   type RunReport,
@@ -26,6 +33,12 @@ function progressText(p: Progress | null): string {
 
 export default function App() {
   const [docker, setDocker] = useState<DockerStatus | null>(null);
+  const [engine, setEngineChoice] = useState<EngineChoice | null>(null);
+  const [starting, setStarting] = useState<string | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
+  // The engine is started automatically once per app start (and after a switch).
+  const autoStartTried = useRef(false);
+  const engineRef = useRef<EngineChoice | null>(null);
   const [languages, setLanguages] = useState<LanguageInfo[]>([]);
   const [languageId, setLanguageId] = useState("python");
   const [codeByLang, setCodeByLang] = useState<Record<string, string>>({});
@@ -39,15 +52,54 @@ export default function App() {
   const [report, setReport] = useState<RunReport | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const doStart = useCallback(async () => {
+    const name = engineRef.current ? ENGINE_NAMES[engineRef.current.engine] : "Container-Engine";
+    setStartError(null);
+    setStarting(`${name} wird gestartet …`);
+    try {
+      setDocker(await startEngine());
+    } catch (e) {
+      setStartError(String(e));
+      setDocker(await dockerStatus().catch((): DockerStatus => ({ state: "notInstalled" })));
+    } finally {
+      setStarting(null);
+    }
+  }, []);
+
   const refreshDocker = useCallback(() => {
     setDocker(null);
     dockerStatus()
-      .then(setDocker)
+      .then((s) => {
+        setDocker(s);
+        if (s.state === "notRunning" && !autoStartTried.current) {
+          autoStartTried.current = true;
+          void doStart();
+        }
+      })
       .catch(() => setDocker({ state: "notInstalled" }));
-  }, []);
+  }, [doStart]);
+
+  const onEngineChange = async (e: Engine) => {
+    try {
+      const choice = await setEngine(e);
+      engineRef.current = choice;
+      setEngineChoice(choice);
+      setStartError(null);
+      autoStartTried.current = false;
+      refreshDocker();
+    } catch (err) {
+      setStartError(String(err));
+    }
+  };
 
   useEffect(() => {
-    refreshDocker();
+    getEngine()
+      .then((choice) => {
+        engineRef.current = choice;
+        setEngineChoice(choice);
+      })
+      .catch(() => undefined)
+      .finally(refreshDocker);
     listLanguages()
       .then((langs) => {
         setLanguages(langs);
@@ -55,14 +107,18 @@ export default function App() {
       })
       .catch((e) => setError(String(e)));
     const unlisten = onProgress(setProgress);
+    // Only show engine messages while a start is in progress.
+    const unlistenEngine = onEngineProgress((m) => setStarting((prev) => (prev === null ? null : m)));
     return () => {
       void unlisten.then((f) => f());
+      void unlistenEngine.then((f) => f());
     };
   }, [refreshDocker]);
 
   const language = languages.find((l) => l.id === languageId);
   const code = codeByLang[languageId] ?? "";
-  const canRun = docker?.state === "ok" && !running && tests.length > 0 && code.trim() !== "";
+  const canRun =
+    docker?.state === "ok" && starting === null && !running && tests.length > 0 && code.trim() !== "";
 
   const onRun = async () => {
     setRunning(true);
@@ -91,7 +147,16 @@ export default function App() {
         <h1>Code-Prüfer</h1>
         <span className="muted">Programmieraufgaben lokal und sicher testen</span>
       </header>
-      <DockerBanner status={docker} onRetry={refreshDocker} />
+      <DockerBanner
+        status={docker}
+        engine={engine}
+        starting={starting}
+        startError={startError}
+        busy={running}
+        onRetry={refreshDocker}
+        onStart={() => void doStart()}
+        onEngineChange={(e) => void onEngineChange(e)}
+      />
       <main>
         <div className="col">
           <TaskStatement value={task} onChange={setTask} />

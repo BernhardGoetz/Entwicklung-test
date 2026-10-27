@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 
+use crate::engine;
 use crate::runner::docker;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -49,15 +50,7 @@ fn looks_installed() -> bool {
     if std::env::var_os("DOCKER_HOST").is_some() {
         return true;
     }
-    let exe = if cfg!(windows) { ".exe" } else { "" };
-    let on_path = |name: &str| {
-        std::env::var_os("PATH")
-            .map(|paths| {
-                std::env::split_paths(&paths).any(|dir| dir.join(format!("{name}{exe}")).is_file())
-            })
-            .unwrap_or(false)
-    };
-    if on_path("docker") || on_path("podman") {
+    if engine::find_on_path("docker").is_some() || engine::podman_path().is_some() {
         return true;
     }
     let mut known: Vec<String> = vec![

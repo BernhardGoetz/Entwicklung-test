@@ -213,3 +213,15 @@ async fn missing_override_image_gives_actionable_error() {
         "{msg}"
     );
 }
+
+#[tokio::test]
+#[ignore = "benötigt Docker"]
+async fn start_is_a_no_op_when_engine_already_answers() {
+    let mut messages = Vec::new();
+    code_pruefer_lib::engine::start(code_pruefer_lib::engine::Engine::Docker, |m| {
+        messages.push(m)
+    })
+    .await
+    .expect("engine should already be reachable");
+    assert!(messages.is_empty(), "{messages:?}");
+}

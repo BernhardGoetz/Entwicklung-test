@@ -77,3 +77,22 @@ export const listLanguages = () => invoke<LanguageInfo[]>("list_languages");
 export const runTests = (request: RunRequest) => invoke<RunReport>("run_tests", { request });
 export const onProgress = (cb: (p: Progress) => void): Promise<UnlistenFn> =>
   listen<Progress>("run-progress", (e) => cb(e.payload));
+
+export type Engine = "docker" | "podman";
+export interface EngineChoice {
+  engine: Engine;
+  /** Where the choice came from: app setting, installer (registry) or default. */
+  source: "config" | "registry" | "default";
+}
+
+export const ENGINE_NAMES: Record<Engine, string> = {
+  docker: "Docker Desktop",
+  podman: "Podman",
+};
+
+export const getEngine = () => invoke<EngineChoice>("get_engine");
+export const setEngine = (engine: Engine) => invoke<EngineChoice>("set_engine", { engine });
+/** Starts the chosen engine and resolves with the status once its API answers. */
+export const startEngine = () => invoke<DockerStatus>("start_engine");
+export const onEngineProgress = (cb: (message: string) => void): Promise<UnlistenFn> =>
+  listen<string>("engine-progress", (e) => cb(e.payload));

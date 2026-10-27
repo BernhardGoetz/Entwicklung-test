@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use super::compare::{CappedBuffer, OUTPUT_LIMIT};
 use super::RunnerError;
+use crate::engine;
 
 /// User the code runs as inside the container (non-root).
 pub const SANDBOX_USER: &str = "1000:1000";
@@ -34,7 +35,8 @@ const ENV: &[&str] = &["LANG=C.UTF-8", "LC_ALL=C.UTF-8", "HOME=/tmp"];
 /// below the kernel's 128 KiB limit for a single argument.
 const WRITE_CHUNK: usize = 48 * 1024;
 
-/// Engine endpoints to try, in order. `DOCKER_HOST` (if set) wins exclusively.
+/// Engine endpoints to try, in order. `DOCKER_HOST` (if set) wins exclusively;
+/// otherwise the endpoints of the chosen engine (see `crate::engine`) come first.
 pub fn candidate_hosts() -> Vec<String> {
     if let Some(h) = std::env::var("DOCKER_HOST")
         .ok()
@@ -42,8 +44,8 @@ pub fn candidate_hosts() -> Vec<String> {
     {
         return vec![h];
     }
-    #[allow(unused_mut)]
-    let mut hosts: Vec<String> = Vec::new();
+    // Podman's pipe as reported by `podman machine inspect` (Windows only).
+    let mut hosts: Vec<String> = engine::discovered_podman_host().into_iter().collect();
     #[cfg(unix)]
     {
         let mut paths = vec!["/var/run/docker.sock".to_string()];
@@ -71,11 +73,12 @@ pub fn candidate_hosts() -> Vec<String> {
         hosts.push("npipe:////./pipe/docker_engine".to_string());
         hosts.push("npipe:////./pipe/podman-machine-default".to_string());
     }
-    hosts
+    engine::prefer(hosts, engine::current().engine)
 }
 
 /// Connects to the first engine that answers a ping.
 pub async fn connect() -> Result<Docker, RunnerError> {
+    engine::ensure_podman_pipe().await;
     for host in candidate_hosts() {
         let Ok(docker) = Docker::connect_with_host(&host) else {
             continue;
