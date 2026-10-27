@@ -20,6 +20,19 @@ pub enum RunnerError {
     UnknownLanguage(String),
     #[error("Image {0} konnte nicht geladen werden: {1}")]
     ImagePull(String, String),
+    #[error(
+        "Das Runner-Image für {language} ist nicht vorhanden (gesucht: {tried}) und konnte nicht \
+         heruntergeladen werden ({detail}). Bitte das Image einmalig lokal bauen – in PowerShell \
+         bzw. im Terminal im Projektordner, der den Ordner \"images\" enthält: \
+         docker build -t {local_image} images/{id} – und danach erneut auf „Prüfen“ klicken."
+    )]
+    ImageMissing {
+        language: String,
+        id: String,
+        tried: String,
+        local_image: String,
+        detail: String,
+    },
     #[error("Fehler der Container-Engine: {0}")]
     Docker(#[from] bollard::errors::Error),
     #[error("{0}")]
@@ -143,14 +156,10 @@ pub async fn run_submission(
             "Code oder Testdaten sind zu groß (max. 1 MB je Feld).".into(),
         ));
     }
-    let image = lang.image();
     let hint = languages::precheck(lang, &req.code);
 
     let docker = docker::connect().await?;
-    on_progress(Progress::Phase {
-        message: format!("Prüfe Image {image} …"),
-    });
-    docker::ensure_image(&docker, &image, |p| on_progress(Progress::Pull(p))).await?;
+    let image = resolve_image(&docker, lang, &mut on_progress).await?;
 
     on_progress(Progress::Phase {
         message: "Starte Container …".into(),
@@ -174,6 +183,36 @@ pub async fn run_submission(
         passed,
         tests,
     })
+}
+
+/// Picks the first locally available image candidate; if none is present,
+/// pulls the primary one. A failed pull becomes an actionable German error.
+async fn resolve_image(
+    docker: &bollard::Docker,
+    lang: &languages::LanguageConfig,
+    on_progress: &mut impl FnMut(Progress),
+) -> Result<String, RunnerError> {
+    let candidates = lang.image_candidates();
+    on_progress(Progress::Phase {
+        message: format!("Prüfe Image {} …", candidates[0]),
+    });
+    for image in &candidates {
+        if docker::image_exists(docker, image).await? {
+            return Ok(image.clone());
+        }
+    }
+    let primary = &candidates[0];
+    match docker::pull_image(docker, primary, |p| on_progress(Progress::Pull(p))).await {
+        Ok(()) => Ok(primary.clone()),
+        Err(RunnerError::ImagePull(_, detail)) => Err(RunnerError::ImageMissing {
+            language: lang.name.to_string(),
+            id: lang.id.to_string(),
+            tried: candidates.join(", "),
+            local_image: lang.local_image.to_string(),
+            detail: detail.trim().replace('\n', " "),
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 type SandboxResult = (Option<StepOutput>, bool, Vec<TestResult>);
@@ -359,6 +398,21 @@ mod tests {
         o.stdout_truncated = true;
         let r = evaluate(0, "t".into(), o, "y", true, py());
         assert!(r.message.unwrap().contains("64 KB"));
+    }
+
+    #[test]
+    fn image_missing_message_is_actionable() {
+        let e = RunnerError::ImageMissing {
+            language: "Python 3.12".into(),
+            id: "python".into(),
+            tried: "a, b".into(),
+            local_image: "code-pruefer-python:dev".into(),
+            detail: "denied".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("docker build -t code-pruefer-python:dev images/python"));
+        assert!(msg.contains("gesucht: a, b"));
+        assert!(msg.contains("denied"));
     }
 
     #[test]

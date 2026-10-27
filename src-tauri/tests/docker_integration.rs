@@ -156,3 +156,60 @@ async fn containers_are_removed() {
         "sandbox containers left behind"
     );
 }
+
+#[tokio::test]
+#[ignore = "benötigt Docker und die Runner-Images"]
+async fn falls_back_to_local_dev_image_without_override() {
+    // Simulates a Windows start without env vars: the published default image
+    // is not present locally, so the locally built `:dev` tag must be used.
+    let old = std::env::var("CODE_PRUEFER_PYTHON_IMAGE").ok();
+    std::env::remove_var("CODE_PRUEFER_PYTHON_IMAGE");
+    let r = runner::run_submission(
+        RunRequest {
+            language: "python".into(),
+            code: "print(input())".into(),
+            tests: vec![tc("x\n", "x\n")],
+            trim_whitespace: true,
+        },
+        |_| {},
+    )
+    .await;
+    if let Some(v) = old {
+        std::env::set_var("CODE_PRUEFER_PYTHON_IMAGE", v);
+    }
+    let r = r.expect("run_submission failed");
+    assert_eq!(r.image, "code-pruefer-python:dev");
+    assert_eq!(statuses(&r), vec![TestStatus::Passed]);
+}
+
+#[tokio::test]
+#[ignore = "benötigt Docker"]
+async fn missing_override_image_gives_actionable_error() {
+    let old = std::env::var("CODE_PRUEFER_PYTHON_IMAGE").ok();
+    std::env::set_var(
+        "CODE_PRUEFER_PYTHON_IMAGE",
+        "code-pruefer-does-not-exist.invalid/nope:0",
+    );
+    let r = runner::run_submission(
+        RunRequest {
+            language: "python".into(),
+            code: "print(1)".into(),
+            tests: vec![tc("", "1")],
+            trim_whitespace: true,
+        },
+        |_| {},
+    )
+    .await;
+    match old {
+        Some(v) => std::env::set_var("CODE_PRUEFER_PYTHON_IMAGE", v),
+        None => std::env::remove_var("CODE_PRUEFER_PYTHON_IMAGE"),
+    }
+    let msg = match r {
+        Ok(_) => panic!("must fail"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("docker build -t code-pruefer-python:dev images/python"),
+        "{msg}"
+    );
+}

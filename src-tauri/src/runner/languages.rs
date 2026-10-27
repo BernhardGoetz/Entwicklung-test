@@ -17,6 +17,9 @@ pub struct LanguageConfig {
     pub default_image: &'static str,
     /// Environment variable that overrides the image reference (local dev builds).
     pub image_env: &'static str,
+    /// Tag of a locally built image (`docker build -t <local_image> images/<id>`),
+    /// used when the default image is neither present nor pullable.
+    pub local_image: &'static str,
     /// File name the source code is stored under inside `/work`.
     pub source_file: &'static str,
     /// File extensions accepted by the upload dialog.
@@ -39,6 +42,17 @@ impl LanguageConfig {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| self.default_image.to_string())
     }
+
+    /// Images to look for locally, in order. An env override is used
+    /// exclusively; otherwise the published image comes first, then the
+    /// locally built `:dev` tag. Only the first entry is ever pulled.
+    pub fn image_candidates(&self) -> Vec<String> {
+        let image = self.image();
+        if image != self.default_image {
+            return vec![image];
+        }
+        vec![image, self.local_image.to_string()]
+    }
 }
 
 pub static LANGUAGES: &[LanguageConfig] = &[
@@ -47,6 +61,7 @@ pub static LANGUAGES: &[LanguageConfig] = &[
         name: "Python 3.12",
         default_image: "ghcr.io/bernhardgoetz/code-pruefer-python:0.1.0",
         image_env: "CODE_PRUEFER_PYTHON_IMAGE",
+        local_image: "code-pruefer-python:dev",
         source_file: "main.py",
         extensions: &["py"],
         compile_cmd: Some(&["python", "-m", "py_compile", "main.py"]),
@@ -60,6 +75,7 @@ pub static LANGUAGES: &[LanguageConfig] = &[
         name: "Java 21",
         default_image: "ghcr.io/bernhardgoetz/code-pruefer-java:0.1.0",
         image_env: "CODE_PRUEFER_JAVA_IMAGE",
+        local_image: "code-pruefer-java:dev",
         source_file: "Main.java",
         extensions: &["java"],
         compile_cmd: Some(&[
@@ -163,6 +179,13 @@ mod tests {
                 "{}",
                 l.id
             );
+        }
+    }
+
+    #[test]
+    fn local_images_match_build_instructions() {
+        for l in LANGUAGES {
+            assert_eq!(l.local_image, format!("code-pruefer-{}:dev", l.id));
         }
     }
 

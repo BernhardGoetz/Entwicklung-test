@@ -96,19 +96,23 @@ pub struct PullProgress {
     pub percent: Option<u8>,
 }
 
-/// Pulls `image` if it is not available locally, reporting progress.
-pub async fn ensure_image(
+/// Whether `image` is available in the local image store.
+pub async fn image_exists(docker: &Docker, image: &str) -> Result<bool, RunnerError> {
+    match docker.inspect_image(image).await {
+        Ok(_) => Ok(true),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Pulls `image` from its registry, reporting progress.
+pub async fn pull_image(
     docker: &Docker,
     image: &str,
     mut on_progress: impl FnMut(PullProgress),
 ) -> Result<(), RunnerError> {
-    match docker.inspect_image(image).await {
-        Ok(_) => return Ok(()),
-        Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => {}
-        Err(e) => return Err(e.into()),
-    }
     let opts = CreateImageOptionsBuilder::default()
         .from_image(image)
         .build();
