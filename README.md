@@ -227,8 +227,8 @@ und 20 Seiten. Alles läuft lokal:
 
 Erkannter Text kann Fehler enthalten. Daneben steht eine Vorschau des Originals (bei
 Bildern; bei PDFs die erste Seite, soweit das System sie darstellen kann). Das Häkchen
-„Text geprüft und korrigiert“ wird bei jedem Import zurückgesetzt; es wird für die
-geplante Erzeugung von Testfällen aus dem Aufgabentext benötigt.
+„Text geprüft und korrigiert“ wird bei jedem Import zurückgesetzt; es ist Voraussetzung für
+„Testfälle mit KI erzeugen“ (siehe „KI und Texterkennung“).
 
 ## Ausgabevergleich
 
@@ -244,6 +244,86 @@ Testfällen):
   Ausgabe absolut oder relativ um die Toleranz abweichen (z. B. `1e-6`).
 
 Der Diff in den Ergebnissen ist immer zeilenbasiert.
+
+## KI und Texterkennung
+
+„Testfälle mit KI erzeugen“ erstellt aus der geprüften Aufgabenstellung Testfälle – mit
+einem **lokalen** Sprachmodell (Qwen2.5-Coder über llama.cpp), ohne Cloud-Dienst.
+Grundlage ist die Recherche in
+[`docs/ENTSCHEIDUNGSGRUNDLAGE_lokale-KI-Aufgabenchecker.md`](docs/ENTSCHEIDUNGSGRUNDLAGE_lokale-KI-Aufgabenchecker.md).
+
+**Kernregel:** Die KI schreibt **nie** die erwarteten Ausgaben. Sie schreibt Lösungen und
+Testeingaben; die erwarteten Ausgaben entstehen durch **Ausführen** geprüfter Lösungen in
+derselben Sandbox wie beim „Prüfen“.
+
+Ablauf (`src-tauri/src/ai/pipeline.rs`):
+
+1. **Struktur:** Ein-/Ausgabeformat, Beispiele und ein Vorschlag für den Vergleichsmodus
+   (JSON, per JSON-Schema grammatikgebunden). Ein Beispiel zählt nur, wenn Ein- und
+   Ausgabe **wörtlich** im Aufgabentext stehen (Zeilenenden und Leerraum am Zeilenrand
+   egal) – erfundene Beispiele werden verworfen.
+2. **Lösungen:** 5 (1.5B-Modell) bzw. 3 (7B-Modell) unabhängige Lösungen, Temperatur 0,7.
+3. **Kompilieren** in der Sandbox; höchstens eine Reparaturrunde mit der Fehlermeldung.
+4. **Beispiele des Blatts:** Lösungen, die sie nicht bestehen, fallen heraus.
+5. **Testeingaben:** höchstens 10, inklusive Grenzfällen – nur Eingaben.
+6. **Mehrheitsentscheid:** Alle verbliebenen Lösungen laufen auf jede Eingabe; die
+   Ausgaben werden im gewählten Vergleichsmodus gruppiert, die größte Gruppe liefert den
+   Erwartungswert. Ohne echte Mehrheit (z. B. 2 gegen 2) wird die Eingabe verworfen.
+7. **Konfidenz:**
+   - **Grün:** Die Beispiele des Blatts wurden bestanden, mindestens zwei Lösungen sind
+     übrig und bei jedem Testfall stimmen mindestens 80 % von ihnen überein.
+   - **Gelb:** keine Beispiele im Text, nur eine Lösung übrig, knappe Mehrheit oder
+     verworfene Eingaben – die Testfälle sind **nur ein Hinweis**.
+   - **Rot:** Keine Lösung besteht (oder keine Eingabe hat eine Mehrheit). Dann gibt es
+     **keine** Testfälle, sondern eine ehrliche Meldung.
+
+Die Testfälle werden an die vorhandenen angehängt (höchstens 50 insgesamt), mit „KI“
+markiert und bleiben bearbeitbar. Die Musterlösung (die Lösung, die am häufigsten mit der
+Mehrheit übereinstimmte) lässt sich aufklappen. Der vorgeschlagene Vergleichsmodus wird
+nur übernommen, wenn man „Vorschlag übernehmen“ klickt; sonst gilt der eingestellte.
+
+**Grenzen** (Recherche §11) – hier ist das Ergebnis höchstens ein Hinweis:
+Aufgaben ohne Beispiele, mehrdeutige Texte, mehrere richtige Ausgaben, GUI/Dateien/
+Netzwerk/Zufall/Nebenläufigkeit, Strukturvorgaben („rekursiv lösen“, „Klasse X
+implementieren“) und algorithmisch anspruchsvolle Aufgaben (kleine Modelle scheitern
+dort häufig). Die Konfidenzanzeige ist deshalb Pflicht.
+
+**Hardware und Dauer** (Schätzungen, nicht auf echten Schüler-/Studierenden-PCs gemessen):
+
+| Arbeitsspeicher | Vorschlag | Größe | Dauer je Aufgabe (CPU) |
+|---|---|---|---|
+| unter 12 GB | Qwen2.5-Coder 1.5B Instruct, Q5_K_M | ≈ 1,1 GB | ca. 1–4 Minuten |
+| ab 12 GB | Qwen2.5-Coder 7B Instruct, Q4_K_M | ≈ 4,7 GB | ca. 4–10 Minuten |
+
+Auf Apple Silicon (Metal) deutlich schneller. Ohne AVX2 warnt die App (sehr langsam).
+Qwen2.5-Coder-3B wird nicht angeboten (Lizenz verbietet kommerzielle Nutzung); 1.5B und 7B
+stehen unter Apache-2.0.
+
+**Datenschutz:** Alles läuft lokal. Die **einzige** Netzwerkverbindung der KI-Funktion ist
+der einmalige Modell-Download von `huggingface.co` (nur https, nur Hosts von Hugging Face,
+auch bei Weiterleitungen; feste Revision, SHA-256 und Größe aus dem Katalog,
+`src-tauri/src/ai/catalog.json`). llama-server lauscht nur auf `127.0.0.1` mit zufälligem
+API-Schlüssel und startet mit `--offline`. Aufgabentexte und Code verlassen den Rechner nie.
+
+**Modell offline einrichten:** Die `.gguf`-Datei (Links und Prüfsummen in `catalog.json`)
+auf einem Rechner mit Internet herunterladen, z. B. per USB-Stick übertragen und unter
+„KI-Modell …“ → „Datei importieren (.gguf) …“ einlesen. Stimmt die SHA-256 mit dem Katalog
+überein, gilt die Datei als geprüftes Katalogmodell; eine unbekannte Datei wird nur nach
+ausdrücklicher Bestätigung übernommen und als „unbekanntes Modell“ markiert. Modelle liegen
+im App-Datenordner (`models/`), die Auswahl in `ai.json` im Konfigurationsordner.
+
+**Modellkatalog pinnen:** `scripts/pin-models.sh` trägt Revision, Größe und SHA-256 aus der
+Hugging-Face-API ein (bei aufgeteilten GGUF-Dateien alle Teile; llama.cpp lädt sie über den
+ersten Teil). Solange das nicht geschehen ist, verweigert die App den Download (Import
+geht) und der Release-Workflow bricht ab (`scripts/pin-models.sh --check`).
+**Stand:** In dieser Version ist der Katalog noch **nicht** gepinnt – der Build-Umgebung war
+huggingface.co nicht erreichbar. Vor dem nächsten Release einmal mit Internet ausführen und
+`catalog.json` committen.
+
+**KI-Laufzeit:** llama.cpp Release `b11700` (offizielle Binaries, SHA-256 je Plattform in
+`scripts/fetch-llama-server.sh`), im Installer unter `llama/`. Unter Windows braucht
+llama-server die Visual-C++-Laufzeit; der Release-Installer legt sie bei. Fehlt sie (z. B.
+in lokal gebauten Testversionen), meldet die App das mit Link zum Microsoft-Download.
 
 ## Entwicklung
 
@@ -281,6 +361,19 @@ npm run tauri dev
 
 # Integrationstests (benötigen Docker, standardmäßig mit den :dev-Images)
 cd src-tauri && cargo test -- --ignored --test-threads=1
+```
+
+KI (Entwickler-Builds): llama-server für Linux holen und per Umgebungsvariable setzen
+(gilt nur in Debug-Builds), Modell unter „KI-Modell …“ importieren:
+
+```sh
+scripts/fetch-llama-server.sh linux-x64 /tmp/llama
+CODE_PRUEFER_LLAMA_SERVER=/tmp/llama/llama-server npm run tauri dev
+
+# Integrationstests: echter llama-server, beliebiges GGUF (ideal: Qwen2.5-Coder-1.5B)
+cd src-tauri && CODE_PRUEFER_LLAMA_SERVER=/tmp/llama/llama-server \
+  CODE_PRUEFER_TEST_MODEL=/pfad/zum/modell.gguf \
+  cargo test --test ai_integration -- --ignored --nocapture --test-threads=1
 ```
 
 Integrationstest für das Laden aus einem Archiv:
@@ -321,13 +414,14 @@ Registry-Digest – die App prüft die Archive, lädt aber nichts herunter):
 
 ```sh
 scripts/export-image-archives.sh amd64     # -> src-tauri/resources/images/ (Archive + image-digests.json, nicht eingecheckt)
+scripts/fetch-llama-server.sh win-x64      # -> src-tauri/resources/llama/ (bzw. macos-arm64 / macos-x64)
 npm run tauri build -- --config src-tauri/tauri.release.conf.json
 # Windows-Installer unter Linux:
 npm run tauri build -- --target x86_64-pc-windows-gnu --bundles nsis --config src-tauri/tauri.release.conf.json
 ```
 
-Portable Windows-Version: den Ordner `images` (mit den Archiven und `image-digests.json`)
-neben `code-pruefer.exe` legen – unter Windows ist der Tauri-Ressourcenordner immer der
+Portable Windows-Version: die Ordner `images` (mit den Archiven und `image-digests.json`)
+und `llama` (llama-server und DLLs) neben `code-pruefer.exe` legen – unter Windows ist der Tauri-Ressourcenordner immer der
 Ordner der exe.
 
 ### Projektstruktur
@@ -337,7 +431,13 @@ src/                     React-Frontend (Monaco-Editor, Testfälle, Ergebnisse)
 src-tauri/src/
   lib.rs                 Tauri-Commands: docker_status, get_engine, set_engine,
                          start_engine, list_languages, run_tests,
-                         prepare_images, update_images, import_task_document
+                         prepare_images, update_images, import_task_document,
+                         ai_status, download_model, import_model, delete_model,
+                         select_model, generate_tests, cancel_ai
+  ai/llama.rs            llama-server als Sidecar (Start, /health, Client, Abbruch)
+  ai/models.rs           Modellkatalog (catalog.json), Hardware, Download, Import
+  ai/pipeline.rs         Testfälle erzeugen: Lösungen, Beispiele, Mehrheit, Konfidenz
+  ai/prompts.rs          Prompts, JSON-Schemas, Code aus Antworten extrahieren
   docs/mod.rs            Import von Aufgabenblättern (Bild, PDF, DOCX), Limits
   docs/docx.rs           Text aus word/document.xml
   docs/pdf.rs            Textebene pro Seite, Erkennung gescannter Seiten
@@ -353,11 +453,15 @@ src-tauri/src/
   runner/compare.rs      Normalisierung, Zeilen-Diff, Ausgabebegrenzung
 src-tauri/windows/       NSIS-Installer: Template + Hooks (Engine-Auswahl, winget)
 src-tauri/tauri.release.conf.json
-                         Release-Overlay: bündelt resources/images/*.tar.gz
-                         und resources/images/image-digests.json
+                         Release-Overlay: bündelt resources/images/*.tar.gz,
+                         resources/images/image-digests.json und resources/llama/*
 images/                  Dockerfiles der Runner-Images
 scripts/export-image-archives.sh
                          Image-Archive und image-digests.json erzeugen
+scripts/fetch-llama-server.sh
+                         llama-server (gepinnt, SHA-256) nach resources/llama/
+scripts/pin-models.sh    Modellkatalog aus der Hugging-Face-API pinnen
+THIRD_PARTY_NOTICES.txt  Lizenzen von llama.cpp u. a. (wird mitgeliefert)
 .github/workflows/       ci.yml, images.yml (edge), release.yml (Tags v*)
 .github/dependabot.yml   Updates für Actions, npm, cargo, Basis-Images
 ```
@@ -368,7 +472,8 @@ unter `images/`.
 ## Einschränkungen des MVP
 
 - Nur Python und Java; Java-Code muss eine Klasse `Main` enthalten (Datei `Main.java`).
-- Testfälle werden manuell eingegeben; keine Speicherung von Aufgaben/Testfällen.
+- Testfälle werden manuell eingegeben oder mit der lokalen KI vorgeschlagen (siehe „KI und
+  Texterkennung“); keine Speicherung von Aufgaben/Testfällen.
 - Vergleich nur über stdout (Zeilen, Wörter oder Zahlen mit Toleranz).
 - Builds sind nicht signiert (Windows SmartScreen / macOS Gatekeeper warnen; Signatur ist
   vorbereitet), kein Auto-Update der App (die Images lassen sich über „Images aktualisieren“ neu laden).
@@ -377,7 +482,7 @@ unter `images/`.
   sie über winget nachinstallieren.
 
 Geplant für spätere Phasen: weitere Sprachen (C/C++/C#/JavaScript), signierter
-Aufgabenkatalog, Code-Signing, Updater, automatisch generierte Tests.
+Aufgabenkatalog, Code-Signing, Updater.
 
 ## Recherche: lokale KI und Texterkennung
 
