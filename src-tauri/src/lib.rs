@@ -119,3 +119,37 @@ pub fn run() {
             }
         });
 }
+
+#[cfg(test)]
+mod tests {
+    /// The frontend may only open the URLs the capability allows
+    /// (`opener:allow-open-url` instead of `opener:default`).
+    #[test]
+    fn opener_capability_allows_exactly_the_download_pages() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read_to_string(root.join("capabilities/default.json")).unwrap();
+        let cap: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let perms = cap["permissions"].as_array().unwrap();
+        assert!(!perms.iter().any(|p| p == "opener:default"));
+        let opener = perms
+            .iter()
+            .find(|p| p["identifier"] == "opener:allow-open-url")
+            .expect("opener:allow-open-url");
+        let mut allowed: Vec<&str> = opener["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["url"].as_str().unwrap())
+            .collect();
+        allowed.sort();
+
+        let banner =
+            std::fs::read_to_string(root.join("../src/components/DockerBanner.tsx")).unwrap();
+        let mut used: Vec<&str> = banner
+            .split('"')
+            .filter(|s| s.starts_with("https://"))
+            .collect();
+        used.sort();
+        assert_eq!(allowed, used);
+    }
+}

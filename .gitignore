@@ -9,3 +9,4 @@ src-tauri/gen/schemas/
 !.vscode/extensions.json
 .idea/
 src-tauri/resources/images/*.tar.gz
+src-tauri/tauri.sign.conf.json

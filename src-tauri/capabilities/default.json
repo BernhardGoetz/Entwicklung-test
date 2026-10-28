@@ -1,7 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Rechte des Hauptfensters",
+  "description": "Rechte des Hauptfensters: nur die Download-Seiten von Docker Desktop und Podman dürfen im Browser geöffnet werden",
   "windows": ["main"],
-  "permissions": ["core:default", "opener:default"]
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://www.docker.com/products/docker-desktop/" },
+        { "url": "https://podman.io/" }
+      ]
+    }
+  ]
 }

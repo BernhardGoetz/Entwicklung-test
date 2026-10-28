@@ -10,7 +10,8 @@ name: Release
 #     Prüfsummen, gegen die die App Archive und Downloads prüft,
 #  3. den Windows-Installer (NSIS, x64) und macOS-DMGs (Apple Silicon + Intel)
 #     mit eingebetteten Images (src-tauri/tauri.release.conf.json),
-#  4. ein Entwurfs-Release (draft) mit allen Installern.
+#  4. ein Entwurfs-Release (draft) mit allen Installern, SHA256SUMS.txt und
+#     einer Build-Provenance-Attestierung (gh attestation verify …).
 # Die App erwartet <IMAGE_REGISTRY>/code-pruefer-<sprache>:<Cargo-Version>;
 # der Job "version" bricht ab, wenn Tag, Cargo.toml, tauri.conf.json,
 # package.json oder der Registry-Namensraum nicht zusammenpassen.
@@ -159,6 +160,11 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: read
+    # Für die optionalen Signatur-Secrets (siehe unten).
+    environment: release
+    env:
+      # Secrets sind in `if:` nicht direkt verfügbar.
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -188,11 +194,38 @@ jobs:
 
       - run: npm ci
 
-      # Optional: Code-Signing (z. B. per bundle.windows.signCommand) ist
-      # noch nicht eingerichtet – der Installer ist unsigniert.
+      # OPTIONAL – wird übersprungen, solange das Secret WINDOWS_CERTIFICATE
+      # (base64 .pfx, Code-Signing-Zertifikat) fehlt; dazu
+      # WINDOWS_CERTIFICATE_PASSWORD. Importiert das Zertifikat und schreibt
+      # ein Konfigurations-Overlay mit dessen Fingerabdruck, mit dem Tauri
+      # exe und Installer per signtool signiert. Ohne Secret: unsigniert.
+      - name: Code-Signing vorbereiten (optional)
+        if: env.HAS_WINDOWS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $pfx
+          $config = @{ bundle = @{ windows = @{
+            certificateThumbprint = $cert.Thumbprint
+            digestAlgorithm = "sha256"
+            timestampUrl = "http://timestamp.digicert.com"
+          } } }
+          $config | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 src-tauri/tauri.sign.conf.json
+
       - name: Installer bauen (NSIS, deutsch, mit Images)
         shell: bash
-        run: npm run tauri -- build --bundles nsis --config src-tauri/tauri.release.conf.json
+        run: |
+          sign=()
+          if [ -f src-tauri/tauri.sign.conf.json ]; then
+            sign=(--config src-tauri/tauri.sign.conf.json)
+          fi
+          npm run tauri -- build --bundles nsis --config src-tauri/tauri.release.conf.json "${sign[@]}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -289,12 +322,27 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # Entwurfs-Release anlegen
+      id-token: write # Signatur der Attestierung (Sigstore)
+      attestations: write # Attestierung speichern
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: bundle-*
           merge-multiple: true
           path: release
+
+      - name: SHA256SUMS.txt
+        working-directory: release
+        run: |
+          sha256sum -- * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt .
+          cat SHA256SUMS.txt >> "$GITHUB_STEP_SUMMARY"
+
+      # Prüfen: gh attestation verify <Datei> --repo <owner>/<repo>
+      - name: Build-Provenance attestieren
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release/*
 
       # Mit der vorinstallierten gh-CLI statt einer Fremd-Action, die das
       # Token mit Schreibrecht bekäme.
@@ -317,6 +365,8 @@ jobs:
 
           - Windows x64: \`*_x64-setup.exe\`
           - macOS Apple Silicon: \`*_aarch64.dmg\`, macOS Intel: \`*_x64.dmg\`
+          - Prüfsummen: \`SHA256SUMS.txt\` (\`sha256sum -c SHA256SUMS.txt\`); Herkunft:
+            \`gh attestation verify <Datei> --repo ${GH_REPO}\`
 
           Die Runner-Images (Python, Java) sind in den Installern enthalten und werden
           beim ersten Start automatisch in Docker bzw. Podman geladen. Online-Update:
