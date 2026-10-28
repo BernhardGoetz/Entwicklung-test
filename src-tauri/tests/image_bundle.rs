@@ -105,6 +105,7 @@ async fn load_via_app(archived_as: &str) {
                 expected: "x\n".into(),
             }],
             trim_whitespace: true,
+            compare_mode: None,
         },
         |_| {},
     )

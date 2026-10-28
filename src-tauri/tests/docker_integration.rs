@@ -13,6 +13,7 @@
 //! (env overrides and the `:dev` fallback only exist in debug builds, which
 //! `cargo test` uses).
 
+use code_pruefer_lib::runner::compare::CompareMode;
 use code_pruefer_lib::runner::{self, docker, RunReport, RunRequest, TestCase, TestStatus};
 
 fn setup() {
@@ -42,6 +43,7 @@ async fn run(language: &str, code: &str, tests: Vec<TestCase>) -> RunReport {
             code: code.into(),
             tests,
             trim_whitespace: true,
+            compare_mode: None,
         },
         |_| {},
     )
@@ -183,6 +185,70 @@ open('/work/ok.txt', 'w').write('x'); print('work-ok')
 
 #[tokio::test]
 #[ignore = "benötigt Docker und die Runner-Images"]
+async fn tokens_mode_ignores_line_structure() {
+    setup();
+    let code = "n = int(input())\nfor i in range(n):\n    print(i, end='  ')\n";
+    let request = |mode| RunRequest {
+        language: "python".into(),
+        code: code.into(),
+        tests: vec![tc("3\n", "0\n1\n2\n")],
+        trim_whitespace: true,
+        compare_mode: Some(mode),
+    };
+    let tokens = CompareMode::Tokens {
+        case_sensitive: true,
+    };
+    let r = runner::run_submission(request(tokens), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(statuses(&r), vec![TestStatus::Passed], "{:?}", r.tests[0]);
+    let r = runner::run_submission(request(CompareMode::lines(true)), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(statuses(&r), vec![TestStatus::Failed]);
+}
+
+#[tokio::test]
+#[ignore = "benötigt Docker und die Runner-Images"]
+async fn collect_outputs_runs_every_input() {
+    setup();
+    let inputs: Vec<String> = vec!["2\n".into(), "5\n".into(), "x\n".into()];
+    let mut phases = Vec::new();
+    let c = runner::collect_outputs("python", "print(int(input()) ** 2)\n", &inputs, |p| {
+        phases.push(p)
+    })
+    .await
+    .unwrap();
+    assert!(c.compile_ok);
+    let stdout: Vec<&str> = c.outputs.iter().map(|o| o.stdout.as_str()).collect();
+    assert_eq!(stdout, vec!["4\n", "25\n", ""]);
+    assert_eq!(c.outputs[0].exit_code, Some(0));
+    assert_ne!(c.outputs[2].exit_code, Some(0));
+    assert!(c.outputs[2].stderr.contains("ValueError"));
+    assert!(!phases.is_empty());
+
+    // Java: compiled once; a compile error gives no outputs.
+    let java = "public class Main { public static void main(String[] a) { \
+                System.out.println(new java.util.Scanner(System.in).nextInt() + 1); } }\n";
+    let c = runner::collect_outputs("java", java, &inputs[..2], |_| {})
+        .await
+        .unwrap();
+    assert!(c.compile_ok, "{:?}", c.compile);
+    let stdout: Vec<&str> = c.outputs.iter().map(|o| o.stdout.as_str()).collect();
+    assert_eq!(stdout, vec!["3\n", "6\n"]);
+    let c = runner::collect_outputs("java", "class Main {", &inputs, |_| {})
+        .await
+        .unwrap();
+    assert!(!c.compile_ok);
+    assert!(c.outputs.is_empty());
+    assert!(
+        sandbox_containers().is_empty(),
+        "sandbox containers left behind"
+    );
+}
+
+#[tokio::test]
+#[ignore = "benötigt Docker und die Runner-Images"]
 async fn java_compile_and_run() {
     let code = "import java.util.*;\npublic class Main { public static void main(String[] a) { Scanner s = new Scanner(System.in); System.out.println(\"Hallo \" + s.nextLine() + \" ä\"); } }\n";
     let r = run("java", code, vec![tc("Welt\n", "Hallo Welt ä\n")]).await;
@@ -270,6 +336,7 @@ async fn falls_back_to_local_dev_image_without_override() {
             code: "print(input())".into(),
             tests: vec![tc("x\n", "x\n")],
             trim_whitespace: true,
+            compare_mode: None,
         },
         |_| {},
     )
@@ -296,6 +363,7 @@ async fn missing_override_image_gives_actionable_error() {
             code: "print(1)".into(),
             tests: vec![tc("", "1")],
             trim_whitespace: true,
+            compare_mode: None,
         },
         |_| {},
     )

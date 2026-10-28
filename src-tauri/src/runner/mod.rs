@@ -7,7 +7,7 @@ pub mod languages;
 
 use serde::{Deserialize, Serialize};
 
-use compare::{line_diff, normalize_newlines, normalize_output, outputs_match, DiffLine};
+use compare::{line_diff, normalize_newlines, CompareMode, DiffLine};
 use docker::{PullProgress, Sandbox, STDIN_FILE};
 
 /// Maximum accepted size of source code and of a single test input/expectation.
@@ -67,8 +67,31 @@ pub struct RunRequest {
     pub code: String,
     pub tests: Vec<TestCase>,
     /// Ignore trailing whitespace per line and trailing newlines (default on).
+    /// Only used without `compare_mode`.
     #[serde(default = "default_true")]
     pub trim_whitespace: bool,
+    /// How outputs are compared; `None` = lines, trimmed per `trim_whitespace`.
+    #[serde(default)]
+    pub compare_mode: Option<CompareMode>,
+}
+
+impl RunRequest {
+    /// The effective comparison mode.
+    pub fn mode(&self) -> CompareMode {
+        self.compare_mode
+            .unwrap_or(CompareMode::lines(self.trim_whitespace))
+    }
+}
+
+/// Outputs of a program for a list of inputs (see [`collect_outputs`]).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectedOutputs {
+    pub image: String,
+    pub compile: Option<StepOutput>,
+    pub compile_ok: bool,
+    /// One entry per input, in order; empty if compiling failed.
+    pub outputs: Vec<StepOutput>,
 }
 
 /// " Für Entwickler: …" part of [`RunnerError::ImageMissing`] (debug builds).
@@ -162,39 +185,64 @@ pub enum Progress {
     },
 }
 
-pub async fn run_submission(
-    req: RunRequest,
-    mut on_progress: impl FnMut(Progress),
-) -> Result<RunReport, RunnerError> {
-    let lang = languages::get(&req.language)
-        .ok_or_else(|| RunnerError::UnknownLanguage(req.language.clone()))?;
-    if req.code.len() > MAX_INPUT_BYTES
-        || req
-            .tests
-            .iter()
-            .any(|t| t.input.len() > MAX_INPUT_BYTES || t.expected.len() > MAX_INPUT_BYTES)
-    {
+fn language(id: &str) -> Result<&'static languages::LanguageConfig, RunnerError> {
+    languages::get(id).ok_or_else(|| RunnerError::UnknownLanguage(id.to_string()))
+}
+
+/// Checks the size limits shared by runs and output collection: the code
+/// and every field at most [`MAX_INPUT_BYTES`], at most [`MAX_TESTS`] runs.
+fn check_limits<'a>(
+    code: &str,
+    fields: impl IntoIterator<Item = &'a str>,
+    runs: usize,
+) -> Result<(), RunnerError> {
+    if code.len() > MAX_INPUT_BYTES || fields.into_iter().any(|f| f.len() > MAX_INPUT_BYTES) {
         return Err(RunnerError::Other(
             "Code oder Testdaten sind zu groß (max. 1 MB je Feld).".into(),
         ));
     }
-    if req.tests.len() > MAX_TESTS {
+    if runs > MAX_TESTS {
         return Err(RunnerError::Other(format!(
-            "Zu viele Testfälle ({}) – höchstens {MAX_TESTS} pro Prüfung.",
-            req.tests.len()
+            "Zu viele Testfälle ({runs}) – höchstens {MAX_TESTS} pro Prüfung."
         )));
     }
-    let hint = languages::precheck(lang, &req.code);
+    Ok(())
+}
 
+/// Connects to the engine, makes sure the image exists and starts a fresh
+/// sandbox container. The caller must `remove()` it.
+async fn start_sandbox(
+    lang: &languages::LanguageConfig,
+    on_progress: &mut impl FnMut(Progress),
+) -> Result<(Sandbox, String), RunnerError> {
     let docker = docker::connect().await?;
     // Left-overs of crashed runs; failures do not block the run.
     let _ = docker::remove_orphans(&docker, docker::ORPHAN_AGE).await;
-    let image = images::ensure_image(&docker, lang, &mut on_progress).await?;
+    let image = images::ensure_image(&docker, lang, on_progress).await?;
 
     on_progress(Progress::Phase {
         message: "Starte Container …".into(),
     });
     let sandbox = Sandbox::create(&docker, &image).await?;
+    Ok((sandbox, image))
+}
+
+pub async fn run_submission(
+    req: RunRequest,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<RunReport, RunnerError> {
+    let lang = language(&req.language)?;
+    check_limits(
+        &req.code,
+        req.tests
+            .iter()
+            .flat_map(|t| [t.input.as_str(), t.expected.as_str()]),
+        req.tests.len(),
+    )?;
+    req.mode().validate().map_err(RunnerError::Other)?;
+    let hint = languages::precheck(lang, &req.code);
+
+    let (sandbox, image) = start_sandbox(lang, &mut on_progress).await?;
     let result = run_in_sandbox(&sandbox, lang, &req, &mut on_progress).await;
     sandbox.remove().await;
 
@@ -215,6 +263,84 @@ pub async fn run_submission(
     })
 }
 
+/// Runs `code` once per input and returns the raw outputs (no expected
+/// output, no evaluation) – e.g. to compute expected outputs from a
+/// reference solution. Same sandbox, limits and flow as [`run_submission`]:
+/// one container, compiled once, every input in a fresh process.
+pub async fn collect_outputs(
+    language_id: &str,
+    code: &str,
+    inputs: &[String],
+    mut on_progress: impl FnMut(Progress),
+) -> Result<CollectedOutputs, RunnerError> {
+    let lang = language(language_id)?;
+    check_limits(code, inputs.iter().map(String::as_str), inputs.len())?;
+
+    let (sandbox, image) = start_sandbox(lang, &mut on_progress).await?;
+    let result = async {
+        let (compile, compile_ok) =
+            compile_in_sandbox(&sandbox, lang, code, &mut on_progress).await?;
+        let mut outputs = Vec::with_capacity(inputs.len());
+        if compile_ok {
+            for (index, input) in inputs.iter().enumerate() {
+                on_progress(Progress::Phase {
+                    message: format!("Eingabe {} von {} …", index + 1, inputs.len()),
+                });
+                outputs.push(run_input(&sandbox, lang, input).await?.into());
+            }
+        }
+        Ok(CollectedOutputs {
+            image,
+            compile,
+            compile_ok,
+            outputs,
+        })
+    }
+    .await;
+    sandbox.remove().await;
+    result
+}
+
+/// Writes the source file and compiles it (if the language has a compile
+/// step). Returns the compiler output and whether compiling succeeded.
+async fn compile_in_sandbox(
+    sandbox: &Sandbox,
+    lang: &languages::LanguageConfig,
+    code: &str,
+    on_progress: &mut impl FnMut(Progress),
+) -> Result<(Option<StepOutput>, bool), RunnerError> {
+    let source_path = format!("{}/{}", docker::WORK_DIR, lang.source_file);
+    sandbox
+        .write_file(&source_path, normalize_newlines(code).as_bytes())
+        .await?;
+
+    let Some(cmd) = lang.compile_cmd else {
+        return Ok((None, true));
+    };
+    on_progress(Progress::Phase {
+        message: "Kompiliere …".into(),
+    });
+    let out = sandbox
+        .exec_with_stdin_file(cmd, None, lang.compile_timeout)
+        .await?;
+    let ok = !out.timed_out && out.exit_code == Some(0);
+    Ok((Some(StepOutput::from(out)), ok))
+}
+
+/// Runs the compiled program once with `input` as stdin.
+async fn run_input(
+    sandbox: &Sandbox,
+    lang: &languages::LanguageConfig,
+    input: &str,
+) -> Result<docker::ExecOutput, RunnerError> {
+    sandbox
+        .write_file(STDIN_FILE, normalize_newlines(input).as_bytes())
+        .await?;
+    sandbox
+        .exec_with_stdin_file(lang.run_cmd, Some(STDIN_FILE), lang.run_timeout)
+        .await
+}
+
 type SandboxResult = (Option<StepOutput>, bool, Vec<TestResult>);
 
 async fn run_in_sandbox(
@@ -223,26 +349,12 @@ async fn run_in_sandbox(
     req: &RunRequest,
     on_progress: &mut impl FnMut(Progress),
 ) -> Result<SandboxResult, RunnerError> {
-    let source_path = format!("{}/{}", docker::WORK_DIR, lang.source_file);
-    sandbox
-        .write_file(&source_path, normalize_newlines(&req.code).as_bytes())
-        .await?;
-
-    let mut compile = None;
-    if let Some(cmd) = lang.compile_cmd {
-        on_progress(Progress::Phase {
-            message: "Kompiliere …".into(),
-        });
-        let out = sandbox
-            .exec_with_stdin_file(cmd, None, lang.compile_timeout)
-            .await?;
-        let ok = !out.timed_out && out.exit_code == Some(0);
-        compile = Some(StepOutput::from(out));
-        if !ok {
-            return Ok((compile, false, Vec::new()));
-        }
+    let (compile, compile_ok) = compile_in_sandbox(sandbox, lang, &req.code, on_progress).await?;
+    if !compile_ok {
+        return Ok((compile, false, Vec::new()));
     }
 
+    let mode = req.mode();
     let mut results = Vec::with_capacity(req.tests.len());
     for (index, test) in req.tests.iter().enumerate() {
         on_progress(Progress::Phase {
@@ -253,16 +365,8 @@ async fn run_in_sandbox(
         } else {
             test.name.clone()
         };
-        let run = async {
-            sandbox
-                .write_file(STDIN_FILE, normalize_newlines(&test.input).as_bytes())
-                .await?;
-            sandbox
-                .exec_with_stdin_file(lang.run_cmd, Some(STDIN_FILE), lang.run_timeout)
-                .await
-        };
-        let result = match run.await {
-            Ok(out) => evaluate(index, name, out, &test.expected, req.trim_whitespace, lang),
+        let result = match run_input(sandbox, lang, &test.input).await {
+            Ok(out) => evaluate(index, name, out, &test.expected, &mode, lang),
             Err(e) => TestResult {
                 index,
                 name,
@@ -283,16 +387,16 @@ pub fn evaluate(
     name: String,
     out: docker::ExecOutput,
     expected: &str,
-    trim: bool,
+    mode: &CompareMode,
     lang: &languages::LanguageConfig,
 ) -> TestResult {
-    let matches = outputs_match(expected, &out.stdout, trim);
+    let matches = mode.matches(expected, &out.stdout);
     let diff = if matches {
         Vec::new()
     } else {
         line_diff(
-            &normalize_output(expected, trim),
-            &normalize_output(&out.stdout, trim),
+            &mode.display_text(expected),
+            &mode.display_text(&out.stdout),
         )
     };
     let (status, message) = if out.timed_out {
@@ -362,7 +466,7 @@ mod tests {
             "t".into(),
             out("42\n", Some(0), false),
             "42\r\n",
-            true,
+            &CompareMode::lines(true),
             py(),
         );
         assert_eq!(r.status, TestStatus::Passed);
@@ -376,7 +480,7 @@ mod tests {
             "t".into(),
             out("41\n", Some(0), false),
             "42\n",
-            true,
+            &CompareMode::lines(true),
             py(),
         );
         assert_eq!(r.status, TestStatus::Failed);
@@ -385,10 +489,24 @@ mod tests {
 
     #[test]
     fn evaluate_timeout_and_runtime_error() {
-        let r = evaluate(0, "t".into(), out("", None, true), "x", true, py());
+        let r = evaluate(
+            0,
+            "t".into(),
+            out("", None, true),
+            "x",
+            &CompareMode::lines(true),
+            py(),
+        );
         assert_eq!(r.status, TestStatus::Timeout);
         assert!(r.message.unwrap().contains("5 s"));
-        let r = evaluate(0, "t".into(), out("x\n", Some(1), false), "x", true, py());
+        let r = evaluate(
+            0,
+            "t".into(),
+            out("x\n", Some(1), false),
+            "x",
+            &CompareMode::lines(true),
+            py(),
+        );
         assert_eq!(r.status, TestStatus::RuntimeError);
     }
 
@@ -396,7 +514,7 @@ mod tests {
     fn evaluate_marks_truncation() {
         let mut o = out("x", Some(0), false);
         o.stdout_truncated = true;
-        let r = evaluate(0, "t".into(), o, "y", true, py());
+        let r = evaluate(0, "t".into(), o, "y", &CompareMode::lines(true), py());
         assert!(r.message.unwrap().contains("64 KB"));
     }
 
@@ -432,6 +550,7 @@ mod tests {
                 })
                 .collect(),
             trim_whitespace: true,
+            compare_mode: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -453,5 +572,109 @@ mod tests {
         )
         .unwrap();
         assert!(req.trim_whitespace);
+        assert_eq!(req.mode(), CompareMode::lines(true));
+    }
+
+    #[test]
+    fn compare_mode_overrides_trim_flag() {
+        let req: RunRequest = serde_json::from_str(
+            r#"{"language":"python","code":"","tests":[],"trimWhitespace":false,
+                "compareMode":{"kind":"tokens","caseSensitive":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.mode(),
+            CompareMode::Tokens {
+                case_sensitive: false
+            }
+        );
+        let req: RunRequest = serde_json::from_str(
+            r#"{"language":"python","code":"","tests":[],"trimWhitespace":false}"#,
+        )
+        .unwrap();
+        assert_eq!(req.mode(), CompareMode::lines(false));
+    }
+
+    #[test]
+    fn evaluate_in_token_and_float_mode() {
+        let tokens = CompareMode::Tokens {
+            case_sensitive: true,
+        };
+        let r = evaluate(
+            0,
+            "t".into(),
+            out("1  2\n3\n", Some(0), false),
+            "1 2 3",
+            &tokens,
+            py(),
+        );
+        assert_eq!(r.status, TestStatus::Passed);
+        let float = CompareMode::Float {
+            abs_tol: 1e-3,
+            rel_tol: 0.0,
+        };
+        let r = evaluate(
+            0,
+            "t".into(),
+            out("0.3334\n", Some(0), false),
+            "0.3333",
+            &float,
+            py(),
+        );
+        assert_eq!(r.status, TestStatus::Passed);
+        let r = evaluate(
+            0,
+            "t".into(),
+            out("0.34\n", Some(0), false),
+            "0.3333",
+            &float,
+            py(),
+        );
+        assert_eq!(r.status, TestStatus::Failed);
+        assert!(!r.diff.is_empty());
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn invalid_tolerance_is_rejected_before_engine_access() {
+        let req = RunRequest {
+            language: "python".into(),
+            code: "print(1)".into(),
+            tests: Vec::new(),
+            trim_whitespace: true,
+            compare_mode: Some(CompareMode::Float {
+                abs_tol: -1.0,
+                rel_tol: 0.0,
+            }),
+        };
+        let msg = block_on(run_submission(req, |_| {}))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("Ungültige Toleranz"), "{msg}");
+    }
+
+    #[test]
+    fn collect_outputs_checks_limits_before_engine_access() {
+        let inputs = vec![String::new(); MAX_TESTS + 1];
+        let msg = block_on(collect_outputs("python", "print(1)", &inputs, |_| {}))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("höchstens 50"), "{msg}");
+        let big = vec!["x".repeat(MAX_INPUT_BYTES + 1)];
+        let msg = block_on(collect_outputs("python", "print(1)", &big, |_| {}))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("zu groß"), "{msg}");
+        let msg = block_on(collect_outputs("cobol", "", &[], |_| {}))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("Unbekannte Sprache"), "{msg}");
     }
 }
