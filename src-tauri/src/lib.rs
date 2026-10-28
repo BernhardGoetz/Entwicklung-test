@@ -18,6 +18,8 @@ pub const ENGINE_EVENT: &str = "engine-progress";
 pub const IMAGES_EVENT: &str = "images-progress";
 /// Event name for progress while a task document is imported.
 pub const DOCS_EVENT: &str = "docs-progress";
+/// Event name for model download/import progress.
+pub const MODELS_EVENT: &str = "models-progress";
 
 #[tauri::command]
 async fn docker_status() -> docker_detect::DockerStatus {
@@ -98,6 +100,58 @@ async fn import_task_document(
     .map_err(|e| docs::DocsError::Invalid(format!("Interner Fehler beim Import: {e}")))?
 }
 
+/// Hardware, models (catalog and imported), selection and whether the AI
+/// runtime (llama-server) is available.
+#[tauri::command]
+async fn ai_status() -> ai::models::AiStatus {
+    tauri::async_runtime::spawn_blocking(ai::models::status)
+        .await
+        .expect("ai_status")
+}
+
+/// Downloads a catalog model from huggingface.co (the only network access
+/// of the AI feature); resumable, cancellable via `cancel_ai`.
+#[tauri::command]
+async fn download_model(app: AppHandle, id: String) -> Result<ai::models::AiStatus, ai::AiError> {
+    let op = ai::Operation::start();
+    ai::models::download(&id, &op.token, |p| {
+        let _ = app.emit(MODELS_EVENT, p);
+    })
+    .await
+}
+
+/// Imports a local .gguf file (offline PCs). Unknown files (no catalog hash)
+/// are only taken with `confirm_unknown`.
+#[tauri::command]
+async fn import_model(
+    app: AppHandle,
+    path: String,
+    confirm_unknown: bool,
+) -> Result<ai::models::ImportOutcome, ai::AiError> {
+    let op = ai::Operation::start();
+    ai::models::import(
+        std::path::Path::new(&path),
+        confirm_unknown,
+        &op.token,
+        |p| {
+            let _ = app.emit(MODELS_EVENT, p);
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+async fn delete_model(id: String) -> Result<ai::models::AiStatus, ai::AiError> {
+    ai::models::delete(&id).await
+}
+
+#[tauri::command]
+async fn select_model(id: String) -> Result<ai::models::AiStatus, ai::AiError> {
+    tauri::async_runtime::spawn_blocking(move || ai::models::select(&id))
+        .await
+        .map_err(|e| ai::AiError::Other(e.to_string()))?
+}
+
 /// "Abbrechen" for AI operations: cancels test generation and model
 /// downloads and stops llama-server (frees its memory immediately).
 #[tauri::command]
@@ -113,7 +167,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if let Ok(dir) = app.path().app_config_dir() {
-                engine::init(dir);
+                engine::init(dir.clone());
+                if let Ok(data) = app.path().app_data_dir() {
+                    ai::models::init(dir, data);
+                }
             }
             // Release builds ship the runner images as archives in
             // <resource_dir>/images (next to the .exe on Windows,
@@ -135,6 +192,11 @@ pub fn run() {
             prepare_images,
             update_images,
             import_task_document,
+            ai_status,
+            download_model,
+            import_model,
+            delete_model,
+            select_model,
             cancel_ai
         ])
         .build(tauri::generate_context!())

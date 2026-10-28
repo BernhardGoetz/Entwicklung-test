@@ -5,6 +5,7 @@
 //! download from huggingface.co (`models`).
 
 pub mod llama;
+pub mod models;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
