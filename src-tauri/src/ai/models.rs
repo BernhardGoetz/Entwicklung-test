@@ -1507,6 +1507,115 @@ mod tests {
         assert_eq!(models[1].solutions, 3);
     }
 
+    /// `scripts/pin-models.sh --check` (release workflow) and
+    /// [`CatalogModel::is_pinned`] (app) accept and reject the same
+    /// catalogs. Skipped without bash/jq.
+    #[test]
+    fn release_check_script_agrees_with_app() {
+        let has = |cmd: &str| {
+            std::process::Command::new(cmd)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !has("bash") || !has("jq") {
+            eprintln!("übersprungen: bash/jq fehlen");
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root.join("../scripts/pin-models.sh");
+        let dir = std::env::temp_dir().join(format!("cp-pin-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let check = |name: &str, json: &serde_json::Value| -> bool {
+            let path = dir.join(format!("{name}.json"));
+            std::fs::write(&path, json.to_string()).unwrap();
+            std::process::Command::new("bash")
+                .arg(&script)
+                .arg("--check")
+                .env("CATALOG", &path)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let file = |name: &str, size: serde_json::Value, sha: &str| serde_json::json!({"name": name, "size": size, "sha256": sha});
+        let model = |revision: &str, files: Vec<serde_json::Value>| {
+            serde_json::json!({"models": [{
+                "id": "m", "name": "M", "repo": "Qwen/X-GGUF", "quant": "q4_k_m",
+                "license": "Apache-2.0", "solutions": 3, "revision": revision, "files": files
+            }]})
+        };
+        let rev = "a".repeat(40);
+        let sha = "b".repeat(64);
+        let cases = [
+            (
+                "ok",
+                model(&rev, vec![file("m-q4_k_m.gguf", 10.into(), &sha)]),
+            ),
+            (
+                "split",
+                model(
+                    &rev,
+                    vec![
+                        file("m-q4_k_m-00001-of-00002.gguf", 10.into(), &sha),
+                        file("m-q4_k_m-00002-of-00002.gguf", 11.into(), &sha),
+                    ],
+                ),
+            ),
+            (
+                "no-revision",
+                model("", vec![file("m-q4_k_m.gguf", 10.into(), &sha)]),
+            ),
+            (
+                "branch",
+                model("main", vec![file("m-q4_k_m.gguf", 10.into(), &sha)]),
+            ),
+            ("no-files", model(&rev, vec![])),
+            (
+                "short-sha",
+                model(&rev, vec![file("m-q4_k_m.gguf", 10.into(), "abc")]),
+            ),
+            (
+                "upper-sha",
+                model(
+                    &rev,
+                    vec![file("m-q4_k_m.gguf", 10.into(), &"B".repeat(64))],
+                ),
+            ),
+            (
+                "size-0",
+                model(&rev, vec![file("m-q4_k_m.gguf", 0.into(), &sha)]),
+            ),
+            (
+                "size-text",
+                model(&rev, vec![file("m-q4_k_m.gguf", "10".into(), &sha)]),
+            ),
+            (
+                "path",
+                model(&rev, vec![file("../m-q4_k_m.gguf", 10.into(), &sha)]),
+            ),
+            (
+                "not-gguf",
+                model(&rev, vec![file("m-q4_k_m.bin", 10.into(), &sha)]),
+            ),
+        ];
+        for (name, json) in &cases {
+            let app = parse_catalog(&json.to_string())
+                .map(|ms| ms.iter().all(CatalogModel::is_pinned))
+                .unwrap_or(false);
+            let script_ok = check(name, json);
+            assert_eq!(script_ok, app, "{name}: Skript {script_ok}, App {app}");
+            assert_eq!(script_ok, *name == "ok" || *name == "split", "{name}");
+        }
+        // The committed catalog is unpinned (pinned in the release workflow).
+        let committed: serde_json::Value = serde_json::from_str(CATALOG_JSON).unwrap();
+        assert_eq!(
+            check("committed", &committed),
+            catalog().iter().all(CatalogModel::is_pinned)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn pinning_requires_revision_and_hashes() {
         let m = pinned("m", &[("m-q4_k_m.gguf", 10, 'b')]);

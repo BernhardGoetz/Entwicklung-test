@@ -33,8 +33,9 @@ function modelState(m: ModelInfo): string {
   if (m.installed) return m.known && !m.verified ? "eingerichtet (importiert, nicht geprüft)" : "eingerichtet";
   if (m.partialBytes > 0) return `teilweise geladen (${formatGb(m.partialBytes)})`;
   if (m.importedParts > 0) return `${m.importedParts} Teil(e) importiert – es fehlen noch Teile`;
-  if (m.known && !m.pinned) return "Download in dieser Version nicht möglich – bitte die Datei importieren";
-  return "nicht geladen";
+  if (m.known && !m.pinned)
+    return "Download in dieser Version nicht möglich – bitte die Datei importieren (siehe „Weitere Optionen“)";
+  return "noch nicht heruntergeladen";
 }
 
 /** Import waiting for "Trotzdem importieren". */
@@ -188,8 +189,7 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
         <p className="small">
           Die KI läuft vollständig auf diesem Computer. Nur der einmalige Download des Modells von
           huggingface.co braucht Internet; danach funktioniert alles offline. Aufgabentexte und Code
-          verlassen den Computer nie. Ohne Internet: die .gguf-Datei auf einem anderen Rechner
-          herunterladen und hier importieren.
+          verlassen den Computer nie. Modell herunterladen, danach auswählen – fertig.
         </p>
         {status === null ? (
           <p className="muted">Lade Status …</p>
@@ -206,6 +206,23 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
             {!status.runtimeAvailable && status.runtimeError && (
               <div className="banner warn small">{status.runtimeError}</div>
             )}
+            {(() => {
+              const rec = status.models.find((m) => m.suggested);
+              if (!rec) return null;
+              return (
+                <div className="recommendation small">
+                  <strong>Empfehlung für diesen Rechner:</strong> {rec.name} (
+                  {formatGb(status.hardware.totalRamBytes)} Arbeitsspeicher).{" "}
+                  {rec.installed
+                    ? rec.selected
+                      ? "Ist eingerichtet und ausgewählt."
+                      : "Ist vorhanden – „Auswählen“ klicken."
+                    : rec.pinned
+                      ? "„Herunterladen“ klicken, danach „Auswählen“."
+                      : "In dieser Version bitte die Datei importieren (siehe „Weitere Optionen“)."}
+                </div>
+              );
+            })()}
             <ul className="model-list">
               {status.models.map((m) => (
                 <li key={m.id} className={m.selected ? "model selected" : "model"}>
@@ -229,7 +246,11 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
                   <div className="row small">
                     <span className="muted">{modelState(m)}</span>
                     {m.known && !m.installed && m.pinned && (
-                      <button onClick={() => void download(m)} disabled={!idle}>
+                      <button
+                        className={m.suggested ? "primary" : undefined}
+                        onClick={() => void download(m)}
+                        disabled={!idle}
+                      >
                         {m.partialBytes > 0 ? "Download fortsetzen" : "Herunterladen"}
                       </button>
                     )}
@@ -240,8 +261,9 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
                     )}
                     {!m.installed && (
                       <span className="muted">
-                        Auswählen erst möglich, wenn das Modell vollständig da ist: erst importieren
-                        {m.pinned ? " oder herunterladen" : ""}.
+                        {m.pinned
+                          ? "Nach dem Herunterladen „Auswählen“ klicken."
+                          : "Auswählen erst möglich, wenn das Modell vollständig importiert ist."}
                       </span>
                     )}
                     {(m.installed || m.partialBytes > 0 || m.importedParts > 0) &&
@@ -259,23 +281,34 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
                       ))}
                   </div>
                   {m.known && !m.installed && (
-                    <ImportHint m={m} idle={idle} onImport={() => void pickImportFor(m)} />
+                    // Without a pinned download the import is the only way: shown open.
+                    <details className="more-options" open={!m.pinned}>
+                      <summary className="small">Weitere Optionen (ohne Internet)</summary>
+                      <ImportHint m={m} idle={idle} onImport={() => void pickImportFor(m)} />
+                    </details>
                   )}
                 </li>
               ))}
             </ul>
             <p className="small muted">
-              Empfehlung: unter 12 GB Arbeitsspeicher das 1.5B-Modell (schneller, schwächer),
-              sonst das 7B-Modell (deutlich besser, langsamer).
+              Faustregel: unter 12 GB Arbeitsspeicher das 1.5B-Modell (schneller, schwächer), ab 12 GB
+              (z. B. 16 GB) das 7B-Modell (deutlich besser, langsamer).
               {status.modelsDir && <> Speicherort: {status.modelsDir}</>}
             </p>
           </>
         )}
-        <div className="row">
-          <button onClick={() => void pickImport()} disabled={!idle}>
-            Anderes Modell importieren (.gguf) …
-          </button>
-        </div>
+        <details className="more-options">
+          <summary className="small">Weitere Optionen (ohne Internet)</summary>
+          <div className="row">
+            <button onClick={() => void pickImport()} disabled={!idle}>
+              Anderes Modell importieren (.gguf) …
+            </button>
+            <span className="small muted">
+              Für PCs ohne Internet: die .gguf-Datei auf einem anderen Rechner herunterladen und hier
+              importieren.
+            </span>
+          </div>
+        </details>
         {pendingImport && idle && (
           <div className="banner warn small">
             {pendingImport.unverified ? (

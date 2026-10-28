@@ -150,3 +150,6 @@ button.attention { border-color: var(--primary); color: var(--primary); font-wei
 .model { border: 1px solid var(--border); border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
 .import-hint { display: flex; flex-direction: column; gap: 4px; border-top: 1px dashed var(--border); padding-top: 6px; }
 .model.selected { border-color: var(--ok); }
+.recommendation { border: 2px solid var(--primary); border-radius: 6px; padding: 8px 10px; margin: 6px 0; background: color-mix(in srgb, var(--primary) 8%, transparent); }
+.more-options { margin-top: 6px; }
+.more-options > summary { cursor: pointer; color: var(--muted); }

@@ -11,21 +11,32 @@
 # Ist ein Modell auf Hugging Face in Teile aufgeteilt
 # (…-00001-of-00002.gguf), werden alle Teile eingetragen; llama.cpp lädt sie,
 # wenn sie nebeneinander liegen, über den ersten Teil.
-# --check: nur prüfen, ob alle Einträge gepinnt sind (Release-Workflow).
+# --check: nur prüfen, ob alle Einträge vollständig gepinnt sind: Revision
+# (40 Hex-Zeichen), mindestens eine Datei, je Datei ein einfacher Name auf
+# .gguf, Größe > 0 und SHA-256 (64 Hex-Zeichen). Der Release-Workflow ruft
+# das nach dem Pinnen auf und bricht sonst ab.
+# CATALOG=<Pfad> wählt eine andere Katalogdatei (Tests).
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-catalog="$root/src-tauri/src/ai/catalog.json"
+catalog="${CATALOG:-$root/src-tauri/src/ai/catalog.json}"
 command -v jq >/dev/null || {
   echo "jq wird benötigt." >&2
   exit 1
 }
 
 if [ "${1:-}" = "--check" ]; then
+  if [ "$(jq '.models | length' "$catalog")" -eq 0 ]; then
+    echo "catalog.json enthält keine Modelle." >&2
+    exit 1
+  fi
   unpinned="$(jq -r '.models[]
-    | select((.revision | test("^[0-9a-f]{40}$") | not)
-        or (.files | length) == 0
-        or any(.files[]; (.sha256 | test("^[0-9a-f]{64}$") | not) or .size <= 0))
+    | select(((.revision // "") | tostring | test("^[0-9a-f]{40}$") | not)
+        or ((.files // []) | length) == 0
+        or any(.files[];
+            ((.sha256 // "") | tostring | test("^[0-9a-f]{64}$") | not)
+            or ((.size | type) != "number") or .size <= 0
+            or ((.name // "") | tostring | test("^[^/\\\\:.][^/\\\\:]*\\.gguf$"; "i") | not)))
     | .id' "$catalog" | tr '\n' ' ')"
   if [ -n "$unpinned" ]; then
     echo "Nicht gepinnte Modelle in catalog.json: $unpinned (scripts/pin-models.sh ausführen)" >&2

@@ -14,6 +14,10 @@ name: Release
 #     src-tauri/tauri.release.conf.json). KI-Modelle sind nicht enthalten.
 #  4. ein Entwurfs-Release (draft) mit allen Installern, SHA256SUMS.txt und
 #     einer Build-Provenance-Attestierung (gh attestation verify …).
+# Der Job "version" pinnt außerdem den KI-Modellkatalog (Revision, Datei,
+# Größe, SHA-256 aus der Hugging-Face-API; scripts/pin-models.sh), prüft ihn
+# und gibt ihn als Artefakt an die Bundle-Jobs weiter; die Werte stehen in
+# der Job-Zusammenfassung und in den Release-Notizen.
 # Die App erwartet <IMAGE_REGISTRY>/code-pruefer-<sprache>:<Cargo-Version>;
 # der Job "version" bricht ab, wenn Tag, Cargo.toml, tauri.conf.json,
 # package.json oder der Registry-Namensraum nicht zusammenpassen.
@@ -74,12 +78,36 @@ jobs:
             echo "::error::Die App erwartet Images unter $app_registry, der Workflow würde nach $registry pushen (IMAGE_REGISTRY in languages.rs anpassen)."
             exit 1
           fi
-          # KI-Modellkatalog: Revision, Größe und SHA-256 müssen eingetragen sein
-          # (sonst könnte die App kein Modell herunterladen).
-          scripts/pin-models.sh --check
           echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
           echo "registry=$registry" >> "$GITHUB_OUTPUT"
           echo "Images: $registry/code-pruefer-<sprache>:$cargo_version" >> "$GITHUB_STEP_SUMMARY"
+
+      # Der eingecheckte Katalog ist nicht gepinnt (Hugging Face ist in der
+      # Entwicklungsumgebung nicht erreichbar). Hier werden Revision,
+      # Dateiname, Größe und SHA-256 aus der Hugging-Face-API eingetragen und
+      # vollständig geprüft; ohne vollständige Werte bricht der Release ab.
+      # Die Bundle-Jobs bauen genau diese Datei in die App ein.
+      - name: KI-Modellkatalog pinnen und prüfen
+        run: |
+          set -euo pipefail
+          scripts/pin-models.sh
+          scripts/pin-models.sh --check
+          {
+            echo "### KI-Modelle (in die App eingebaut, Download per Knopf)"
+            echo
+            echo "| Modell | Repository | Revision | Datei | Größe (Bytes) | SHA-256 |"
+            echo "|---|---|---|---|---|---|"
+            jq -r '.models[] as $m | $m.files[]
+              | "| \($m.id) | \($m.repo) | `\($m.revision)` | \(.name) | \(.size) | `\(.sha256)` |"' \
+              src-tauri/src/ai/catalog.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: model-catalog
+          path: src-tauri/src/ai/catalog.json
+          retention-days: 7
+          if-no-files-found: error
 
   images:
     needs: version
@@ -196,6 +224,16 @@ jobs:
       - name: image-digests.json zusammenführen
         shell: bash
         run: jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
+
+      - name: Gepinnter KI-Modellkatalog
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: model-catalog
+          path: src-tauri/src/ai
+
+      - name: KI-Modellkatalog prüfen
+        shell: bash
+        run: scripts/pin-models.sh --check
 
       - name: llama-server (KI-Laufzeit, Windows x64) holen und prüfen
         shell: bash
@@ -316,6 +354,15 @@ jobs:
       - name: image-digests.json zusammenführen
         run: jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
 
+      - name: Gepinnter KI-Modellkatalog
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: model-catalog
+          path: src-tauri/src/ai
+
+      - name: KI-Modellkatalog prüfen
+        run: scripts/pin-models.sh --check
+
       - name: llama-server (KI-Laufzeit) holen und prüfen
         run: scripts/fetch-llama-server.sh "$LLAMA_PLATFORM"
 
@@ -362,6 +409,11 @@ jobs:
           merge-multiple: true
           path: release
 
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: model-catalog
+          path: catalog
+
       - name: SHA256SUMS.txt
         working-directory: release
         run: |
@@ -406,7 +458,15 @@ jobs:
           (Lizenzen: THIRD_PARTY_NOTICES.txt). Online-Update:
           \`${REGISTRY}/code-pruefer-python:${VERSION}\`
           und \`${REGISTRY}/code-pruefer-java:${VERSION}\`.
+
+          KI-Modelle zum Download in der App (Prüfsumme wird nach dem Download geprüft):
+
+          | Modell | Repository | Revision | Datei | Größe (Bytes) | SHA-256 |
+          |---|---|---|---|---|---|
           EOF
+          jq -r '.models[] as $m | $m.files[]
+            | "| \($m.id) | \($m.repo) | `\($m.revision)` | \(.name) | \(.size) | `\(.sha256)` |"' \
+            catalog/catalog.json >> notes.md
           tag="v${VERSION}"
           if gh release view "$tag" >/dev/null 2>&1; then
             # Erneuter Lauf: nur Entwürfe dürfen überschrieben werden.
