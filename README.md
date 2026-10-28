@@ -224,6 +224,13 @@ und 20 Seiten. Alles läuft lokal:
   (dafür muss eine Sprache mit Texterkennung installiert sein: Einstellungen → Zeit und
   Sprache → Sprache), unter macOS Apple Vision. Die Einrückung (wichtig für Python) wird
   aus der Lage der Wörter rekonstruiert. Unter Linux gibt es keine Texterkennung.
+- **Bildvorbereitung** (`docs/ocr/prepare.rs`): Vor der Texterkennung wird das Bild in
+  Graustufen umgewandelt, bei dunklem Hintergrund (dunkles Editor-Design) invertiert, im
+  Kontrast gestreckt, auf den Inhalt zugeschnitten und bei kleiner Schrift hochskaliert
+  (Ziel: etwa 32 Pixel Zeilenhöhe, höchstens 4-fach). Die Zeilenhöhe wird aus dem Bild
+  selbst geschätzt (Zeilen mit Schrift zählen); die Obergrenze der Windows-Texterkennung
+  (`MaxImageDimension`) und 24 Megapixel werden eingehalten. Kleine Schrift in
+  Screenshots wird so deutlich besser erkannt.
 
 Erkannter Text kann Fehler enthalten. Daneben steht eine Vorschau des Originals (bei
 Bildern; bei PDFs die erste Seite, soweit das System sie darstellen kann). Das Häkchen
@@ -443,7 +450,8 @@ src-tauri/src/
   docs/pdf.rs            Textebene pro Seite, Erkennung gescannter Seiten
   docs/layout.rs         Zeilen und Einrückung aus OCR-Wortboxen rekonstruieren
   docs/ocr/              Systemeigene Texterkennung: win.rs (Windows.Media.Ocr,
-                         Windows.Data.Pdf), mac.rs (Vision, PDFKit)
+                         Windows.Data.Pdf), mac.rs (Vision, PDFKit),
+                         prepare.rs (Bildvorbereitung: Kontrast, Hochskalieren)
   docker_detect.rs       Erkennung: nicht installiert / nicht gestartet / ok
   engine.rs              Engine-Auswahl (Datei/Registry), Start, Podman-Pipe
   runner/mod.rs          Ablauf einer Prüfung, Bewertung der Testfälle

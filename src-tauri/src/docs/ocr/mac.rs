@@ -14,7 +14,8 @@ use objc2_vision::{
     VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
 };
 
-use super::{render_size, MAX_RENDER_PIXELS, PREVIEW_PIXELS, RENDER_DPI};
+use super::prepare::Prepared;
+use super::{prepared, render_size, MAX_RENDER_PIXELS, PREVIEW_PIXELS, RENDER_DPI};
 use crate::docs::layout::WordBox;
 use crate::docs::DocsError;
 
@@ -62,6 +63,19 @@ fn recognize_data(data: &NSData) -> Result<Vec<WordBox>, DocsError> {
     Ok(words)
 }
 
+/// Vision has no documented size limit; this keeps preprocessing sane
+/// (the memory cap in `prepare` applies as well).
+pub fn max_image_dimension() -> u32 {
+    8192
+}
+
+/// Vision boxes are normalized, i.e. independent of scaling; the crop
+/// offset only shifts the whole page, which keeps the relative layout
+/// (indentation is measured from the leftmost line).
+pub fn restore(_p: &Prepared, words: Vec<WordBox>) -> Vec<WordBox> {
+    words
+}
+
 pub fn recognize_image(bytes: &[u8]) -> Result<Vec<WordBox>, DocsError> {
     autoreleasepool(|_| recognize_data(&NSData::with_bytes(bytes)))
 }
@@ -103,10 +117,23 @@ pub fn recognize_pdf_pages(
             let index = number.saturating_sub(1) as usize;
             let page = unsafe { doc.pageAtIndex(index) }.ok_or_else(pdf_error)?;
             let tiff = render_page(&page, RENDER_DPI, MAX_RENDER_PIXELS).ok_or_else(pdf_error)?;
-            out.push(recognize_data(&tiff)?);
+            let prep = tiff_to_png(&tiff).and_then(|png| prepared(&png, MAX_RENDER_PIXELS as u32));
+            match prep {
+                Some(p) => out.push(recognize_data(&NSData::with_bytes(&p.png))?),
+                None => out.push(recognize_data(&tiff)?),
+            }
         }
         Ok(out)
     })
+}
+
+/// Converts TIFF data (from `render_page`) to PNG.
+fn tiff_to_png(tiff: &NSData) -> Option<Vec<u8>> {
+    let rep = NSBitmapImageRep::imageRepWithData(tiff)?;
+    let png = unsafe {
+        rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+    }?;
+    Some(png.to_vec())
 }
 
 pub fn render_pdf_preview(pdf: &[u8]) -> Option<Vec<u8>> {
@@ -114,10 +141,6 @@ pub fn render_pdf_preview(pdf: &[u8]) -> Option<Vec<u8>> {
         let doc = load_pdf(pdf)?;
         let page = unsafe { doc.pageAtIndex(0) }?;
         let tiff = render_page(&page, RENDER_DPI, PREVIEW_PIXELS)?;
-        let rep = NSBitmapImageRep::imageRepWithData(&tiff)?;
-        let png = unsafe {
-            rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
-        }?;
-        Some(png.to_vec())
+        tiff_to_png(&tiff)
     })
 }

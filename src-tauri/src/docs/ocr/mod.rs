@@ -1,14 +1,16 @@
 //! System OCR: Windows.Media.Ocr on Windows, Apple Vision on macOS.
 //!
 //! Both return word or line boxes; the text (with indentation) is rebuilt by
-//! [`super::layout::reconstruct_text`]. All functions block and must run on
-//! a blocking thread.
+//! [`super::layout::reconstruct_text`]. Images and rendered PDF pages are
+//! preprocessed first (grayscale, contrast, upscaling of small text; see
+//! [`prepare`]). All functions block and must run on a blocking thread.
 
 use super::layout::WordBox;
 use super::DocsError;
 
 #[cfg(target_os = "macos")]
 mod mac;
+pub mod prepare;
 #[cfg(windows)]
 mod win;
 
@@ -50,10 +52,26 @@ fn unavailable() -> DocsError {
     )
 }
 
-/// Recognizes the text in a PNG or JPEG image.
+/// Preprocesses an encoded image for the platform OCR; `None` if it cannot
+/// be decoded (the engine then gets the original).
+#[cfg(any(windows, target_os = "macos"))]
+fn prepared(bytes: &[u8], max_dimension: u32) -> Option<prepare::Prepared> {
+    prepare::prepare(bytes, max_dimension).ok()
+}
+
+/// Recognizes the text in a PNG or JPEG image (preprocessed; the original
+/// is used if preprocessing fails or yields no text).
 pub fn recognize_image(bytes: &[u8]) -> Result<Vec<WordBox>, DocsError> {
     #[cfg(any(windows, target_os = "macos"))]
-    return platform::recognize_image(bytes);
+    {
+        if let Some(p) = prepared(bytes, platform::max_image_dimension()) {
+            let words = platform::recognize_image(&p.png)?;
+            if !words.is_empty() {
+                return Ok(platform::restore(&p, words));
+            }
+        }
+        platform::recognize_image(bytes)
+    }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = bytes;
@@ -61,7 +79,8 @@ pub fn recognize_image(bytes: &[u8]) -> Result<Vec<WordBox>, DocsError> {
     }
 }
 
-/// Renders the given PDF pages (1-based) and recognizes their text.
+/// Renders the given PDF pages (1-based), preprocesses them and recognizes
+/// their text.
 /// `on_page(i)` is called before the i-th entry of `pages` is processed.
 pub fn recognize_pdf_pages(
     pdf: &[u8],

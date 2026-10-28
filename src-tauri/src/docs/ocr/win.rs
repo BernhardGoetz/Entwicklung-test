@@ -15,7 +15,8 @@ use ::windows::Storage::Streams::{
 };
 use ::windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 
-use super::{render_size, MAX_RENDER_PIXELS, PREVIEW_PIXELS, RENDER_DPI};
+use super::prepare::Prepared;
+use super::{prepared, render_size, MAX_RENDER_PIXELS, PREVIEW_PIXELS, RENDER_DPI};
 use crate::docs::layout::WordBox;
 use crate::docs::DocsError;
 
@@ -139,6 +140,17 @@ fn max_dimension() -> u32 {
     OcrEngine::MaxImageDimension().unwrap_or(4096).max(1)
 }
 
+/// Largest image side Windows OCR accepts (`OcrEngine.MaxImageDimension`).
+pub fn max_image_dimension() -> u32 {
+    let _apartment = Apartment::enter();
+    max_dimension()
+}
+
+/// Windows OCR boxes are in pixels of the prepared image.
+pub fn restore(p: &Prepared, words: Vec<WordBox>) -> Vec<WordBox> {
+    p.restore(words)
+}
+
 pub fn recognize_image(bytes: &[u8]) -> Result<Vec<WordBox>, DocsError> {
     let _apartment = Apartment::enter();
     let engine = engine()?;
@@ -193,8 +205,21 @@ pub fn recognize_pdf_pages(
         on_page(i);
         let png =
             render_page(&doc, number.saturating_sub(1), RENDER_DPI, max).map_err(pdf_error)?;
-        let bitmap = decode(&png, max as u32).map_err(pdf_error)?;
-        out.push(recognize(&engine, &bitmap)?);
+        let prep = bytes_from_stream(&png)
+            .ok()
+            .and_then(|bytes| prepared(&bytes, max as u32));
+        let words = match prep {
+            Some(p) => {
+                let stream = stream_from_bytes(&p.png).map_err(pdf_error)?;
+                let bitmap = decode(&stream, max as u32).map_err(pdf_error)?;
+                p.restore(recognize(&engine, &bitmap)?)
+            }
+            None => {
+                let bitmap = decode(&png, max as u32).map_err(pdf_error)?;
+                recognize(&engine, &bitmap)?
+            }
+        };
+        out.push(words);
     }
     Ok(out)
 }
