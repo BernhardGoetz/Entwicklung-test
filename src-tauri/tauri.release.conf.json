@@ -3,7 +3,8 @@
   "bundle": {
     "resources": {
       "resources/images/*.tar.gz": "images/",
-      "resources/images/image-digests.json": "images/image-digests.json"
+      "resources/images/image-digests.json": "images/image-digests.json",
+      "resources/llama/*": "llama/"
     }
   }
 }

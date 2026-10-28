@@ -10,3 +10,4 @@ src-tauri/gen/schemas/
 .idea/
 src-tauri/resources/images/*.tar.gz
 src-tauri/tauri.sign.conf.json
+src-tauri/resources/llama/

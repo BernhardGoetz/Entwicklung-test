@@ -1,5 +1,6 @@
 //! Code-Prüfer: Tauri backend.
 
+pub mod ai;
 pub mod docker_detect;
 pub mod docs;
 pub mod engine;
@@ -97,6 +98,14 @@ async fn import_task_document(
     .map_err(|e| docs::DocsError::Invalid(format!("Interner Fehler beim Import: {e}")))?
 }
 
+/// "Abbrechen" for AI operations: cancels test generation and model
+/// downloads and stops llama-server (frees its memory immediately).
+#[tauri::command]
+async fn cancel_ai() {
+    ai::cancel_all();
+    ai::llama::shutdown().await;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -111,6 +120,8 @@ pub fn run() {
             // Contents/Resources on macOS).
             if let Ok(dir) = app.path().resource_dir() {
                 images::init_bundle_dir(dir.join(images::BUNDLE_SUBDIR));
+                // llama-server and its libraries: <resource_dir>/llama.
+                ai::llama::init_resource_dir(dir);
             }
             Ok(())
         })
@@ -123,15 +134,19 @@ pub fn run() {
             run_tests,
             prepare_images,
             update_images,
-            import_task_document
+            import_task_document,
+            cancel_ai
         ])
         .build(tauri::generate_context!())
         .expect("Fehler beim Starten der Anwendung")
         .run(|_app, event| {
-            // Closing the app during a run must not leave its container behind.
+            // Closing the app during a run must not leave its container (or
+            // llama-server) behind.
             if let RunEvent::Exit = event {
                 tauri::async_runtime::block_on(async {
+                    ai::cancel_all();
                     let cleanup = async {
+                        ai::llama::shutdown().await;
                         if let Ok(docker) = docker::connect().await {
                             let _ = docker::remove_own_sandboxes(&docker).await;
                         }
