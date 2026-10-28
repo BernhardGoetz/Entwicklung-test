@@ -121,3 +121,21 @@ details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
 .diff-actual { background: var(--ok-bg); color: var(--ok); }
 .diff-equal { color: var(--muted); }
 .diff-legend span { padding: 0 4px; border-radius: 3px; }
+
+/* Local AI */
+.badge.ai { background: var(--code-bg); color: var(--primary); border: 1px solid var(--primary); }
+.badge.info { background: var(--code-bg); color: var(--primary); }
+.badge.conf-green { background: var(--ok-bg); color: var(--ok); }
+.badge.conf-yellow { background: var(--warn-bg); color: var(--warn); }
+.badge.conf-red { background: var(--fail-bg); color: var(--fail); }
+button.attention { border-color: var(--primary); color: var(--primary); font-weight: 600; }
+.ai-progress { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.ai-progress progress { flex: 1; min-width: 120px; }
+.ai-result { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.reasons { margin: 0; padding-left: 18px; }
+.ok-text { color: var(--ok); }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); display: flex; align-items: flex-start; justify-content: center; padding: 48px 16px; z-index: 10; overflow: auto; }
+.modal { width: min(720px, 100%); display: flex; flex-direction: column; gap: 8px; }
+.model-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.model { border: 1px solid var(--border); border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.model.selected { border-color: var(--ok); }

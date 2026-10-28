@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ENGINE_NAMES,
+  aiStatus,
   dockerStatus,
   getEngine,
   listLanguages,
@@ -13,7 +14,9 @@ import {
   setEngine,
   startEngine,
   updateImages,
+  type AiStatus,
   type DockerStatus,
+  type GenerateResult,
   type Engine,
   type CompareMode,
   type EngineChoice,
@@ -29,7 +32,9 @@ import { DockerBanner } from "./components/DockerBanner";
 import { LanguageSelect } from "./components/LanguageSelect";
 import { ResultsPanel } from "./components/ResultsPanel";
 import { TaskStatement } from "./components/TaskStatement";
-import { TestCaseEditor, newTestCase } from "./components/TestCaseEditor";
+import { AiPanel } from "./components/AiPanel";
+import { ModelSetup } from "./components/ModelSetup";
+import { MAX_TESTS, TestCaseEditor, newTestCase } from "./components/TestCaseEditor";
 
 function reportText(r: ImagesReport, what: string): string | null {
   const parts: string[] = [];
@@ -51,13 +56,20 @@ export default function App() {
   const [codeByLang, setCodeByLang] = useState<Record<string, string>>({});
   const [task, setTask] = useState("");
   // "Text geprüft und korrigiert": reset by an import, kept on manual edits.
-  // Needed later before test cases are generated from the task text.
+  // Required before test cases are generated from the task text.
   const [taskConfirmed, setTaskConfirmed] = useState(false);
   const [imported, setImported] = useState<ImportResult | null>(null);
   const [tests, setTests] = useState<TestCase[]>([
     { ...newTestCase(1), input: "Welt\n", expected: "Hallo, Welt!\n" },
   ]);
   const [compareMode, setCompareMode] = useState<CompareMode | null>({ kind: "lines", trim: true });
+  // Remounts the mode select when the mode is set from the AI suggestion.
+  const [compareModeKey, setCompareModeKey] = useState(0);
+  // Local AI: model status, setup dialog, generation running.
+  const [ai, setAi] = useState<AiStatus | null>(null);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [aiNote, setAiNote] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [report, setReport] = useState<RunReport | null>(null);
@@ -160,6 +172,9 @@ export default function App() {
         setCodeByLang(Object.fromEntries(langs.map((l) => [l.id, l.template])));
       })
       .catch((e) => setError(String(e)));
+    aiStatus()
+      .then(setAi)
+      .catch(() => undefined);
     const unlisten = onProgress(setProgress);
     const unlistenImages = onImagesProgress((p) =>
       setImagesBusy((prev) => (prev === null ? null : progressText(p))),
@@ -180,6 +195,7 @@ export default function App() {
     starting === null &&
     imagesBusy === null &&
     !running &&
+    !generating &&
     tests.length > 0 &&
     compareMode !== null &&
     code.trim() !== "";
@@ -188,6 +204,47 @@ export default function App() {
     setImported(r);
     setTask(r.text);
     setTaskConfirmed(false);
+  };
+
+  // Why "Testfälle mit KI erzeugen" is not available (German), or null.
+  const aiBlocked = (() => {
+    if (task.trim() === "" || !taskConfirmed)
+      return "Zuerst die Aufgabenstellung einfügen, prüfen und „Text geprüft und korrigiert“ anhaken.";
+    if (docker?.state !== "ok" || starting !== null) return "Docker oder Podman muss laufen.";
+    if (imagesBusy !== null) return "Die Runner-Images werden noch vorbereitet …";
+    if (ai === null) return "KI-Status wird geladen …";
+    if (!ai.runtimeAvailable) return ai.runtimeError ?? "KI-Laufzeit nicht gefunden.";
+    if (!ai.modelReady) return "Zuerst ein KI-Modell einrichten („KI-Modell einrichten …“).";
+    if (running) return "Bitte warten, bis die Prüfung fertig ist.";
+    if (compareMode === null) return "Bitte eine gültige Toleranz beim Vergleich eingeben.";
+    return null;
+  })();
+
+  // Generated tests are appended (never replace existing ones), up to
+  // MAX_TESTS. The ref holds the current list (edits during generation).
+  const testsRef = useRef(tests);
+  testsRef.current = tests;
+  const onAiResult = (r: GenerateResult) => {
+    setAiNote(null);
+    if (r.tests.length === 0) return;
+    const prev = testsRef.current;
+    const room = Math.max(0, MAX_TESTS - prev.length);
+    const taken = r.tests.slice(0, room);
+    if (taken.length < r.tests.length) {
+      setAiNote(
+        `${r.tests.length - taken.length} KI-Testfälle nicht übernommen – höchstens ${MAX_TESTS} Testfälle pro Prüfung.`,
+      );
+    }
+    setTests([
+      ...prev,
+      ...taken.map((t, i) => ({
+        ...newTestCase(prev.length + i + 1),
+        name: t.name,
+        input: t.input,
+        expected: t.expected,
+        origin: "ai" as const,
+      })),
+    ]);
   };
 
   const onRun = async () => {
@@ -225,7 +282,7 @@ export default function App() {
         engine={engine}
         starting={starting}
         startError={startError}
-        busy={running}
+        busy={running || generating}
         images={{ busy: imagesBusy, note: imagesNote }}
         onUpdateImages={onUpdateImages}
         onRetry={refreshDocker}
@@ -247,7 +304,7 @@ export default function App() {
               languages={languages}
               value={languageId}
               onChange={setLanguageId}
-              disabled={running}
+              disabled={running || generating}
             />
           </div>
           <CodeEditor
@@ -257,11 +314,27 @@ export default function App() {
           />
         </div>
         <div className="col">
+          <AiPanel
+            status={ai}
+            blockedReason={aiBlocked}
+            taskText={task}
+            language={languageId}
+            compareMode={compareMode}
+            onResult={onAiResult}
+            onApplyMode={(m) => {
+              setCompareMode(m);
+              setCompareModeKey((k) => k + 1);
+            }}
+            onOpenSetup={() => setSetupOpen(true)}
+            onRunningChange={setGenerating}
+          />
+          {aiNote && <div className="hint small">{aiNote}</div>}
           <TestCaseEditor
             tests={tests}
             onChange={setTests}
             compareMode={compareMode}
             onCompareModeChange={setCompareMode}
+            compareModeKey={compareModeKey}
           />
           <div className="toolbar">
             <button className="primary" onClick={onRun} disabled={!canRun}>
@@ -277,6 +350,7 @@ export default function App() {
           {report && <ResultsPanel report={report} />}
         </div>
       </main>
+      {setupOpen && <ModelSetup status={ai} onStatus={setAi} onClose={() => setSetupOpen(false)} />}
     </div>
   );
 }

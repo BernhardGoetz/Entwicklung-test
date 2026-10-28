@@ -7,10 +7,12 @@ interface Props {
   /** null while the settings are invalid (e.g. tolerance). */
   compareMode: CompareMode | null;
   onCompareModeChange: (mode: CompareMode | null) => void;
+  /** Changes when the mode is set from outside (AI suggestion). */
+  compareModeKey?: number;
 }
 
 /** Same limit as MAX_TESTS in src-tauri/src/runner/mod.rs. */
-const MAX_TESTS = 50;
+export const MAX_TESTS = 50;
 
 let nextId = 1000;
 export const newTestCase = (n: number): TestCase => ({
@@ -20,7 +22,7 @@ export const newTestCase = (n: number): TestCase => ({
   expected: "",
 });
 
-export function TestCaseEditor({ tests, onChange, compareMode, onCompareModeChange }: Props) {
+export function TestCaseEditor({ tests, onChange, compareMode, onCompareModeChange, compareModeKey }: Props) {
   const update = (id: number, patch: Partial<TestCase>) =>
     onChange(tests.map((t) => (t.id === id ? { ...t, ...patch } : t)));
 
@@ -28,12 +30,17 @@ export function TestCaseEditor({ tests, onChange, compareMode, onCompareModeChan
     <section className="card">
       <div className="card-header">
         <h2>Testfälle</h2>
-        <CompareModeSelect value={compareMode} onChange={onCompareModeChange} />
+        <CompareModeSelect key={compareModeKey} value={compareMode} onChange={onCompareModeChange} />
       </div>
       {tests.length === 0 && <p className="muted">Noch keine Testfälle angelegt.</p>}
       {tests.map((t) => (
         <div key={t.id} className="testcase">
           <div className="row">
+            {t.origin === "ai" && (
+              <span className="badge ai" title="Von der KI erzeugt – bitte prüfen">
+                KI
+              </span>
+            )}
             <input
               className="test-name"
               value={t.name}
