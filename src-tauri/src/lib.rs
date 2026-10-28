@@ -124,24 +124,35 @@ async fn download_model(app: AppHandle, id: String) -> Result<ai::models::AiStat
     .await
 }
 
-/// Imports a local .gguf file (offline PCs). Unknown files (no catalog hash)
-/// are only taken with `confirm_unknown`.
+/// Imports local .gguf files (offline PCs). Without `catalog_id`: one file,
+/// unknown files (no catalog hash) are only taken with `confirm`. With
+/// `catalog_id`: the file(s) for that catalog entry (all parts of a split
+/// model); without catalog hashes only with `confirm` and marked unverified.
 #[tauri::command]
 async fn import_model(
     app: AppHandle,
-    path: String,
-    confirm_unknown: bool,
+    paths: Vec<String>,
+    catalog_id: Option<String>,
+    confirm: bool,
 ) -> Result<ai::models::ImportOutcome, ai::AiError> {
     let op = ai::Operation::start();
-    ai::models::import(
-        std::path::Path::new(&path),
-        confirm_unknown,
-        &op.token,
-        |p| {
-            let _ = app.emit(MODELS_EVENT, p);
+    let emit = |p| {
+        let _ = app.emit(MODELS_EVENT, p);
+    };
+    match catalog_id {
+        Some(id) => {
+            let paths: Vec<std::path::PathBuf> = paths.iter().map(Into::into).collect();
+            ai::models::import_for(&id, &paths, confirm, &op.token, emit).await
+        }
+        None => match paths.as_slice() {
+            [path] => {
+                ai::models::import(std::path::Path::new(path), confirm, &op.token, emit).await
+            }
+            _ => Err(ai::AiError::Other(
+                "Bitte genau eine .gguf-Datei wählen.".into(),
+            )),
         },
-    )
-    .await
+    }
 }
 
 #[tauri::command]

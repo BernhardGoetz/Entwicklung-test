@@ -8,6 +8,7 @@ import {
   importModel,
   onModelsProgress,
   pickModelFile,
+  pickModelFiles,
   selectModel,
   type AiStatus,
   type ModelInfo,
@@ -29,10 +30,50 @@ function hardwareText(s: AiStatus): string {
 }
 
 function modelState(m: ModelInfo): string {
-  if (m.installed) return "eingerichtet";
+  if (m.installed) return m.known && !m.verified ? "eingerichtet (importiert, nicht geprüft)" : "eingerichtet";
   if (m.partialBytes > 0) return `teilweise geladen (${formatGb(m.partialBytes)})`;
-  if (m.known && !m.pinned) return "Download in dieser Version nicht möglich – bitte importieren";
+  if (m.importedParts > 0) return `${m.importedParts} Teil(e) importiert – es fehlen noch Teile`;
+  if (m.known && !m.pinned) return "Download in dieser Version nicht möglich – bitte die Datei importieren";
   return "nicht geladen";
+}
+
+/** Import waiting for "Trotzdem importieren". */
+interface PendingImport {
+  paths: string[];
+  /** Catalog entry whose button was used (null: "Anderes Modell importieren"). */
+  catalogId: string | null;
+  unverified: boolean;
+  warnings: string[];
+  missingParts: string[];
+}
+
+/** Explanation and "Datei importieren …" for a catalog entry that is not installed. */
+function ImportHint({ m, idle, onImport }: { m: ModelInfo; idle: boolean; onImport: () => void }) {
+  return (
+    <div className="import-hint small">
+      <div className="row">
+        <button onClick={onImport} disabled={!idle}>
+          Datei importieren …
+        </button>
+        <span>
+          Erwartet: <code>*{m.quant}*.gguf</code> (eine .gguf-Datei mit „{m.quant}“ im Namen). Große Modelle
+          sind auf Hugging Face oft in mehrere Teile aufgeteilt (<code>…-00001-of-0000N.gguf</code>) – dann
+          alle Teile herunterladen und zusammen auswählen.
+        </span>
+      </div>
+      {m.repo && (
+        <span className="muted">
+          Wo finde ich die Datei? Auf huggingface.co im Repository <code>{m.repo}</code>, Reiter „Files and
+          versions“ – auch auf einem anderen Rechner, dann per USB-Stick hierher bringen.
+        </span>
+      )}
+      {m.missingParts.length > 0 && (
+        <span>
+          Es fehlen noch: {m.missingParts.join(", ")}
+        </span>
+      )}
+    </div>
+  );
 }
 
 /** "KI-Modell": hardware suggestion, download (with progress), import, delete, select. */
@@ -42,8 +83,8 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  // Unknown .gguf waiting for "Trotzdem importieren".
-  const [pendingImport, setPendingImport] = useState<string | null>(null);
+  // Unknown or unchecked .gguf waiting for "Trotzdem importieren".
+  const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
 
   useEffect(() => {
     const unlisten = onModelsProgress(setProgress);
@@ -73,16 +114,28 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
       setNote(`${m.name} ist eingerichtet. Ab jetzt läuft die KI ohne Internet.`);
     });
 
-  const runImport = (path: string, confirmUnknown: boolean) =>
-    act("Datei wird geprüft und kopiert …", async () => {
-      const r = await importModel(path, confirmUnknown);
+  const runImport = (paths: string[], catalogId: string | null, confirm: boolean) =>
+    act(paths.length > 1 ? `${paths.length} Dateien werden geprüft und kopiert …` : "Datei wird geprüft und kopiert …", async () => {
+      setPendingImport(null);
+      const r = await importModel(paths, catalogId, confirm);
       onStatus(r.status);
       if (r.needsConfirmation) {
-        setPendingImport(path);
+        setPendingImport({
+          paths,
+          catalogId,
+          unverified: r.unverified,
+          warnings: r.warnings,
+          missingParts: r.missingParts,
+        });
         return;
       }
-      setPendingImport(null);
-      if (r.incomplete) setNote("Teil importiert – weitere Teile dieses Modells fehlen noch.");
+      if (r.incomplete)
+        setNote(
+          "Teil importiert – weitere Teile dieses Modells fehlen noch" +
+            (r.missingParts.length > 0 ? `: ${r.missingParts.join(", ")}` : ".")
+        );
+      else if (r.unverified)
+        setNote("Importiert und eingerichtet – nicht geprüft (Prüfsumme fehlt in dieser Version).");
       else if (r.known) setNote("Modell erkannt (Prüfsumme stimmt mit dem Katalog überein) und eingerichtet.");
       else setNote("Unbekanntes Modell importiert. Ergebnisse bitte besonders kritisch prüfen.");
     });
@@ -91,11 +144,24 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
     setError(null);
     try {
       const path = await pickModelFile();
-      if (path) await runImport(path, false);
+      if (path) await runImport([path], null, false);
     } catch (e) {
       setError(String(e));
     }
   };
+
+  const pickImportFor = async (m: ModelInfo) => {
+    setError(null);
+    try {
+      const picked = await pickModelFiles(`${m.name} importieren (alle Teile auswählen)`);
+      const paths = picked === null ? [] : Array.isArray(picked) ? picked : [picked];
+      if (paths.length > 0) await runImport(paths, m.id, false);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const nameOf = (id: string | null) => status?.models.find((m) => m.id === id)?.name ?? "dieses Modell";
 
   const remove = (m: ModelInfo) =>
     act(`${m.name} wird gelöscht …`, async () => {
@@ -154,6 +220,11 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
                         unbekanntes Modell
                       </span>
                     )}
+                    {m.known && m.installed && !m.verified && (
+                      <span className="badge timeout" title="Die Datei wurde importiert, konnte aber nicht geprüft werden">
+                        nicht geprüft (Prüfsumme fehlt in dieser Version)
+                      </span>
+                    )}
                   </div>
                   <div className="row small">
                     <span className="muted">{modelState(m)}</span>
@@ -164,10 +235,16 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
                     )}
                     {m.installed && !m.selected && (
                       <button onClick={() => void choose(m)} disabled={!idle}>
-                        Verwenden
+                        Auswählen
                       </button>
                     )}
-                    {(m.installed || m.partialBytes > 0) &&
+                    {!m.installed && (
+                      <span className="muted">
+                        Auswählen erst möglich, wenn das Modell vollständig da ist: erst importieren
+                        {m.pinned ? " oder herunterladen" : ""}.
+                      </span>
+                    )}
+                    {(m.installed || m.partialBytes > 0 || m.importedParts > 0) &&
                       (confirmDelete === m.id ? (
                         <>
                           <button className="danger" onClick={() => void remove(m)} disabled={!idle}>
@@ -181,6 +258,9 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
                         </button>
                       ))}
                   </div>
+                  {m.known && !m.installed && (
+                    <ImportHint m={m} idle={idle} onImport={() => void pickImportFor(m)} />
+                  )}
                 </li>
               ))}
             </ul>
@@ -193,17 +273,42 @@ export function ModelSetup({ status, onStatus, onClose }: Props) {
         )}
         <div className="row">
           <button onClick={() => void pickImport()} disabled={!idle}>
-            Datei importieren (.gguf) …
+            Anderes Modell importieren (.gguf) …
           </button>
         </div>
         {pendingImport && idle && (
           <div className="banner warn small">
-            <p>
-              Diese Datei ist kein Modell aus dem Katalog (Prüfsumme unbekannt). Ein unbekanntes Modell
-              kann schlechte oder unsinnige Testfälle liefern und ist nicht geprüft.
-            </p>
+            {pendingImport.unverified ? (
+              <p>
+                Für „{nameOf(pendingImport.catalogId)}“ ist in dieser Version keine Prüfsumme hinterlegt –
+                {pendingImport.paths.length > 1 ? " die Dateien können" : " die Datei kann"} deshalb nicht
+                geprüft werden. Sie werden diesem Modell zugeordnet und als „nicht geprüft“ markiert. Nur
+                Dateien aus dem genannten Hugging-Face-Repository verwenden.
+              </p>
+            ) : (
+              <p>
+                Diese Datei ist kein Modell aus dem Katalog (Prüfsumme unbekannt). Ein unbekanntes Modell
+                kann schlechte oder unsinnige Testfälle liefern und ist nicht geprüft.
+              </p>
+            )}
+            {pendingImport.warnings.length > 0 && (
+              <ul>
+                {pendingImport.warnings.map((w) => (
+                  <li key={w}>{w}</li>
+                ))}
+              </ul>
+            )}
+            {pendingImport.missingParts.length > 0 && (
+              <p>
+                Danach fehlen noch: {pendingImport.missingParts.join(", ")} (können auch später importiert
+                werden).
+              </p>
+            )}
             <div className="row">
-              <button className="danger" onClick={() => void runImport(pendingImport, true)}>
+              <button
+                className="danger"
+                onClick={() => void runImport(pendingImport.paths, pendingImport.catalogId, true)}
+              >
                 Trotzdem importieren
               </button>
               <button onClick={() => setPendingImport(null)}>Abbrechen</button>

@@ -330,10 +330,18 @@ API-Schlüssel und startet mit `--offline`. Aufgabentexte und Code verlassen den
 
 **Modell offline einrichten:** Die `.gguf`-Datei (Links und Prüfsummen in `catalog.json`)
 auf einem Rechner mit Internet herunterladen, z. B. per USB-Stick übertragen und unter
-„KI-Modell …“ → „Datei importieren (.gguf) …“ einlesen. Stimmt die SHA-256 mit dem Katalog
-überein, gilt die Datei als geprüftes Katalogmodell; eine unbekannte Datei wird nur nach
-ausdrücklicher Bestätigung übernommen und als „unbekanntes Modell“ markiert. Modelle liegen
-im App-Datenordner (`models/`), die Auswahl in `ai.json` im Konfigurationsordner.
+„KI-Modell …“ beim passenden Eintrag mit „Datei importieren …“ einlesen (erwartet:
+`*q5_k_m*.gguf` für 1.5B, `*q4_k_m*.gguf` für 7B; ist die Datei auf Hugging Face in Teile
+`…-00001-of-0000N.gguf` aufgeteilt, alle Teile zusammen auswählen – fehlende Teile lassen sich
+nachträglich importieren). Die App prüft den GGUF-Dateianfang und warnt bei unpassendem
+Dateinamen. Ist der Eintrag gepinnt, muss die SHA-256 mit dem Katalog übereinstimmen. Ist er
+nicht gepinnt, wird die Datei nach ausdrücklicher Bestätigung diesem Eintrag zugeordnet (mit
+seinen Einstellungen, z. B. Anzahl der Lösungen), unter `models/unverified/<id>/` mit
+Originalnamen abgelegt und als „nicht geprüft (Prüfsumme fehlt in dieser Version)“ markiert.
+„Anderes Modell importieren (.gguf) …“ nimmt eine beliebige einzelne Datei: Stimmt ihre
+SHA-256 mit dem Katalog überein, gilt sie als geprüftes Katalogmodell, sonst wird sie nur nach
+Bestätigung als „unbekanntes Modell“ übernommen. Modelle liegen im App-Datenordner
+(`models/`), die Auswahl in `ai.json` im Konfigurationsordner.
 
 **Modellkatalog pinnen:** `scripts/pin-models.sh` trägt Revision, Größe und SHA-256 aus der
 Hugging-Face-API ein (bei aufgeteilten GGUF-Dateien alle Teile; llama.cpp lädt sie über den

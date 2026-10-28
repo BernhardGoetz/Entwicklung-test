@@ -189,11 +189,20 @@ export interface ModelInfo {
   name: string;
   sizeBytes: number;
   license: string | null;
-  /** From the catalog (hash-checked); false = imported unknown file. */
+  /** From the catalog; false = imported unknown file. */
   known: boolean;
   /** Catalog entry with revision and checksums: download possible. */
   pinned: boolean;
   installed: boolean;
+  /** Installed and checked against the catalog checksums (installed && !verified: imported unchecked). */
+  verified: boolean;
+  /** Hugging Face repo and quantization (catalog entries). */
+  repo: string | null;
+  quant: string | null;
+  /** Unchecked files already imported for this catalog entry. */
+  importedParts: number;
+  /** Parts of a split GGUF that are still missing. */
+  missingParts: string[];
   /** Bytes of an interrupted download (resumable). */
   partialBytes: number;
   suggested: boolean;
@@ -224,10 +233,16 @@ export interface ModelsProgress {
 export interface ImportOutcome {
   modelId: string | null;
   known: boolean;
-  /** Unknown file: import again with confirmUnknown = true. */
+  /** Unknown or unchecked file: import again with confirm = true. */
   needsConfirmation: boolean;
   /** Split catalog model: other parts are still missing. */
   incomplete: boolean;
+  /** Imported for a catalog entry without checksums (not checked). */
+  unverified: boolean;
+  /** Reasons to confirm, e.g. unexpected file name. */
+  warnings: string[];
+  /** Parts of a split GGUF still missing. */
+  missingParts: string[];
   sha256: string;
   status: AiStatus;
 }
@@ -287,8 +302,9 @@ export interface AiProgress {
 export const aiStatus = () => invoke<AiStatus>("ai_status");
 /** Downloads a catalog model from huggingface.co (resumable; cancel with cancelAi). */
 export const downloadModel = (id: string) => invoke<AiStatus>("download_model", { id });
-export const importModel = (path: string, confirmUnknown: boolean) =>
-  invoke<ImportOutcome>("import_model", { path, confirmUnknown });
+/** Without catalogId: exactly one file (unknown models). With catalogId: the file(s) for that catalog entry. */
+export const importModel = (paths: string[], catalogId: string | null, confirm: boolean) =>
+  invoke<ImportOutcome>("import_model", { paths, catalogId, confirm });
 export const deleteModel = (id: string) => invoke<AiStatus>("delete_model", { id });
 export const selectModel = (id: string) => invoke<AiStatus>("select_model", { id });
 export const generateTests = (request: GenerateRequest) =>
@@ -340,6 +356,15 @@ export const pickModelFile = () =>
   open({
     title: "KI-Modell importieren",
     multiple: false,
+    directory: false,
+    filters: [{ name: "KI-Modell (GGUF)", extensions: ["gguf"] }],
+  });
+
+/** Several files at once (all parts of a split model). */
+export const pickModelFiles = (title: string) =>
+  open({
+    title,
+    multiple: true,
     directory: false,
     filters: [{ name: "KI-Modell (GGUF)", extensions: ["gguf"] }],
   });
