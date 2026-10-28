@@ -13,7 +13,7 @@
 //! (env overrides and the `:dev` fallback only exist in debug builds, which
 //! `cargo test` uses).
 
-use code_pruefer_lib::runner::{self, RunReport, RunRequest, TestCase, TestStatus};
+use code_pruefer_lib::runner::{self, docker, RunReport, RunRequest, TestCase, TestStatus};
 
 fn setup() {
     for (var, img) in [
@@ -84,6 +84,59 @@ async fn python_timeout_is_killed_and_next_test_still_runs() {
     assert_eq!(statuses(&r), vec![TestStatus::Timeout, TestStatus::Passed]);
 }
 
+/// Nothing a test leaves running survives into the next test: neither a
+/// detached background process nor one that closed its output.
+#[tokio::test]
+#[ignore = "benötigt Docker und die Runner-Images"]
+async fn left_over_processes_are_killed_after_each_test() {
+    let code = r#"
+import os, time
+mode = input()
+if mode == 'fork':
+    if os.fork() == 0:
+        os.setsid()
+        for fd in (0, 1, 2):
+            os.close(fd)
+        time.sleep(100)
+        os._exit(0)
+    print('ok')
+elif mode == 'close':
+    print('ok', flush=True)
+    os.close(1)
+    os.close(2)
+    time.sleep(100)
+else:
+    me = os.getpid()
+    # Killed orphans stay as zombies of PID 1 (`sleep`); only live ones count.
+    def alive(p):
+        return open(f'/proc/{p}/stat').read().rsplit(')', 1)[1].split()[0] != 'Z'
+    print(len([p for p in os.listdir('/proc') if p.isdigit() and int(p) not in (1, me) and alive(p)]))
+"#;
+    let r = run(
+        "python",
+        code,
+        vec![
+            tc("fork\n", "ok\n"),
+            tc("count\n", "0\n"),
+            tc("close\n", "ok\n"),
+            tc("count\n", "0\n"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        statuses(&r),
+        vec![
+            TestStatus::Passed,
+            TestStatus::Passed,
+            TestStatus::Timeout,
+            TestStatus::Passed
+        ],
+        "{:?}",
+        r.tests
+    );
+    assert_eq!(r.tests[2].output.as_ref().unwrap().exit_code, None);
+}
+
 #[tokio::test]
 #[ignore = "benötigt Docker und die Runner-Images"]
 async fn python_runtime_error_and_truncation() {
@@ -149,14 +202,59 @@ async fn java_wrong_class_name_gives_hint() {
 #[ignore = "benötigt Docker und die Runner-Images"]
 async fn containers_are_removed() {
     let _ = run("python", "print(1)\n", vec![tc("", "1")]).await;
+    assert!(
+        sandbox_containers().is_empty(),
+        "sandbox containers left behind"
+    );
+}
+
+fn sandbox_containers() -> Vec<String> {
     let out = std::process::Command::new("docker")
         .args(["ps", "-aq", "--filter", "label=de.code-pruefer.sandbox"])
         .output()
         .expect("docker CLI");
-    assert!(
-        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-        "sandbox containers left behind"
-    );
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
+/// `docker create` of an idle container with the sandbox labels.
+fn create_labeled(instance: &str) -> String {
+    let instance_label = format!("{}={instance}", docker::INSTANCE_LABEL);
+    let out = std::process::Command::new("docker")
+        .args(["create", "--label", "de.code-pruefer.sandbox=1", "--label"])
+        .arg(&instance_label)
+        .args(["code-pruefer-python:dev", "sleep", "infinity"])
+        .output()
+        .expect("docker CLI");
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[tokio::test]
+#[ignore = "benötigt Docker und die Runner-Images"]
+async fn orphaned_sandboxes_are_removed() {
+    let client = docker::connect().await.expect("engine");
+    let own = create_labeled(docker::instance_id());
+    let foreign = create_labeled("anderer-prozess");
+    let present = |id: &str| {
+        sandbox_containers()
+            .iter()
+            .any(|c| id.starts_with(c.as_str()))
+    };
+    assert!(present(&own) && present(&foreign));
+
+    // Own left-over: removed at once; another instance's: only when old.
+    docker::remove_orphans(&client, docker::ORPHAN_AGE)
+        .await
+        .unwrap();
+    assert!(!present(&own));
+    assert!(present(&foreign));
+    docker::remove_orphans(&client, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(!present(&foreign));
 }
 
 #[tokio::test]

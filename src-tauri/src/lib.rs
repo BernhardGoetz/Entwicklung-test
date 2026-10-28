@@ -4,7 +4,7 @@ pub mod docker_detect;
 pub mod engine;
 pub mod runner;
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 use runner::{docker, images, languages, RunReport, RunRequest, RunnerError};
 
@@ -55,10 +55,12 @@ async fn run_tests(app: AppHandle, request: RunRequest) -> Result<RunReport, Run
 }
 
 /// Loads bundled image archives into the active engine if the images are
-/// missing (called once the engine is up).
+/// missing (called once the engine is up, i.e. at app start). Also removes
+/// sandbox containers left over from a crash.
 #[tauri::command]
 async fn prepare_images(app: AppHandle) -> Result<images::ImagesReport, RunnerError> {
     let docker = docker::connect().await?;
+    let _ = docker::remove_orphans(&docker, docker::ORPHAN_AGE).await;
     Ok(images::prepare_all(&docker, |p| {
         let _ = app.emit(IMAGES_EVENT, p);
     })
@@ -101,6 +103,19 @@ pub fn run() {
             prepare_images,
             update_images
         ])
-        .run(tauri::generate_context!())
-        .expect("Fehler beim Starten der Anwendung");
+        .build(tauri::generate_context!())
+        .expect("Fehler beim Starten der Anwendung")
+        .run(|_app, event| {
+            // Closing the app during a run must not leave its container behind.
+            if let RunEvent::Exit = event {
+                tauri::async_runtime::block_on(async {
+                    let cleanup = async {
+                        if let Ok(docker) = docker::connect().await {
+                            let _ = docker::remove_own_sandboxes(&docker).await;
+                        }
+                    };
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cleanup).await;
+                });
+            }
+        });
 }

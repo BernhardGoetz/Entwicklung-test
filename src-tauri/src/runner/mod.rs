@@ -12,6 +12,9 @@ use docker::{PullProgress, Sandbox, STDIN_FILE};
 
 /// Maximum accepted size of source code and of a single test input/expectation.
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+/// Maximum number of test cases per run (bounds the run time, see
+/// `docker::ORPHAN_AGE`).
+pub const MAX_TESTS: usize = 50;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
@@ -175,9 +178,17 @@ pub async fn run_submission(
             "Code oder Testdaten sind zu groß (max. 1 MB je Feld).".into(),
         ));
     }
+    if req.tests.len() > MAX_TESTS {
+        return Err(RunnerError::Other(format!(
+            "Zu viele Testfälle ({}) – höchstens {MAX_TESTS} pro Prüfung.",
+            req.tests.len()
+        )));
+    }
     let hint = languages::precheck(lang, &req.code);
 
     let docker = docker::connect().await?;
+    // Left-overs of crashed runs; failures do not block the run.
+    let _ = docker::remove_orphans(&docker, docker::ORPHAN_AGE).await;
     let image = images::ensure_image(&docker, lang, &mut on_progress).await?;
 
     on_progress(Progress::Phase {
@@ -406,6 +417,33 @@ mod tests {
         let msg = e(String::new()).to_string();
         assert!(!msg.contains("docker build"), "{msg}");
         assert!(msg.ends_with("neu installieren."), "{msg}");
+    }
+
+    #[test]
+    fn too_many_tests_are_rejected() {
+        let req = |n: usize| RunRequest {
+            language: "python".into(),
+            code: "print(1)".into(),
+            tests: (0..n)
+                .map(|_| TestCase {
+                    name: String::new(),
+                    input: String::new(),
+                    expected: "1".into(),
+                })
+                .collect(),
+            trim_whitespace: true,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Rejected before any engine access.
+        let msg = rt
+            .block_on(run_submission(req(MAX_TESTS + 1), |_| {}))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("Zu viele Testfälle (51)"), "{msg}");
+        assert!(msg.contains("höchstens 50"), "{msg}");
     }
 
     #[test]

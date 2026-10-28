@@ -7,6 +7,9 @@ interface Props {
   onTrimChange: (v: boolean) => void;
 }
 
+/** Same limit as MAX_TESTS in src-tauri/src/runner/mod.rs. */
+const MAX_TESTS = 50;
+
 let nextId = 1000;
 export const newTestCase = (n: number): TestCase => ({
   id: nextId++,
@@ -72,7 +75,11 @@ export function TestCaseEditor({ tests, onChange, trimWhitespace, onTrimChange }
           </div>
         </div>
       ))}
-      <button onClick={() => onChange([...tests, newTestCase(tests.length + 1)])}>
+      <button
+        onClick={() => onChange([...tests, newTestCase(tests.length + 1)])}
+        disabled={tests.length >= MAX_TESTS}
+        title={tests.length >= MAX_TESTS ? `Höchstens ${MAX_TESTS} Testfälle pro Prüfung` : undefined}
+      >
         + Testfall hinzufügen
       </button>
     </section>

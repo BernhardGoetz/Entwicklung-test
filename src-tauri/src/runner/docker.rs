@@ -1,12 +1,12 @@
 //! Thin layer over the Docker Engine API (bollard): engine discovery,
 //! image pulls/loads and a hardened, short-lived sandbox container.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use bollard::container::LogOutput;
@@ -14,7 +14,7 @@ use bollard::exec::StartExecResults;
 use bollard::models::{ContainerCreateBody, ExecConfig, HostConfig, ResourcesUlimits};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ImportImageOptionsBuilder,
-    RemoveContainerOptionsBuilder, TagImageOptionsBuilder,
+    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, TagImageOptionsBuilder,
 };
 use bollard::Docker;
 use bytes::Bytes;
@@ -36,6 +36,12 @@ pub const PIDS_LIMIT: i64 = 64;
 /// Maximum size of a single file written by the program (RLIMIT_FSIZE).
 pub const FSIZE_LIMIT: i64 = 16 * 1024 * 1024;
 pub const LABEL: &str = "de.code-pruefer.sandbox";
+/// Label with the app instance that created the sandbox ([`instance_id`]).
+pub const INSTANCE_LABEL: &str = "de.code-pruefer.instance";
+/// Sandboxes of other app instances count as orphaned only after this age
+/// (longer than any run: 50 tests × 8 s plus compiling), so a second app
+/// instance never removes the container of a running check.
+pub const ORPHAN_AGE: Duration = Duration::from_secs(15 * 60);
 const ENV: &[&str] = &["LANG=C.UTF-8", "LC_ALL=C.UTF-8", "HOME=/tmp"];
 /// Raw bytes per `write_file` exec; base64 inflates by 4/3 and must stay
 /// below the kernel's 128 KiB limit for a single argument.
@@ -366,6 +372,85 @@ pub async fn tag_image(docker: &Docker, source: &str, target: &str) -> Result<()
     Ok(())
 }
 
+/// ID of this app process, stored in [`INSTANCE_LABEL`].
+pub fn instance_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        format!("{}-{nanos}", std::process::id())
+    })
+}
+
+/// Names of the sandboxes this process is using right now.
+fn active() -> std::sync::MutexGuard<'static, HashSet<String>> {
+    static ACTIVE: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    ACTIVE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a sandbox container is left over: not in use by this process
+/// and either created by this process (its removal failed) or older than
+/// `min_age` (another or a crashed instance). Pure, unit-tested.
+pub fn is_orphan(instance: Option<&str>, in_use: bool, age: Duration, min_age: Duration) -> bool {
+    !in_use && (instance == Some(instance_id()) || age >= min_age)
+}
+
+/// Force-removes the sandbox containers (label [`LABEL`]) for which `pred`
+/// (instance label, in use by this process, age) holds; returns how many.
+async fn remove_sandboxes(
+    docker: &Docker,
+    pred: impl Fn(Option<&str>, bool, Duration) -> bool,
+) -> Result<usize, RunnerError> {
+    let filters = HashMap::from([("label", vec![LABEL])]);
+    let opts = ListContainersOptionsBuilder::default()
+        .all(true)
+        .filters(&filters)
+        .build();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let mut removed = 0;
+    for c in docker.list_containers(Some(opts)).await? {
+        let Some(id) = c.id else { continue };
+        let in_use = {
+            let active = active();
+            c.names
+                .iter()
+                .flatten()
+                .any(|n| active.contains(n.trim_start_matches('/')))
+        };
+        let age = Duration::from_secs(now.saturating_sub(c.created.unwrap_or(now)).max(0) as u64);
+        let instance = c.labels.as_ref().and_then(|l| l.get(INSTANCE_LABEL));
+        if pred(instance.map(String::as_str), in_use, age) {
+            let opts = RemoveContainerOptionsBuilder::default().force(true).build();
+            if docker.remove_container(&id, Some(opts)).await.is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Removes left-over sandboxes (see [`is_orphan`]), e.g. after a crash.
+/// Called when the engine is up and before every run.
+pub async fn remove_orphans(docker: &Docker, min_age: Duration) -> Result<usize, RunnerError> {
+    remove_sandboxes(docker, |instance, in_use, age| {
+        is_orphan(instance, in_use, age, min_age)
+    })
+    .await
+}
+
+/// Removes every sandbox of this process (app exit).
+pub async fn remove_own_sandboxes(docker: &Docker) -> Result<usize, RunnerError> {
+    remove_sandboxes(docker, |instance, _, _| instance == Some(instance_id())).await
+}
+
 /// Hardened container definition. The container itself only idles
 /// (`sleep infinity`); all work happens via `exec`.
 pub fn sandbox_config(image: &str) -> ContainerCreateBody {
@@ -391,7 +476,10 @@ pub fn sandbox_config(image: &str) -> ContainerCreateBody {
         working_dir: Some(WORK_DIR.to_string()),
         env: Some(ENV.iter().map(|s| s.to_string()).collect()),
         network_disabled: Some(true),
-        labels: Some(HashMap::from([(LABEL.to_string(), "1".to_string())])),
+        labels: Some(HashMap::from([
+            (LABEL.to_string(), "1".to_string()),
+            (INSTANCE_LABEL.to_string(), instance_id().to_string()),
+        ])),
         host_config: Some(HostConfig {
             network_mode: Some("none".to_string()),
             memory: Some(MEMORY_BYTES),
@@ -415,7 +503,8 @@ pub struct ExecOutput {
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
-    /// `None` if the process was killed after a timeout.
+    /// `None` if the process was killed after a timeout (also when it
+    /// closed its output but kept running).
     pub exit_code: Option<i64>,
     pub timed_out: bool,
     pub duration_ms: u64,
@@ -425,23 +514,34 @@ pub struct ExecOutput {
 pub struct Sandbox {
     docker: Docker,
     id: String,
+    name: String,
 }
 
 impl Sandbox {
     pub async fn create(docker: &Docker, image: &str) -> Result<Self, RunnerError> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         let name = format!("code-pruefer-{}-{nanos}", std::process::id());
+        // Registered before creation, so a concurrent orphan cleanup never
+        // takes it for a left-over.
+        active().insert(name.clone());
         let opts = CreateContainerOptionsBuilder::default().name(&name).build();
-        let id = docker
+        let id = match docker
             .create_container(Some(opts), sandbox_config(image))
-            .await?
-            .id;
+            .await
+        {
+            Ok(created) => created.id,
+            Err(e) => {
+                active().remove(&name);
+                return Err(e.into());
+            }
+        };
         let sandbox = Sandbox {
             docker: docker.clone(),
             id,
+            name,
         };
         if let Err(e) = sandbox.docker.start_container(&sandbox.id, None).await {
             sandbox.remove().await;
@@ -450,10 +550,12 @@ impl Sandbox {
         Ok(sandbox)
     }
 
-    /// Force-removes the container; errors are ignored (best effort).
+    /// Force-removes the container; errors are ignored (best effort, a
+    /// left-over is removed by [`remove_orphans`] later).
     pub async fn remove(self) {
         let opts = RemoveContainerOptionsBuilder::default().force(true).build();
         let _ = self.docker.remove_container(&self.id, Some(opts)).await;
+        active().remove(&self.name);
     }
 
     /// Writes `content` to `path` inside the container. The data travels as
@@ -481,7 +583,10 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Runs `cmd` with stdin redirected from `stdin_file` (if given).
+    /// Runs user code (`cmd`, compile step or test) with stdin redirected
+    /// from `stdin_file` (if given). Afterwards every remaining process of
+    /// the sandbox user is killed, so nothing the program left running in
+    /// the background survives into the next test.
     pub async fn exec_with_stdin_file(
         &self,
         cmd: &[&str],
@@ -491,11 +596,18 @@ impl Sandbox {
         let script = format!("exec \"$@\" < {}", stdin_file.unwrap_or("/dev/null"));
         let mut full = vec!["sh", "-c", &script, "sh"];
         full.extend_from_slice(cmd);
-        self.exec(&full, timeout).await
+        let out = self.exec(&full, timeout).await;
+        // `exec` already killed everything after a timeout.
+        if !matches!(&out, Ok(o) if o.timed_out) {
+            self.kill_user_processes().await;
+        }
+        out
     }
 
-    /// Runs a command, collecting capped stdout/stderr. On timeout all
-    /// sandbox user processes (except PID 1) are killed.
+    /// Runs a command, collecting capped stdout/stderr. If it does not end
+    /// within `timeout` – also when it closed its output but keeps running –
+    /// it counts as timed out and all sandbox user processes (except PID 1)
+    /// are killed.
     pub async fn exec(&self, cmd: &[&str], timeout: Duration) -> Result<ExecOutput, RunnerError> {
         let config = ExecConfig {
             attach_stdin: Some(false),
@@ -531,7 +643,7 @@ impl Sandbox {
             }
             Ok::<_, bollard::errors::Error>(())
         };
-        let timed_out = match tokio::time::timeout(timeout, read_all).await {
+        let mut timed_out = match tokio::time::timeout(timeout, read_all).await {
             Ok(res) => {
                 res?;
                 false
@@ -539,14 +651,17 @@ impl Sandbox {
             Err(_) => true,
         };
         drop(output);
-        let duration_ms = started.elapsed().as_millis() as u64;
 
         let exit_code = if timed_out {
-            self.kill_user_processes().await;
             None
         } else {
-            self.wait_exit_code(&exec_id).await?
+            self.wait_exit_code(&exec_id, started + timeout).await?
         };
+        if exit_code.is_none() {
+            timed_out = true;
+            self.kill_user_processes().await;
+        }
+        let duration_ms = started.elapsed().as_millis() as u64;
         Ok(ExecOutput {
             stdout_truncated: stdout.truncated(),
             stderr_truncated: stderr.truncated(),
@@ -558,15 +673,25 @@ impl Sandbox {
         })
     }
 
-    async fn wait_exit_code(&self, exec_id: &str) -> Result<Option<i64>, RunnerError> {
-        for _ in 0..50 {
+    /// Exit code once the exec has ended; `None` if it still runs at
+    /// `deadline` (with a short grace period for the engine to notice the
+    /// exit after the output closed).
+    async fn wait_exit_code(
+        &self,
+        exec_id: &str,
+        deadline: Instant,
+    ) -> Result<Option<i64>, RunnerError> {
+        let deadline = deadline.max(Instant::now() + Duration::from_millis(500));
+        loop {
             let info = self.docker.inspect_exec(exec_id).await?;
             if info.running != Some(true) {
                 return Ok(info.exit_code);
             }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        Ok(None)
     }
 
     /// `kill -9 -1` signals every process of the sandbox user except PID 1
@@ -628,6 +753,33 @@ mod tests {
             .expect("fsize ulimit");
         assert_eq!(fsize.soft, Some(FSIZE_LIMIT));
         assert_eq!(fsize.hard, Some(FSIZE_LIMIT));
+    }
+
+    #[test]
+    fn sandboxes_carry_instance_label() {
+        let labels = sandbox_config("img:1").labels.unwrap();
+        assert_eq!(labels.get(LABEL).map(String::as_str), Some("1"));
+        assert_eq!(
+            labels.get(INSTANCE_LABEL).map(String::as_str),
+            Some(instance_id())
+        );
+    }
+
+    #[test]
+    fn orphan_rules() {
+        let own = Some(instance_id());
+        let young = Duration::from_secs(60);
+        let old = ORPHAN_AGE + Duration::from_secs(1);
+        // In use by this process: never.
+        assert!(!is_orphan(own, true, old, ORPHAN_AGE));
+        assert!(!is_orphan(Some("x"), true, old, ORPHAN_AGE));
+        // Own, not in use (removal failed): at once.
+        assert!(is_orphan(own, false, young, ORPHAN_AGE));
+        // Other or crashed instance, or no label (older versions): when old.
+        assert!(!is_orphan(Some("x"), false, young, ORPHAN_AGE));
+        assert!(is_orphan(Some("x"), false, old, ORPHAN_AGE));
+        assert!(is_orphan(None, false, old, ORPHAN_AGE));
+        assert!(is_orphan(None, false, young, Duration::ZERO));
     }
 
     #[test]
