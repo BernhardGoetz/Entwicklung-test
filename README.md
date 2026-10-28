@@ -342,3 +342,12 @@ unter `images/`.
 
 Geplant für spätere Phasen: weitere Sprachen (C/C++/C#/JavaScript), signierter
 Aufgabenkatalog, Code-Signing, Updater, automatisch generierte Tests.
+
+## Recherche: lokale KI und Texterkennung
+
+[`docs/ENTSCHEIDUNGSGRUNDLAGE_lokale-KI-Aufgabenchecker.md`](docs/ENTSCHEIDUNGSGRUNDLAGE_lokale-KI-Aufgabenchecker.md)
+ist die Entscheidungsgrundlage für das Hochladen von Aufgabenblättern (Bild, PDF, DOCX),
+die systemeigene Texterkennung und die lokale Erzeugung von Testfällen. Sie ist eine
+Recherche, keine Spezifikation: Übernommen werden vor allem Pipeline, Mehrheitsentscheid,
+Konfidenz und Ausgabevergleich. Die Abschnitte 8 (Sandbox) und 10 (Verteilung/JavaFX)
+gelten für diese App nicht, weil sie auf Tauri/Rust mit Docker bzw. Podman aufbaut.
