@@ -9,7 +9,9 @@
 //! cd src-tauri && cargo test -- --ignored --test-threads=1
 //! ```
 //!
-//! Without `CODE_PRUEFER_*_IMAGE` set, the tests use the `:dev` tags above.
+//! Without `CODE_PRUEFER_*_IMAGE` set, the tests use the `:dev` tags above
+//! (env overrides and the `:dev` fallback only exist in debug builds, which
+//! `cargo test` uses).
 
 use code_pruefer_lib::runner::{self, RunReport, RunRequest, TestCase, TestStatus};
 

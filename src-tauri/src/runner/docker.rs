@@ -41,13 +41,34 @@ const ENV: &[&str] = &["LANG=C.UTF-8", "LC_ALL=C.UTF-8", "HOME=/tmp"];
 /// below the kernel's 128 KiB limit for a single argument.
 const WRITE_CHUNK: usize = 48 * 1024;
 
+/// `DOCKER_HOST`, if set. It stays supported in release builds because some
+/// Podman and remote setups need it.
+pub fn docker_host() -> Option<String> {
+    std::env::var("DOCKER_HOST")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+}
+
+/// German warning for a `DOCKER_HOST` that talks plain HTTP over the
+/// network (`tcp://`, `http://`; the app has no TLS support). Pure,
+/// unit-tested.
+pub fn insecure_host_warning(host: Option<&str>) -> Option<String> {
+    let host = host?.trim();
+    let lower = host.to_ascii_lowercase();
+    (lower.starts_with("tcp://") || lower.starts_with("http://")).then(|| {
+        format!(
+            "Achtung: DOCKER_HOST={host} verbindet unverschlüsselt und ohne Anmeldung über das \
+             Netzwerk. Wer diesen Port erreicht, kann Container starten und den Rechner \
+             übernehmen. Bitte nur auf dem eigenen Rechner verwenden oder auf den Socket bzw. \
+             die Named Pipe der Engine umstellen."
+        )
+    })
+}
+
 /// Engine endpoints to try, in order. `DOCKER_HOST` (if set) wins exclusively;
 /// otherwise the endpoints of the chosen engine (see `crate::engine`) come first.
 pub fn candidate_hosts() -> Vec<String> {
-    if let Some(h) = std::env::var("DOCKER_HOST")
-        .ok()
-        .filter(|h| !h.trim().is_empty())
-    {
+    if let Some(h) = docker_host() {
         return vec![h];
     }
     // Podman's pipe (Windows) or machine socket (macOS) as reported by
@@ -645,6 +666,23 @@ mod tests {
             ("localhost:5000/img", "latest")
         );
         assert_eq!(split_ref("img"), ("img", "latest"));
+    }
+
+    #[test]
+    fn plain_tcp_docker_host_is_warned_about() {
+        let w = insecure_host_warning(Some("tcp://192.168.1.5:2375")).unwrap();
+        assert!(w.contains("unverschlüsselt"), "{w}");
+        assert!(w.contains("tcp://192.168.1.5:2375"), "{w}");
+        assert!(insecure_host_warning(Some("HTTP://localhost:2375")).is_some());
+        assert_eq!(
+            insecure_host_warning(Some("unix:///run/podman/podman.sock")),
+            None
+        );
+        assert_eq!(
+            insecure_host_warning(Some("npipe:////./pipe/podman-machine-default")),
+            None
+        );
+        assert_eq!(insecure_host_warning(None), None);
     }
 
     #[test]

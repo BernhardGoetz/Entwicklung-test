@@ -14,6 +14,11 @@ pub const IMAGE_REGISTRY: &str = "ghcr.io/bernhardgoetz";
 /// images as `<IMAGE_REGISTRY>/code-pruefer-<id>:<version>` for tag `v<version>`.
 pub const IMAGE_TAG: &str = env!("CARGO_PKG_VERSION");
 
+/// Developer overrides (`CODE_PRUEFER_<LANG>_IMAGE`, the local `:dev`
+/// images) only work in debug builds; release builds run nothing but the
+/// embedded or published images.
+pub const DEV_OVERRIDES: bool = cfg!(debug_assertions);
+
 #[derive(Debug, Clone)]
 pub struct LanguageConfig {
     /// Stable identifier used by the frontend (`"python"`, `"java"`).
@@ -23,10 +28,12 @@ pub struct LanguageConfig {
     /// Image reference used when no override env var is set
     /// (`<IMAGE_REGISTRY>/code-pruefer-<id>:<IMAGE_TAG>`).
     pub default_image: &'static str,
-    /// Environment variable that overrides the image reference (local dev builds).
+    /// Environment variable that overrides the image reference (debug
+    /// builds only, see [`DEV_OVERRIDES`]).
     pub image_env: &'static str,
     /// Tag of a locally built image (`docker build -t <local_image> images/<id>`),
-    /// used when the default image is neither present nor pullable.
+    /// used when the default image is neither present nor pullable (debug
+    /// builds only).
     pub local_image: &'static str,
     /// File name the source code is stored under inside `/work`.
     pub source_file: &'static str,
@@ -42,14 +49,24 @@ pub struct LanguageConfig {
     pub template: &'static str,
 }
 
+/// The override `value` of an image env var, if overrides are `allowed`
+/// and it differs from `default`. Pure, unit-tested.
+pub fn override_from(value: Option<String>, default: &str, allowed: bool) -> Option<String> {
+    value
+        .filter(|_| allowed)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != default)
+}
+
 impl LanguageConfig {
     /// Image set via env var (e.g. `CODE_PRUEFER_PYTHON_IMAGE=code-pruefer-python:dev`),
-    /// if it differs from the default image.
+    /// if it differs from the default image; always `None` in release builds.
     pub fn image_override(&self) -> Option<String> {
-        std::env::var(self.image_env)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && s != self.default_image)
+        override_from(
+            std::env::var(self.image_env).ok(),
+            self.default_image,
+            DEV_OVERRIDES,
+        )
     }
 
     /// Image reference, overridable via env var.
@@ -221,6 +238,22 @@ mod tests {
         for l in LANGUAGES {
             assert_eq!(l.local_image, format!("code-pruefer-{}:dev", l.id));
         }
+    }
+
+    #[test]
+    fn overrides_only_in_debug_builds() {
+        let default = get("python").unwrap().default_image;
+        let set = |v: &str| Some(v.to_string());
+        assert_eq!(
+            override_from(set(" mein:x "), default, true),
+            Some("mein:x".into())
+        );
+        assert_eq!(override_from(set("mein:x"), default, false), None);
+        assert_eq!(override_from(set(""), default, true), None);
+        assert_eq!(override_from(set(default), default, true), None);
+        assert_eq!(override_from(None, default, true), None);
+        // `cargo test` builds with debug assertions, `--release` without.
+        assert_eq!(DEV_OVERRIDES, cfg!(debug_assertions));
     }
 
     #[test]

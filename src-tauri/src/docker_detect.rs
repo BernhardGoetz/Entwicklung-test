@@ -16,6 +16,9 @@ pub enum DockerStatus {
         version: String,
         /// e.g. "Docker Desktop", "Podman Engine"
         product: String,
+        /// German security warning (e.g. unencrypted `DOCKER_HOST`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
 }
 
@@ -35,6 +38,7 @@ pub async fn detect() -> DockerStatus {
             return DockerStatus::Ok {
                 version: v.version.unwrap_or_else(|| "unbekannt".into()),
                 product,
+                warning: docker::insecure_host_warning(docker::docker_host().as_deref()),
             };
         }
     }
@@ -85,9 +89,11 @@ mod tests {
         let s = serde_json::to_value(DockerStatus::Ok {
             version: "27.0".into(),
             product: "Docker Engine".into(),
+            warning: None,
         })
         .unwrap();
         assert_eq!(s["state"], "ok");
         assert_eq!(s["version"], "27.0");
+        assert!(s.get("warning").is_none());
     }
 }

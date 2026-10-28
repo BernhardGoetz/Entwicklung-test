@@ -11,6 +11,9 @@
 //! 5. a locally built `code-pruefer-<id>:dev`;
 //! 6. otherwise an actionable German error.
 //!
+//! Steps 1 and 5 are developer conveniences and only exist in debug builds
+//! ([`languages::DEV_OVERRIDES`]).
+//!
 //! Builds with embedded images also ship `<resource_dir>/images/image-digests.json`
 //! (written by `scripts/export-image-archives.sh`). With it, the pinned image
 //! only counts if its ID (or registry digest) is one listed there, archives
@@ -267,12 +270,14 @@ pub enum Step {
 }
 
 /// The resolution order (see module docs). `pull` is the reference to pull
-/// the pinned image from (`None`: no download). Pure, unit-tested.
+/// the pinned image from (`None`: no download); `dev` adds the local `:dev`
+/// image as last resort. Pure, unit-tested.
 pub fn plan(
     lang: &LanguageConfig,
     override_image: Option<String>,
     archive: Option<PathBuf>,
     pull: Option<String>,
+    dev: bool,
 ) -> Vec<Step> {
     if let Some(image) = override_image {
         return vec![
@@ -297,7 +302,9 @@ pub fn plan(
             image: primary,
         });
     }
-    steps.push(Step::Present(lang.local_image.to_string()));
+    if dev {
+        steps.push(Step::Present(lang.local_image.to_string()));
+    }
     steps
 }
 
@@ -492,9 +499,12 @@ async fn execute(
     }
     Err(RunnerError::ImageMissing {
         language: lang.name.to_string(),
-        id: lang.id.to_string(),
         tried: tried.join(", "),
-        local_image: lang.local_image.to_string(),
+        dev_hint: if languages::DEV_OVERRIDES {
+            super::dev_build_hint(lang)
+        } else {
+            String::new()
+        },
         detail: if failures.is_empty() {
             "keine Quelle verfügbar".into()
         } else {
@@ -541,7 +551,13 @@ pub async fn ensure_image(
         (None, None)
     };
     let pull = pull_source(lang, verify.as_ref());
-    let steps = plan(lang, override_image, archive, pull);
+    let steps = plan(
+        lang,
+        override_image,
+        archive,
+        pull,
+        languages::DEV_OVERRIDES,
+    );
     if let Some(Step::Present(first)) = steps.first() {
         on_progress(Progress::Phase {
             message: format!("Prüfe Image {first} …"),
@@ -704,7 +720,13 @@ mod tests {
             image: primary.clone(),
         };
         assert_eq!(
-            plan(py(), None, Some(archive.clone()), Some(primary.clone())),
+            plan(
+                py(),
+                None,
+                Some(archive.clone()),
+                Some(primary.clone()),
+                true
+            ),
             vec![
                 Step::Present(primary.clone()),
                 Step::Load {
@@ -716,15 +738,26 @@ mod tests {
             ]
         );
         assert_eq!(
-            plan(py(), None, None, Some(primary.clone())),
+            plan(py(), None, None, Some(primary.clone()), true),
             vec![
                 Step::Present(primary.clone()),
                 pull(&primary),
                 Step::Present("code-pruefer-python:dev".into()),
             ]
         );
+        // Release builds: no local :dev fallback.
         assert_eq!(
-            plan(py(), Some("mein:x".into()), None, Some(primary.clone())),
+            plan(py(), None, None, Some(primary.clone()), false),
+            vec![Step::Present(primary.clone()), pull(&primary)]
+        );
+        assert_eq!(
+            plan(
+                py(),
+                Some("mein:x".into()),
+                None,
+                Some(primary.clone()),
+                true
+            ),
             vec![
                 Step::Present("mein:x".into()),
                 Step::Pull {
@@ -800,7 +833,7 @@ mod tests {
         // Pulls use the registry digest, never the tag.
         assert_eq!(pull_source(py(), Some(&v)), Some(format!("{repo}@{rd}")));
         assert_eq!(
-            plan(py(), None, None, pull_source(py(), Some(&v)))[1],
+            plan(py(), None, None, pull_source(py(), Some(&v)), true)[1],
             Step::Pull {
                 source: format!("{repo}@{rd}"),
                 image: py().default_image.into()
@@ -933,7 +966,7 @@ mod tests {
         verify: Option<&Verify>,
     ) -> Result<String, RunnerError> {
         let archive = archive.then(|| PathBuf::from("a.tar.gz"));
-        let steps = plan(py(), None, archive, pull_source(py(), verify));
+        let steps = plan(py(), None, archive, pull_source(py(), verify), true);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

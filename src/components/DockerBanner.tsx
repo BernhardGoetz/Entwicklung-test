@@ -114,6 +114,7 @@ export function DockerBanner({
             {engineSwitch}
           </span>
         </div>
+        {status.warning && <p className="images-status images-error">⚠ {status.warning}</p>}
         {images.busy !== null && <p className="images-status">⏳ {images.busy}</p>}
         {images.busy === null && images.note && (
           <p className={images.note.error ? "images-status images-error" : "images-status"}>

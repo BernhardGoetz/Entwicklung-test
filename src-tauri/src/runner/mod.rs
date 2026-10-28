@@ -27,15 +27,13 @@ pub enum RunnerError {
         "Das Runner-Image für {language} ist nicht vorhanden (gesucht: {tried}). Es konnte weder \
          aus dem Installationspaket geladen noch heruntergeladen werden ({detail}). Bitte die \
          Internetverbindung prüfen und „Images aktualisieren“ klicken oder den Code-Prüfer neu \
-         installieren. Für Entwickler: das Image im Projektordner lokal bauen mit \
-         docker build -t {local_image} images/{id} (bei Podman „podman build …“) und danach \
-         erneut auf „Prüfen“ klicken."
+         installieren.{dev_hint}"
     )]
     ImageMissing {
         language: String,
-        id: String,
         tried: String,
-        local_image: String,
+        /// Build instructions for developers (debug builds), else empty.
+        dev_hint: String,
         detail: String,
     },
     #[error("Fehler der Container-Engine: {0}")]
@@ -68,6 +66,15 @@ pub struct RunRequest {
     /// Ignore trailing whitespace per line and trailing newlines (default on).
     #[serde(default = "default_true")]
     pub trim_whitespace: bool,
+}
+
+/// " Für Entwickler: …" part of [`RunnerError::ImageMissing`] (debug builds).
+pub fn dev_build_hint(lang: &languages::LanguageConfig) -> String {
+    format!(
+        " Für Entwickler: das Image im Projektordner lokal bauen mit docker build -t {} \
+         images/{} (bei Podman „podman build …“) und danach erneut auf „Prüfen“ klicken.",
+        lang.local_image, lang.id
+    )
 }
 
 fn default_true() -> bool {
@@ -384,18 +391,21 @@ mod tests {
 
     #[test]
     fn image_missing_message_is_actionable() {
-        let e = RunnerError::ImageMissing {
+        let e = |dev_hint: String| RunnerError::ImageMissing {
             language: "Python 3.12".into(),
-            id: "python".into(),
             tried: "a, b".into(),
-            local_image: "code-pruefer-python:dev".into(),
+            dev_hint,
             detail: "denied".into(),
         };
-        let msg = e.to_string();
+        let msg = e(dev_build_hint(py())).to_string();
         assert!(msg.contains("docker build -t code-pruefer-python:dev images/python"));
         assert!(msg.contains("Images aktualisieren"));
         assert!(msg.contains("gesucht: a, b"));
         assert!(msg.contains("denied"));
+        // Release builds: no developer instructions.
+        let msg = e(String::new()).to_string();
+        assert!(!msg.contains("docker build"), "{msg}");
+        assert!(msg.ends_with("neu installieren."), "{msg}");
     }
 
     #[test]

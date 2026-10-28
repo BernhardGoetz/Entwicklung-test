@@ -4,7 +4,13 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export type DockerStatus =
   | { state: "notInstalled" }
   | { state: "notRunning" }
-  | { state: "ok"; version: string; product: string };
+  | {
+      state: "ok";
+      version: string;
+      product: string;
+      /** German security warning, e.g. for an unencrypted DOCKER_HOST. */
+      warning?: string;
+    };
 
 export interface LanguageInfo {
   id: string;
