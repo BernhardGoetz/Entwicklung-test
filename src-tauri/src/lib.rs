@@ -56,12 +56,17 @@ fn list_languages() -> Vec<languages::LanguageInfo> {
     languages::infos()
 }
 
+/// "Prüfen": starts the chosen engine first if it does not answer (the
+/// frontend's engine status may be stale), then runs the tests.
 #[tauri::command]
 async fn run_tests(app: AppHandle, request: RunRequest) -> Result<RunReport, RunnerError> {
-    runner::run_submission(request, |p| {
+    let emit = |p: runner::Progress| {
         let _ = app.emit(PROGRESS_EVENT, p);
-    })
-    .await
+    };
+    let docker = engine::ensure_running(|message| emit(runner::Progress::Phase { message }))
+        .await
+        .map_err(RunnerError::Other)?;
+    runner::run_submission_with(&docker, request, emit).await
 }
 
 /// Loads bundled image archives into the active engine if the images are
@@ -175,7 +180,7 @@ async fn generate_tests(
     request: ai::pipeline::GenerateRequest,
 ) -> Result<ai::pipeline::GenerateResult, ai::AiError> {
     let op = ai::Operation::start();
-    ai::pipeline::run(request, &op.token, |p| {
+    ai::pipeline::run(request, &op.token, move |p| {
         let _ = app.emit(AI_EVENT, p);
     })
     .await
@@ -254,7 +259,7 @@ pub fn run() {
                     ai::cancel_all();
                     let cleanup = async {
                         ai::llama::shutdown().await;
-                        if let Ok(docker) = docker::connect().await {
+                        if let Ok(docker) = docker::connect_quick().await {
                             let _ = docker::remove_own_sandboxes(&docker).await;
                         }
                     };

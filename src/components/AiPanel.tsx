@@ -22,6 +22,8 @@ interface Props {
   onApplyMode: (mode: CompareMode) => void;
   onOpenSetup: () => void;
   onRunningChange: (running: boolean) => void;
+  /** Called when a generation ended: the backend may have started the engine (or found it gone). */
+  onFinished: (failed: boolean) => void;
 }
 
 const LEVEL_TEXT = { green: "Grün", yellow: "Gelb", red: "Rot" } as const;
@@ -59,6 +61,7 @@ export function AiPanel({
   onApplyMode,
   onOpenSetup,
   onRunningChange,
+  onFinished,
 }: Props) {
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<AiProgress | null>(null);
@@ -88,6 +91,7 @@ export function AiPanel({
     setSeconds(0);
     const started = Date.now();
     timer.current = window.setInterval(() => setSeconds(Math.round((Date.now() - started) / 1000)), 1000);
+    let failed = false;
     try {
       const r = await generateTests({
         taskText,
@@ -98,12 +102,16 @@ export function AiPanel({
       onResult(r);
     } catch (e) {
       if (String(e) === CANCELLED) setCancelled(true);
-      else setError(String(e));
+      else {
+        setError(String(e));
+        failed = true;
+      }
     } finally {
       if (timer.current !== null) window.clearInterval(timer.current);
       timer.current = null;
       setRunning(false);
       onRunningChange(false);
+      onFinished(failed);
     }
   };
 

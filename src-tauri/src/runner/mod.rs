@@ -18,8 +18,11 @@ pub const MAX_TESTS: usize = 50;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
-    #[error("Keine laufende Container-Engine gefunden. Bitte Docker Desktop oder Podman starten.")]
-    NoEngine,
+    /// Carries the German reason (timeout or no connection).
+    #[error(
+        "Keine laufende Container-Engine gefunden ({0}). Bitte Docker Desktop oder Podman starten."
+    )]
+    NoEngine(String),
     #[error("Unbekannte Sprache: {0}")]
     UnknownLanguage(String),
     #[error("Image {0} konnte nicht geladen werden: {1}")]
@@ -43,6 +46,15 @@ pub enum RunnerError {
     Docker(#[from] bollard::errors::Error),
     #[error("{0}")]
     Other(String),
+}
+
+impl RunnerError {
+    /// The engine itself failed (no connection, broken connection, engine
+    /// error answer), as opposed to a problem of the program or the input.
+    /// After such an error the engine may need a (re)start.
+    pub fn is_engine_error(&self) -> bool {
+        matches!(self, Self::NoEngine(_) | Self::Docker(_))
+    }
 }
 
 impl Serialize for RunnerError {
@@ -185,7 +197,7 @@ pub enum Progress {
     },
 }
 
-fn language(id: &str) -> Result<&'static languages::LanguageConfig, RunnerError> {
+pub fn language(id: &str) -> Result<&'static languages::LanguageConfig, RunnerError> {
     languages::get(id).ok_or_else(|| RunnerError::UnknownLanguage(id.to_string()))
 }
 
@@ -209,28 +221,46 @@ fn check_limits<'a>(
     Ok(())
 }
 
-/// Connects to the engine, makes sure the image exists and starts a fresh
-/// sandbox container. The caller must `remove()` it.
+/// Once per run (or per test generation): removes sandboxes left over by
+/// crashed runs and makes sure the runner image of `lang` exists. Returns
+/// the image to start sandboxes from.
+pub async fn prepare(
+    docker: &bollard::Docker,
+    lang: &languages::LanguageConfig,
+    on_progress: &mut impl FnMut(Progress),
+) -> Result<String, RunnerError> {
+    // Left-overs of crashed runs; failures do not block the run.
+    let _ = docker::remove_orphans(docker, docker::ORPHAN_AGE).await;
+    images::ensure_image(docker, lang, on_progress).await
+}
+
+/// Makes sure the image exists and starts a fresh sandbox container. The
+/// caller must `remove()` it.
 async fn start_sandbox(
+    docker: &bollard::Docker,
     lang: &languages::LanguageConfig,
     on_progress: &mut impl FnMut(Progress),
 ) -> Result<(Sandbox, String), RunnerError> {
-    let docker = docker::connect().await?;
-    // Left-overs of crashed runs; failures do not block the run.
-    let _ = docker::remove_orphans(&docker, docker::ORPHAN_AGE).await;
-    let image = images::ensure_image(&docker, lang, on_progress).await?;
-
+    let image = prepare(docker, lang, on_progress).await?;
     on_progress(Progress::Phase {
         message: "Starte Container …".into(),
     });
-    let sandbox = Sandbox::create(&docker, &image).await?;
+    let sandbox = Sandbox::create(docker, &image).await?;
     Ok((sandbox, image))
 }
 
+/// Connects (with retries) and runs the submission, see [`run_submission_with`].
 pub async fn run_submission(
     req: RunRequest,
-    mut on_progress: impl FnMut(Progress),
+    on_progress: impl FnMut(Progress),
 ) -> Result<RunReport, RunnerError> {
+    // Limits first: rejected requests never touch the engine.
+    validate_request(&req)?;
+    let docker = docker::connect().await?;
+    run_submission_with(&docker, req, on_progress).await
+}
+
+fn validate_request(req: &RunRequest) -> Result<&'static languages::LanguageConfig, RunnerError> {
     let lang = language(&req.language)?;
     check_limits(
         &req.code,
@@ -240,9 +270,19 @@ pub async fn run_submission(
         req.tests.len(),
     )?;
     req.mode().validate().map_err(RunnerError::Other)?;
+    Ok(lang)
+}
+
+/// Runs a submission on an engine that is already connected.
+pub async fn run_submission_with(
+    docker: &bollard::Docker,
+    req: RunRequest,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<RunReport, RunnerError> {
+    let lang = validate_request(&req)?;
     let hint = languages::precheck(lang, &req.code);
 
-    let (sandbox, image) = start_sandbox(lang, &mut on_progress).await?;
+    let (sandbox, image) = start_sandbox(docker, lang, &mut on_progress).await?;
     let result = run_in_sandbox(&sandbox, lang, &req, &mut on_progress).await;
     sandbox.remove().await;
 
@@ -266,39 +306,116 @@ pub async fn run_submission(
 /// Runs `code` once per input and returns the raw outputs (no expected
 /// output, no evaluation) – e.g. to compute expected outputs from a
 /// reference solution. Same sandbox, limits and flow as [`run_submission`]:
-/// one container, compiled once, every input in a fresh process.
+/// one container, compiled once, every input in a fresh process. Uses
+/// `docker` if given, else connects.
 pub async fn collect_outputs(
     language_id: &str,
     code: &str,
     inputs: &[String],
+    docker: Option<&bollard::Docker>,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<CollectedOutputs, RunnerError> {
     let lang = language(language_id)?;
     check_limits(code, inputs.iter().map(String::as_str), inputs.len())?;
-
-    let (sandbox, image) = start_sandbox(lang, &mut on_progress).await?;
-    let result = async {
-        let (compile, compile_ok) =
-            compile_in_sandbox(&sandbox, lang, code, &mut on_progress).await?;
-        let mut outputs = Vec::with_capacity(inputs.len());
-        if compile_ok {
-            for (index, input) in inputs.iter().enumerate() {
-                on_progress(Progress::Phase {
-                    message: format!("Eingabe {} von {} …", index + 1, inputs.len()),
-                });
-                outputs.push(run_input(&sandbox, lang, input).await?.into());
-            }
+    let connected;
+    let docker = match docker {
+        Some(d) => d,
+        None => {
+            connected = docker::connect().await?;
+            &connected
         }
+    };
+    let image = prepare(docker, lang, &mut on_progress).await?;
+    run_program(docker, lang, &image, code, inputs, on_progress).await
+}
+
+/// [`collect_outputs`] without the preparation: `image` comes from
+/// [`prepare`], which callers with many programs run only once.
+pub async fn run_program(
+    docker: &bollard::Docker,
+    lang: &'static languages::LanguageConfig,
+    image: &str,
+    code: &str,
+    inputs: &[String],
+    mut on_progress: impl FnMut(Progress),
+) -> Result<CollectedOutputs, RunnerError> {
+    check_limits(code, inputs.iter().map(String::as_str), inputs.len())?;
+    on_progress(Progress::Phase {
+        message: "Starte Container …".into(),
+    });
+    let session = SandboxSession::open(docker, lang, image).await?;
+    let result = async {
+        let (compile, compile_ok) = session.compile(code, &mut on_progress).await?;
+        let outputs = if compile_ok {
+            session.run(inputs, &mut on_progress).await?
+        } else {
+            Vec::new()
+        };
         Ok(CollectedOutputs {
-            image,
+            image: image.to_string(),
             compile,
             compile_ok,
             outputs,
         })
     }
     .await;
-    sandbox.remove().await;
+    session.close().await;
     result
+}
+
+/// One sandbox container for one program: compiled once, then run on any
+/// number of inputs (each in a fresh process). Test generation keeps one
+/// session per candidate solution for the example check and the majority
+/// vote. Call [`SandboxSession::close`] when done.
+pub struct SandboxSession {
+    sandbox: Sandbox,
+    lang: &'static languages::LanguageConfig,
+}
+
+impl SandboxSession {
+    /// Starts a container from `image` (see [`prepare`]).
+    pub async fn open(
+        docker: &bollard::Docker,
+        lang: &'static languages::LanguageConfig,
+        image: &str,
+    ) -> Result<Self, RunnerError> {
+        Ok(Self {
+            sandbox: Sandbox::create(docker, image).await?,
+            lang,
+        })
+    }
+
+    /// Writes `code` (replacing an earlier program) and compiles it.
+    pub async fn compile(
+        &self,
+        code: &str,
+        on_progress: &mut impl FnMut(Progress),
+    ) -> Result<(Option<StepOutput>, bool), RunnerError> {
+        check_limits(code, [], 0)?;
+        compile_in_sandbox(&self.sandbox, self.lang, code, on_progress).await
+    }
+
+    /// Runs the compiled program once per input.
+    pub async fn run(
+        &self,
+        inputs: &[String],
+        on_progress: &mut impl FnMut(Progress),
+    ) -> Result<Vec<StepOutput>, RunnerError> {
+        check_limits("", inputs.iter().map(String::as_str), inputs.len())?;
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            on_progress(Progress::Phase {
+                message: format!("Eingabe {} von {} …", index + 1, inputs.len()),
+            });
+            outputs.push(run_input(&self.sandbox, self.lang, input).await?.into());
+        }
+        Ok(outputs)
+    }
+
+    /// Removes the container (best effort).
+    pub async fn close(self) {
+        self.sandbox.remove().await;
+    }
 }
 
 /// Writes the source file and compiles it (if the language has a compile
@@ -663,16 +780,16 @@ mod tests {
     #[test]
     fn collect_outputs_checks_limits_before_engine_access() {
         let inputs = vec![String::new(); MAX_TESTS + 1];
-        let msg = block_on(collect_outputs("python", "print(1)", &inputs, |_| {}))
+        let msg = block_on(collect_outputs("python", "print(1)", &inputs, None, |_| {}))
             .unwrap_err()
             .to_string();
         assert!(msg.contains("höchstens 50"), "{msg}");
         let big = vec!["x".repeat(MAX_INPUT_BYTES + 1)];
-        let msg = block_on(collect_outputs("python", "print(1)", &big, |_| {}))
+        let msg = block_on(collect_outputs("python", "print(1)", &big, None, |_| {}))
             .unwrap_err()
             .to_string();
         assert!(msg.contains("zu groß"), "{msg}");
-        let msg = block_on(collect_outputs("cobol", "", &[], |_| {}))
+        let msg = block_on(collect_outputs("cobol", "", &[], None, |_| {}))
             .unwrap_err()
             .to_string();
         assert!(msg.contains("Unbekannte Sprache"), "{msg}");

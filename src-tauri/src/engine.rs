@@ -12,6 +12,7 @@
 //! tried first) and decides which engine is started; an explicit
 //! `DOCKER_HOST` still wins exclusively (see `runner::docker::candidate_hosts`).
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -378,33 +379,102 @@ pub fn podman_start_steps(machine: Option<&str>) -> Vec<Vec<String>> {
 // ---------------------------------------------------------------------------
 // Starting the engine
 
-/// Starts `engine` and waits until its API answers, reporting German status
-/// messages. Returns a German error message on failure.
-pub async fn start(engine: Engine, mut on_message: impl FnMut(String)) -> Result<(), String> {
-    if docker::connect().await.is_ok() {
-        return Ok(());
+/// What [`ensure_running_with`] needs from the outside world; the real
+/// implementation is [`RealOps`], tests simulate Docker and Podman.
+pub trait EngineOps: Sync {
+    type Client: Send;
+    /// Connects with retries ([`docker::connect`]).
+    fn connect(&self) -> impl Future<Output = Result<Self::Client, String>> + Send;
+    /// One quick connection attempt while the engine starts.
+    fn poll(&self) -> impl Future<Output = Result<Self::Client, String>> + Send;
+    /// Launches the engine; `Ok(Some(note))` is a non-fatal message.
+    fn launch(
+        &self,
+        engine: Engine,
+        on_message: &mut (dyn FnMut(String) + Send),
+    ) -> impl Future<Output = Result<Option<String>, String>> + Send;
+    /// Asks Podman for its endpoint again (it may change on start).
+    fn refresh_podman(&self) -> impl Future<Output = ()> + Send;
+}
+
+/// The real engine: bollard connections and the launch code below.
+pub struct RealOps;
+
+impl EngineOps for RealOps {
+    type Client = bollard::Docker;
+
+    async fn connect(&self) -> Result<bollard::Docker, String> {
+        docker::connect().await.map_err(|e| e.to_string())
     }
+
+    async fn poll(&self) -> Result<bollard::Docker, String> {
+        docker::connect_quick().await.map_err(|e| e.to_string())
+    }
+
+    async fn launch(
+        &self,
+        engine: Engine,
+        on_message: &mut (dyn FnMut(String) + Send),
+    ) -> Result<Option<String>, String> {
+        launch(engine, on_message).await
+    }
+
+    async fn refresh_podman(&self) {
+        refresh_podman_pipe(None).await;
+    }
+}
+
+/// Timing of [`ensure_running_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct StartTiming {
+    pub poll_interval: Duration,
+    pub timeout: Duration,
+}
+
+pub const START_TIMING: StartTiming = StartTiming {
+    poll_interval: POLL_INTERVAL,
+    timeout: START_TIMEOUT,
+};
+
+/// Makes sure the engine answers: connects (with retries) and otherwise
+/// starts the chosen engine and waits for its API, reporting German status
+/// messages ("Docker Desktop wird gestartet …"). `starting` keeps a second
+/// caller (double click, run and AI at once) from launching it twice; that
+/// caller only waits. Returns a connected client or a German error message.
+pub async fn ensure_running_with<O: EngineOps>(
+    ops: &O,
+    engine: Engine,
+    timing: StartTiming,
+    starting: &AtomicBool,
+    on_message: &mut (dyn FnMut(String) + Send),
+) -> Result<O::Client, String> {
+    let first_error = match ops.connect().await {
+        Ok(c) => return Ok(c),
+        Err(e) => e,
+    };
     let name = engine.display_name();
     on_message(format!("{name} wird gestartet …"));
-    // A second caller (e.g. a double click) only waits for the first start.
-    let launch_note = if STARTING.swap(true, Ordering::SeqCst) {
+    let launch_note = if starting.swap(true, Ordering::SeqCst) {
         None
     } else {
-        let r = launch(engine, &mut on_message).await;
-        STARTING.store(false, Ordering::SeqCst);
-        r?
+        let r = ops.launch(engine, on_message).await;
+        starting.store(false, Ordering::SeqCst);
+        match r {
+            Ok(note) => note,
+            Err(e) => return Err(format!("{first_error} {e}")),
+        }
     };
 
     let started = Instant::now();
     loop {
         if engine == Engine::Podman {
-            refresh_podman_pipe(None).await;
+            ops.refresh_podman().await;
         }
-        if docker::connect().await.is_ok() {
-            return Ok(());
+        if let Ok(c) = ops.poll().await {
+            return Ok(c);
         }
         let waited = started.elapsed();
-        if waited >= START_TIMEOUT {
+        if waited >= timing.timeout {
             let mut msg = format!(
                 "{name} wurde gestartet, antwortet aber nach {} s noch nicht. Bitte {name} prüfen \
                  (beim ersten Start ggf. Nutzungsbedingungen bestätigen) und danach „Erneut prüfen“ \
@@ -417,8 +487,35 @@ pub async fn start(engine: Engine, mut on_message: impl FnMut(String)) -> Result
             return Err(msg);
         }
         on_message(format!("{name} wird gestartet … ({} s)", waited.as_secs()));
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(timing.poll_interval).await;
     }
+}
+
+/// The chosen engine answers (started if needed); returns a client for it.
+/// Used by runs and test generation, so they do not depend on the
+/// frontend's (possibly stale) engine status.
+pub async fn ensure_running(
+    mut on_message: impl FnMut(String) + Send,
+) -> Result<bollard::Docker, String> {
+    ensure_running_with(
+        &RealOps,
+        current().engine,
+        START_TIMING,
+        &STARTING,
+        &mut on_message,
+    )
+    .await
+}
+
+/// Starts `engine` and waits until its API answers, reporting German status
+/// messages. Returns a German error message on failure.
+pub async fn start(
+    engine: Engine,
+    mut on_message: impl FnMut(String) + Send,
+) -> Result<(), String> {
+    ensure_running_with(&RealOps, engine, START_TIMING, &STARTING, &mut on_message)
+        .await
+        .map(|_| ())
 }
 
 fn not_installed(engine: Engine) -> String {
@@ -433,7 +530,7 @@ fn not_installed(engine: Engine) -> String {
 /// (e.g. "already running") to show if the API never comes up.
 async fn launch(
     engine: Engine,
-    on_message: &mut impl FnMut(String),
+    on_message: &mut (dyn FnMut(String) + Send),
 ) -> Result<Option<String>, String> {
     if !cfg!(any(windows, target_os = "macos")) {
         // Linux: the engine is a system/user service; starting it needs root
@@ -470,7 +567,9 @@ async fn launch_docker() -> Result<(), String> {
     spawn_detached(&app).map_err(|e| format!("Docker Desktop konnte nicht gestartet werden: {e}"))
 }
 
-async fn launch_podman(on_message: &mut impl FnMut(String)) -> Result<Option<String>, String> {
+async fn launch_podman(
+    on_message: &mut (dyn FnMut(String) + Send),
+) -> Result<Option<String>, String> {
     let podman = podman_path().ok_or_else(|| not_installed(Engine::Podman))?;
     let list = run_cmd(&podman, &strings(PODMAN_LIST), PODMAN_QUERY_TIMEOUT).await?;
     let machine = pick_machine(&String::from_utf8_lossy(&list.stdout));
@@ -681,6 +780,176 @@ mod tests {
         assert_eq!(
             podman_start_steps(Some("dev")),
             vec![vec!["machine", "start", "dev"]]
+        );
+    }
+
+    /// Simulated engine: answers after `up_after` connection attempts once
+    /// launched (or at once with `running`).
+    struct SimEngine {
+        running: bool,
+        up_after: usize,
+        launch_error: Option<String>,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl SimEngine {
+        fn new(running: bool, up_after: usize) -> Self {
+            Self {
+                running,
+                up_after,
+                launch_error: None,
+                log: Mutex::new(Vec::new()),
+            }
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+        fn count(&self, what: &str) -> usize {
+            self.log().iter().filter(|l| *l == what).count()
+        }
+    }
+
+    impl EngineOps for SimEngine {
+        type Client = &'static str;
+
+        async fn connect(&self) -> Result<&'static str, String> {
+            self.log.lock().unwrap().push("connect".into());
+            if self.running {
+                Ok("client")
+            } else {
+                Err("Keine laufende Container-Engine gefunden (x).".into())
+            }
+        }
+
+        async fn poll(&self) -> Result<&'static str, String> {
+            let mut log = self.log.lock().unwrap();
+            log.push("poll".into());
+            let polls = log.iter().filter(|l| *l == "poll").count();
+            if polls >= self.up_after {
+                Ok("client")
+            } else {
+                Err("noch nicht".into())
+            }
+        }
+
+        async fn launch(
+            &self,
+            engine: Engine,
+            on_message: &mut (dyn FnMut(String) + Send),
+        ) -> Result<Option<String>, String> {
+            self.log.lock().unwrap().push(format!("launch {engine:?}"));
+            if engine == Engine::Podman {
+                on_message("Podman wird gestartet …".into());
+            }
+            match &self.launch_error {
+                Some(e) => Err(e.clone()),
+                None => Ok(None),
+            }
+        }
+
+        async fn refresh_podman(&self) {
+            self.log.lock().unwrap().push("refresh".into());
+        }
+    }
+
+    const FAST: StartTiming = StartTiming {
+        poll_interval: Duration::from_millis(1),
+        timeout: Duration::from_millis(200),
+    };
+
+    fn ensure(sim: &SimEngine, engine: Engine) -> (Result<&'static str, String>, Vec<String>) {
+        let starting = AtomicBool::new(false);
+        let mut messages = Vec::new();
+        let r = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ensure_running_with(
+                sim,
+                engine,
+                FAST,
+                &starting,
+                &mut |m| messages.push(m),
+            ));
+        assert!(!starting.load(Ordering::SeqCst));
+        (r, messages)
+    }
+
+    #[test]
+    fn ensure_running_is_a_no_op_when_engine_answers() {
+        let sim = SimEngine::new(true, 0);
+        let (r, messages) = ensure(&sim, Engine::Docker);
+        assert_eq!(r.unwrap(), "client");
+        assert!(messages.is_empty());
+        assert_eq!(sim.log(), vec!["connect"]);
+    }
+
+    #[test]
+    fn ensure_running_starts_docker_and_waits() {
+        let sim = SimEngine::new(false, 3);
+        let (r, messages) = ensure(&sim, Engine::Docker);
+        assert_eq!(r.unwrap(), "client");
+        assert_eq!(messages[0], "Docker Desktop wird gestartet …");
+        assert!(messages
+            .iter()
+            .any(|m| m.starts_with("Docker Desktop wird gestartet … (")));
+        assert_eq!(sim.count("launch Docker"), 1);
+        assert_eq!(sim.count("poll"), 3);
+        assert_eq!(sim.count("refresh"), 0);
+    }
+
+    #[test]
+    fn ensure_running_starts_podman_and_refreshes_its_endpoint() {
+        let sim = SimEngine::new(false, 2);
+        let (r, messages) = ensure(&sim, Engine::Podman);
+        assert_eq!(r.unwrap(), "client");
+        assert_eq!(messages[0], "Podman wird gestartet …");
+        assert_eq!(sim.count("launch Podman"), 1);
+        // The endpoint is asked for before every poll.
+        assert_eq!(sim.count("refresh"), sim.count("poll"));
+    }
+
+    #[test]
+    fn ensure_running_reports_launch_errors_and_timeouts() {
+        let mut sim = SimEngine::new(false, usize::MAX);
+        sim.launch_error = Some(not_installed(Engine::Docker));
+        let (r, _) = ensure(&sim, Engine::Docker);
+        let e = r.unwrap_err();
+        assert!(
+            e.starts_with("Keine laufende Container-Engine gefunden (x)."),
+            "{e}"
+        );
+        assert!(e.contains("Docker Desktop wurde nicht gefunden"), "{e}");
+        assert_eq!(sim.count("poll"), 0);
+
+        let sim = SimEngine::new(false, usize::MAX);
+        let (r, _) = ensure(&sim, Engine::Podman);
+        let e = r.unwrap_err();
+        assert!(e.contains("Podman wurde gestartet, antwortet aber"), "{e}");
+        assert!(sim.count("poll") >= 2);
+    }
+
+    #[test]
+    fn ensure_running_waits_for_a_start_in_progress() {
+        // Another caller is launching the engine: only wait, no 2nd launch.
+        let sim = SimEngine::new(false, 2);
+        let starting = AtomicBool::new(true);
+        let r = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ensure_running_with(
+                &sim,
+                Engine::Docker,
+                FAST,
+                &starting,
+                &mut |_| {},
+            ));
+        assert_eq!(r.unwrap(), "client");
+        assert_eq!(sim.count("launch Docker"), 0);
+        assert!(
+            starting.load(Ordering::SeqCst),
+            "the other caller resets it"
         );
     }
 

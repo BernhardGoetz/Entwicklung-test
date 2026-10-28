@@ -192,8 +192,10 @@ export default function App() {
 
   const language = languages.find((l) => l.id === languageId);
   const code = codeByLang[languageId] ?? "";
+  // "Prüfen" starts the engine itself if it is installed but not running.
   const canRun =
-    docker?.state === "ok" &&
+    docker !== null &&
+    docker.state !== "notInstalled" &&
     starting === null &&
     imagesBusy === null &&
     !running &&
@@ -212,7 +214,8 @@ export default function App() {
   const aiBlocked = (() => {
     if (task.trim() === "" || !taskConfirmed)
       return "Zuerst die Aufgabenstellung einfügen, prüfen und „Text geprüft und korrigiert“ anhaken.";
-    if (docker?.state !== "ok" || starting !== null) return "Docker oder Podman muss laufen.";
+    // The backend starts the engine itself; only a start in progress blocks.
+    if (starting !== null) return "Docker oder Podman wird gerade gestartet …";
     if (imagesBusy !== null) return "Die Runner-Images werden noch vorbereitet …";
     if (ai === null) return "KI-Status wird geladen …";
     if (!ai.runtimeAvailable) return ai.runtimeError ?? "KI-Laufzeit nicht gefunden.";
@@ -266,6 +269,8 @@ export default function App() {
         compareMode,
       });
       setReport(r);
+      // The backend may have started the engine.
+      if (docker?.state !== "ok") refreshDocker();
     } catch (e) {
       setError(String(e));
       refreshDocker();
@@ -334,6 +339,10 @@ export default function App() {
             }}
             onOpenSetup={() => setSetupOpen(true)}
             onRunningChange={setGenerating}
+            onFinished={(failed) => {
+              // Engine errors, or the backend started the engine: show the real state.
+              if (failed || docker?.state !== "ok") refreshDocker();
+            }}
           />
           {aiNote && <div className="hint small">{aiNote}</div>}
           <TestCaseEditor
@@ -349,8 +358,11 @@ export default function App() {
             </button>
             {running && <span className="muted">{progressText(progress)}</span>}
             {!running && imagesBusy !== null && <span className="muted">{imagesBusy}</span>}
-            {!running && docker?.state !== "ok" && (
+            {!running && docker?.state === "notInstalled" && (
               <span className="muted small">Zum Prüfen wird Docker oder Podman benötigt.</span>
+            )}
+            {!running && docker?.state === "notRunning" && (
+              <span className="muted small">Die Container-Engine wird beim Prüfen automatisch gestartet.</span>
             )}
           </div>
           {error && <div className="banner warn">{error}</div>}

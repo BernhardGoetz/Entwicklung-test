@@ -23,7 +23,7 @@ pub enum DockerStatus {
 }
 
 pub async fn detect() -> DockerStatus {
-    if let Ok(client) = docker::connect().await {
+    if let Ok(client) = docker::connect_quick().await {
         if let Ok(v) = client.version().await {
             let product = v
                 .platform

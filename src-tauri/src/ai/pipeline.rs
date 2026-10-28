@@ -18,7 +18,10 @@
 //! The flow is generic over the model ([`Llm`]) and the sandbox
 //! ([`Executor`]), so it is unit-tested with mocks.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -27,8 +30,9 @@ use tokio_util::sync::CancellationToken;
 use super::llama::{ChatRequest, ChatResponse, Llm};
 use super::prompts::{self, SolutionContext, MAX_EXAMPLES, MAX_INPUTS};
 use super::AiError;
+use crate::engine;
 use crate::runner::compare::{group_outputs, normalize_newlines, CompareMode};
-use crate::runner::{languages, CollectedOutputs, StepOutput};
+use crate::runner::{self, languages, CollectedOutputs, StepOutput};
 
 /// Longest accepted task text (the model context is 8192 tokens).
 pub const MAX_TASK_CHARS: usize = 12_000;
@@ -149,6 +153,8 @@ pub struct GenerateResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Phase {
+    /// Checking or starting the container engine, preparing the image.
+    Engine,
     Model,
     Structure,
     Solutions,
@@ -192,9 +198,179 @@ pub trait Executor {
     ) -> impl Future<Output = Result<CollectedOutputs, AiError>> + Send;
 }
 
-/// [`Executor`] using the real sandbox.
+/// Engine status messages ("Docker Desktop wird gestartet …").
+pub type Notify = Arc<dyn Fn(String) + Send + Sync>;
+
+/// How often one test generation may restart/reconnect the engine.
+const MAX_ENGINE_RECOVERIES: usize = 3;
+/// How long a recovery waits for an engine that does not answer.
+const RECOVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+const RECOVERY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The connection of a run; `generation` counts reconnects.
+struct Connection {
+    docker: bollard::Docker,
+    generation: u64,
+}
+
+/// [`Executor`] using the real sandbox. One engine connection per test
+/// generation: orphan cleanup and the image check run once per language,
+/// not before every program. If the engine fails (e.g. Docker Desktop
+/// restarts or answers too slowly), it is started again via
+/// [`engine::ensure_running`] and the program runs once more.
 pub struct SandboxExecutor {
-    pub cancel: CancellationToken,
+    cancel: CancellationToken,
+    notify: Notify,
+    conn: tokio::sync::Mutex<Connection>,
+    /// Image per language, from [`runner::prepare`].
+    images: tokio::sync::Mutex<HashMap<&'static str, String>>,
+    recoveries: AtomicUsize,
+}
+
+impl SandboxExecutor {
+    /// Makes sure the engine runs (starting it if needed) and connects.
+    pub async fn connect(
+        cancel: CancellationToken,
+        notify: impl Fn(String) + Send + Sync + 'static,
+    ) -> Result<Self, AiError> {
+        let notify: Notify = Arc::new(notify);
+        let n = notify.clone();
+        let docker = cancellable(&cancel, async {
+            engine::ensure_running(move |m| n(m))
+                .await
+                .map_err(AiError::Other)
+        })
+        .await?;
+        Ok(Self {
+            cancel,
+            notify,
+            conn: tokio::sync::Mutex::new(Connection {
+                docker,
+                generation: 0,
+            }),
+            images: tokio::sync::Mutex::new(HashMap::new()),
+            recoveries: AtomicUsize::new(0),
+        })
+    }
+
+    /// Number of engine recoveries so far.
+    pub fn recoveries(&self) -> usize {
+        self.recoveries.load(AtomicOrdering::SeqCst)
+    }
+
+    async fn client(&self) -> (bollard::Docker, u64) {
+        let c = self.conn.lock().await;
+        (c.docker.clone(), c.generation)
+    }
+
+    /// Removes orphans and checks the image of `lang` (once per language).
+    pub async fn prepare(&self, language: &str) -> Result<String, AiError> {
+        let lang = runner::language(language).map_err(|e| AiError::Other(e.to_string()))?;
+        let mut images = self.images.lock().await;
+        if let Some(image) = images.get(lang.id) {
+            return Ok(image.clone());
+        }
+        let notify = self.notify.clone();
+        let image = self
+            .with_engine(|docker| {
+                let notify = notify.clone();
+                async move {
+                    runner::prepare(&docker, lang, &mut |p| notify(engine_progress_text(&p))).await
+                }
+            })
+            .await?;
+        images.insert(lang.id, image.clone());
+        Ok(image)
+    }
+
+    /// Runs `op` with the current client; after an engine error the engine
+    /// is (re)started and `op` runs once more (at most
+    /// [`MAX_ENGINE_RECOVERIES`] times per test generation).
+    async fn with_engine<T, F, Fut>(&self, mut op: F) -> Result<T, AiError>
+    where
+        F: FnMut(bollard::Docker) -> Fut,
+        Fut: Future<Output = Result<T, runner::RunnerError>>,
+    {
+        loop {
+            let (docker, generation) = self.client().await;
+            let err = match cancellable(&self.cancel, async { Ok(op(docker).await) }).await? {
+                Ok(v) => return Ok(v),
+                Err(e) => e,
+            };
+            if !err.is_engine_error()
+                || self.recoveries.fetch_add(1, AtomicOrdering::SeqCst) >= MAX_ENGINE_RECOVERIES
+            {
+                return Err(AiError::Other(err.to_string()));
+            }
+            self.recover(generation).await?;
+        }
+    }
+
+    /// New connection after an engine error; concurrent callers share one
+    /// recovery (the generation tells whether another caller already did it).
+    async fn recover(&self, failed: u64) -> Result<(), AiError> {
+        let mut conn = self.conn.lock().await;
+        if conn.generation != failed {
+            return Ok(());
+        }
+        (self.notify)("Verbindung zur Container-Engine unterbrochen – neuer Versuch …".into());
+        let started = Instant::now();
+        let docker = loop {
+            let notify = self.notify.clone();
+            let r = cancellable(&self.cancel, async {
+                Ok(engine::ensure_running(move |m| notify(m)).await)
+            })
+            .await?;
+            match r {
+                Ok(docker) => break docker,
+                // The engine may be restarting by itself (Docker Desktop
+                // after an update or crash, a service restart): wait a while.
+                Err(_) if started.elapsed() < RECOVERY_WAIT => {
+                    (self.notify)(format!(
+                        "Warte auf die Container-Engine … ({} s)",
+                        started.elapsed().as_secs()
+                    ));
+                    cancellable(&self.cancel, async {
+                        tokio::time::sleep(RECOVERY_POLL).await;
+                        Ok(())
+                    })
+                    .await?;
+                }
+                Err(e) => return Err(AiError::Other(e)),
+            }
+        };
+        conn.docker = docker;
+        conn.generation += 1;
+        Ok(())
+    }
+}
+
+/// Runs `f` unless `cancel` fires first.
+async fn cancellable<T>(
+    cancel: &CancellationToken,
+    f: impl Future<Output = Result<T, AiError>>,
+) -> Result<T, AiError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(AiError::Cancelled),
+        r = f => r,
+    }
+}
+
+/// German status line for image preparation progress.
+fn engine_progress_text(p: &runner::Progress) -> String {
+    match p {
+        runner::Progress::Phase { message } => message.clone(),
+        runner::Progress::Load { image, percent } => format!(
+            "Lade Image {image} aus dem Installationspaket (einmalig){}",
+            percent.map(|p| format!(": {p} %")).unwrap_or_default()
+        ),
+        runner::Progress::Pull(p) => format!(
+            "Lade Image {} herunter{}",
+            p.image,
+            p.percent.map(|x| format!(": {x} %")).unwrap_or_default()
+        ),
+    }
 }
 
 impl Executor for SandboxExecutor {
@@ -204,12 +380,13 @@ impl Executor for SandboxExecutor {
         code: &str,
         inputs: &[String],
     ) -> Result<CollectedOutputs, AiError> {
-        let run = crate::runner::collect_outputs(language, code, inputs, |_| {});
-        tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => Err(AiError::Cancelled),
-            r = run => r.map_err(|e| AiError::Other(e.to_string())),
-        }
+        let lang = runner::language(language).map_err(|e| AiError::Other(e.to_string()))?;
+        let image = self.prepare(language).await?;
+        self.with_engine(|docker| {
+            let image = image.clone();
+            async move { runner::run_program(&docker, lang, &image, code, inputs, |_| {}).await }
+        })
+        .await
     }
 }
 
@@ -838,15 +1015,17 @@ pub async fn generate<L: Llm, E: Executor>(
 
 static GENERATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// `generate_tests`: checks the request, starts llama-server with the
-/// selected model and runs the pipeline against the real sandbox.
+/// `generate_tests`: checks the request, makes sure the container engine
+/// runs (before the model is loaded – minutes of model work must not end
+/// in "no engine"), starts llama-server with the selected model and runs
+/// the pipeline against the real sandbox.
 pub async fn run(
     req: GenerateRequest,
     cancel: &CancellationToken,
-    mut on_progress: impl FnMut(AiProgress),
+    on_progress: impl Fn(AiProgress) + Send + Sync + 'static,
 ) -> Result<GenerateResult, AiError> {
     use std::sync::atomic::Ordering;
-    req.validate()?;
+    let lang = req.validate()?;
     if GENERATING.swap(true, Ordering::SeqCst) {
         return Err(AiError::Other(
             "Es werden bereits Testfälle erzeugt.".into(),
@@ -861,20 +1040,29 @@ pub async fn run(
     let _reset = Reset;
 
     let model = super::models::selected_model()?;
+    let on_progress = Arc::new(on_progress);
+    on_progress(AiProgress::new(
+        Phase::Engine,
+        "Container-Engine wird geprüft …",
+    ));
+    let p = on_progress.clone();
+    let exec = SandboxExecutor::connect(cancel.clone(), move |m| {
+        p(AiProgress::new(Phase::Engine, m))
+    })
+    .await?;
+    exec.prepare(lang.id).await?;
+
     on_progress(AiProgress::new(Phase::Model, "KI-Modell wird geladen …"));
     let endpoint = super::llama::ensure_running(&model.path, cancel, |m| {
         on_progress(AiProgress::new(Phase::Model, m))
     })
     .await?;
     let llm = super::llama::LlamaClient::new(endpoint, cancel.clone())?;
-    let exec = SandboxExecutor {
-        cancel: cancel.clone(),
-    };
     let settings = Settings {
         solutions: model.solutions as usize,
         repair_rounds: 1,
     };
-    generate(&llm, &exec, &req, settings, cancel, on_progress).await
+    generate(&llm, &exec, &req, settings, cancel, |p| on_progress(p)).await
 }
 
 #[cfg(test)]

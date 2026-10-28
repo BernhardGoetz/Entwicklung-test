@@ -292,7 +292,7 @@ export interface GenerateRequest {
 }
 
 export interface AiProgress {
-  phase: "model" | "structure" | "solutions" | "inputs" | "majority" | "correction";
+  phase: "engine" | "model" | "structure" | "solutions" | "inputs" | "majority" | "correction";
   message: string;
   current: number | null;
   total: number | null;

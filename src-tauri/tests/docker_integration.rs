@@ -214,7 +214,7 @@ async fn collect_outputs_runs_every_input() {
     setup();
     let inputs: Vec<String> = vec!["2\n".into(), "5\n".into(), "x\n".into()];
     let mut phases = Vec::new();
-    let c = runner::collect_outputs("python", "print(int(input()) ** 2)\n", &inputs, |p| {
+    let c = runner::collect_outputs("python", "print(int(input()) ** 2)\n", &inputs, None, |p| {
         phases.push(p)
     })
     .await
@@ -230,13 +230,13 @@ async fn collect_outputs_runs_every_input() {
     // Java: compiled once; a compile error gives no outputs.
     let java = "public class Main { public static void main(String[] a) { \
                 System.out.println(new java.util.Scanner(System.in).nextInt() + 1); } }\n";
-    let c = runner::collect_outputs("java", java, &inputs[..2], |_| {})
+    let c = runner::collect_outputs("java", java, &inputs[..2], None, |_| {})
         .await
         .unwrap();
     assert!(c.compile_ok, "{:?}", c.compile);
     let stdout: Vec<&str> = c.outputs.iter().map(|o| o.stdout.as_str()).collect();
     assert_eq!(stdout, vec!["3\n", "6\n"]);
-    let c = runner::collect_outputs("java", "class Main {", &inputs, |_| {})
+    let c = runner::collect_outputs("java", "class Main {", &inputs, None, |_| {})
         .await
         .unwrap();
     assert!(!c.compile_ok);

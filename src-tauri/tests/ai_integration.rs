@@ -174,9 +174,9 @@ async fn pipeline_on_sample_tasks() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
     let llm = LlamaClient::new(endpoint, cancel.clone()).unwrap();
-    let exec = SandboxExecutor {
-        cancel: cancel.clone(),
-    };
+    let exec = SandboxExecutor::connect(cancel.clone(), |m| eprintln!("{m}"))
+        .await
+        .expect("Engine");
     let only = std::env::var("CODE_PRUEFER_TEST_SAMPLE").ok();
     for s in SAMPLES
         .iter()
@@ -269,9 +269,9 @@ impl Llm for ScriptedLlm {
 async fn pipeline_with_real_sandbox() {
     setup_images();
     let cancel = CancellationToken::new();
-    let exec = SandboxExecutor {
-        cancel: cancel.clone(),
-    };
+    let exec = SandboxExecutor::connect(cancel.clone(), |m| eprintln!("{m}"))
+        .await
+        .expect("Engine");
     let task = "Lies zwei ganze Zahlen a und b und gib a + b aus.\n\nBeispiel\nEingabe:\n3 4\nAusgabe:\n7\n";
     let req = |language: &str| GenerateRequest {
         task_text: task.into(),
@@ -351,4 +351,162 @@ async fn pipeline_with_real_sandbox() {
     assert_eq!(r.confidence.level, ConfidenceLevel::Yellow);
     assert_eq!(r.tests.last().unwrap().expected, "4000000000\n");
     assert!(r.reference_solution.unwrap().contains("long a"));
+}
+
+/// Sandbox containers of this test process (label `de.code-pruefer.sandbox`).
+fn sandbox_containers() -> Vec<String> {
+    let out = std::process::Command::new("docker")
+        .args(["ps", "-aq", "--filter", "label=de.code-pruefer.sandbox"])
+        .output()
+        .expect("docker ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+fn dockerd_running() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Stops dockerd (all containers die with it) and starts it again in the
+/// background, as happens when Docker Desktop restarts.
+fn restart_dockerd() {
+    let _ = std::process::Command::new("pkill")
+        .args(["-x", "dockerd"])
+        .status();
+    // Wait until the process has exited (it holds its pid file until then).
+    let alive = || {
+        std::process::Command::new("pgrep")
+            .args(["-x", "dockerd"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    for _ in 0..300 {
+        if !alive() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!alive(), "dockerd läuft noch");
+    let log = std::env::temp_dir().join("code-pruefer-dockerd-restart.log");
+    std::process::Command::new("sh")
+        .args([
+            "-c",
+            &format!("setsid dockerd > {} 2>&1 < /dev/null &", log.display()),
+        ])
+        .status()
+        .expect("dockerd starten");
+}
+
+/// Model that restarts dockerd while it "writes" the second solution.
+struct RestartingLlm {
+    inner: ScriptedLlm,
+    solution_calls: std::sync::Mutex<usize>,
+}
+
+impl Llm for RestartingLlm {
+    async fn chat(&self, req: &ChatRequest) -> Result<llama::ChatResponse, AiError> {
+        let solution = !req.messages[0]
+            .content
+            .contains("analyse programming exercises")
+            && !req.messages[0].content.contains("write test inputs");
+        if solution {
+            let n = {
+                let mut c = self.solution_calls.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            if n == 2 {
+                eprintln!("-- dockerd wird neu gestartet --");
+                tokio::task::spawn_blocking(restart_dockerd).await.unwrap();
+            }
+        }
+        self.inner.chat(req).await
+    }
+}
+
+/// The engine fails in the middle of a test generation (dockerd is stopped,
+/// its containers die, and it comes back a few seconds later): the run must
+/// reconnect and finish with the same result. Needs root and a dockerd that
+/// may be restarted (Linux CI or dev container), so it is opt-in:
+/// `CODE_PRUEFER_TEST_DOCKERD_RESTART=1`.
+#[tokio::test]
+#[ignore = "startet dockerd neu (root); CODE_PRUEFER_TEST_DOCKERD_RESTART=1"]
+async fn pipeline_survives_engine_restart() {
+    if std::env::var("CODE_PRUEFER_TEST_DOCKERD_RESTART").as_deref() != Ok("1") {
+        eprintln!("übersprungen: CODE_PRUEFER_TEST_DOCKERD_RESTART=1 setzen");
+        return;
+    }
+    setup_images();
+    assert!(dockerd_running());
+    let before = sandbox_containers();
+    let cancel = CancellationToken::new();
+    let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let m = messages.clone();
+    let exec = SandboxExecutor::connect(cancel.clone(), move |msg| {
+        eprintln!("  [Engine] {msg}");
+        m.lock().unwrap().push(msg);
+    })
+    .await
+    .expect("Engine");
+    let llm = RestartingLlm {
+        inner: ScriptedLlm {
+            calls: Default::default(),
+            solutions: vec![
+                "```python\na, b = map(int, input().split())\nprint(a + b)\n```",
+                "```python\nimport sys\nprint(sum(map(int, sys.stdin.read().split())))\n```",
+                "```python\na, b = map(int, input().split())\nprint(b + a)\n```",
+            ],
+            structure: r#"{"inputFormat":"a b","outputFormat":"a+b","examples":[{"input":"3 4","output":"7"}],"compareMode":"tokens"}"#,
+            inputs: r#"{"inputs":["0 0","-5 12"]}"#,
+        },
+        solution_calls: Default::default(),
+    };
+    let req = GenerateRequest {
+        task_text: "Lies a und b und gib a + b aus.\n\nBeispiel\nEingabe:\n3 4\nAusgabe:\n7\n"
+            .into(),
+        language: "python".into(),
+        compare_mode: None,
+    };
+    let started = Instant::now();
+    let r = pipeline::generate(
+        &llm,
+        &exec,
+        &req,
+        Settings {
+            solutions: 3,
+            repair_rounds: 1,
+        },
+        &cancel,
+        |p| eprintln!("  [{:?}] {}", p.phase, p.message),
+    )
+    .await
+    .expect("Pipeline übersteht den Neustart der Engine");
+    eprintln!(
+        "Nach Neustart: {:?}, {:.1} s, {} Wiederherstellung(en)\n{:?}",
+        r.confidence.level,
+        started.elapsed().as_secs_f64(),
+        exec.recoveries(),
+        r.tests
+    );
+    assert!(dockerd_running());
+    assert!(exec.recoveries() >= 1, "kein Engine-Fehler beobachtet");
+    assert_eq!(r.stats.solutions_passed, 3);
+    assert_eq!(r.confidence.level, ConfidenceLevel::Green);
+    let expected: Vec<&str> = r.tests.iter().map(|t| t.expected.as_str()).collect();
+    assert_eq!(expected, vec!["7\n", "0\n", "7\n"]);
+    // Containers that died with the old dockerd are cleaned up as orphans.
+    let docker = code_pruefer_lib::runner::docker::connect().await.unwrap();
+    code_pruefer_lib::runner::docker::remove_orphans(&docker, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    let after = sandbox_containers();
+    assert!(after.iter().all(|c| before.contains(c)), "{after:?}");
 }

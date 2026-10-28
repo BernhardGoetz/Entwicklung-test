@@ -110,18 +110,119 @@ pub fn candidate_hosts() -> Vec<String> {
     engine::prefer(hosts, engine::current().engine)
 }
 
-/// Connects to the first engine that answers a ping.
-pub async fn connect() -> Result<Docker, RunnerError> {
-    engine::ensure_podman_pipe().await;
-    for host in candidate_hosts() {
-        let Ok(docker) = Docker::connect_with_host(&host) else {
-            continue;
-        };
-        if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(3), docker.ping()).await {
-            return Ok(docker);
+/// How often and how patiently [`connect`] pings the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Rounds over all candidate hosts.
+    pub attempts: u32,
+    /// Timeout of one ping. Docker Desktop under memory pressure or waking
+    /// up from "Resource Saver" can take several seconds to answer.
+    pub ping_timeout: Duration,
+    /// Pause after the first failed round; doubled after each further one.
+    pub backoff: Duration,
+}
+
+/// Runs and test generation: 3 rounds, 10 s per ping, 1 s and 2 s pause.
+pub const CONNECT_POLICY: RetryPolicy = RetryPolicy {
+    attempts: 3,
+    ping_timeout: Duration::from_secs(10),
+    backoff: Duration::from_secs(1),
+};
+
+/// Status checks and polling while the engine starts: one round.
+pub const QUICK_POLICY: RetryPolicy = RetryPolicy {
+    attempts: 1,
+    ping_timeout: Duration::from_secs(10),
+    backoff: Duration::ZERO,
+};
+
+/// Why a single connection attempt failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptError {
+    /// The endpoint exists but did not answer within the ping timeout.
+    Timeout(Duration),
+    /// No connection (endpoint missing, refused, error answer).
+    Unreachable(String),
+}
+
+/// German reason for [`RunnerError::NoEngine`]. A timeout wins over other
+/// failures: it shows that an engine exists but is too slow. Pure,
+/// unit-tested.
+pub fn failure_reason(errors: &[(String, AttemptError)]) -> String {
+    if let Some((host, AttemptError::Timeout(t))) = errors
+        .iter()
+        .find(|(_, e)| matches!(e, AttemptError::Timeout(_)))
+    {
+        return format!(
+            "Zeitüberschreitung: {host} hat nicht innerhalb von {} s geantwortet",
+            t.as_secs()
+        );
+    }
+    match errors.last() {
+        Some((host, AttemptError::Unreachable(e))) => {
+            format!("keine Verbindung zu {host}: {e}")
+        }
+        _ => "kein Endpunkt gefunden".to_string(),
+    }
+}
+
+/// Tries every host per round and pauses with exponential backoff between
+/// rounds; returns the first success or the German reason of the failure.
+/// Generic over the attempt, so the retry logic is unit-tested.
+pub async fn connect_with<T, F, Fut>(
+    hosts: &[String],
+    policy: RetryPolicy,
+    mut attempt: F,
+) -> Result<T, String>
+where
+    F: FnMut(String, Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T, AttemptError>>,
+{
+    let mut errors: Vec<(String, AttemptError)> = Vec::new();
+    let mut pause = policy.backoff;
+    for round in 0..policy.attempts.max(1) {
+        if round > 0 {
+            tokio::time::sleep(pause).await;
+            pause = pause.saturating_mul(2);
+        }
+        for host in hosts {
+            match attempt(host.clone(), policy.ping_timeout).await {
+                Ok(v) => return Ok(v),
+                Err(e) => errors.push((host.clone(), e)),
+            }
         }
     }
-    Err(RunnerError::NoEngine)
+    Err(failure_reason(&errors))
+}
+
+/// One connection attempt: client for `host` plus a ping within `timeout`.
+async fn try_host(host: String, timeout: Duration) -> Result<Docker, AttemptError> {
+    let docker =
+        Docker::connect_with_host(&host).map_err(|e| AttemptError::Unreachable(e.to_string()))?;
+    match tokio::time::timeout(timeout, docker.ping()).await {
+        Ok(Ok(_)) => Ok(docker),
+        Ok(Err(e)) => Err(AttemptError::Unreachable(e.to_string())),
+        Err(_) => Err(AttemptError::Timeout(timeout)),
+    }
+}
+
+/// Connects to the first engine that answers a ping, with retries
+/// ([`CONNECT_POLICY`]).
+pub async fn connect() -> Result<Docker, RunnerError> {
+    connect_policy(CONNECT_POLICY).await
+}
+
+/// Like [`connect`], one round only ([`QUICK_POLICY`]): status checks.
+pub async fn connect_quick() -> Result<Docker, RunnerError> {
+    connect_policy(QUICK_POLICY).await
+}
+
+pub async fn connect_policy(policy: RetryPolicy) -> Result<Docker, RunnerError> {
+    engine::ensure_podman_pipe().await;
+    let hosts = candidate_hosts();
+    connect_with(&hosts, policy, try_host)
+        .await
+        .map_err(RunnerError::NoEngine)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -523,7 +624,10 @@ impl Sandbox {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        let name = format!("code-pruefer-{}-{nanos}", std::process::id());
+        // The counter keeps names unique when sessions start concurrently.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = format!("code-pruefer-{}-{nanos}-{seq}", std::process::id());
         // Registered before creation, so a concurrent orphan cleanup never
         // takes it for a left-over.
         active().insert(name.clone());
@@ -835,6 +939,91 @@ mod tests {
             None
         );
         assert_eq!(insecure_host_warning(None), None);
+    }
+
+    fn hosts(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    const FAST: RetryPolicy = RetryPolicy {
+        attempts: 3,
+        ping_timeout: Duration::from_millis(50),
+        backoff: Duration::from_millis(10),
+    };
+
+    #[tokio::test]
+    async fn connect_retries_with_backoff_until_engine_answers() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let started = Instant::now();
+        // The engine answers from the third round on (e.g. after a restart).
+        let r = connect_with(&hosts(&["a", "b"]), FAST, |host, timeout| {
+            let mut c = calls.lock().unwrap();
+            c.push(host.clone());
+            let round = (c.len() - 1) / 2;
+            async move {
+                assert_eq!(timeout, Duration::from_millis(50));
+                if round >= 2 && host == "b" {
+                    Ok(host)
+                } else {
+                    Err(AttemptError::Unreachable("refused".into()))
+                }
+            }
+        })
+        .await;
+        assert_eq!(r.unwrap(), "b");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            hosts(&["a", "b", "a", "b", "a", "b"])
+        );
+        // Pauses of 10 ms and 20 ms between the rounds.
+        assert!(started.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[tokio::test]
+    async fn connect_gives_up_with_reason() {
+        let mut n = 0;
+        let r: Result<(), String> =
+            connect_with(&hosts(&["npipe:////./pipe/docker_engine"]), FAST, |_, t| {
+                n += 1;
+                async move { Err(AttemptError::Timeout(t)) }
+            })
+            .await;
+        assert_eq!(n, 3);
+        let msg = r.unwrap_err();
+        assert!(msg.starts_with("Zeitüberschreitung"), "{msg}");
+        assert!(msg.contains("docker_engine"), "{msg}");
+        // Only one round for status checks.
+        let mut n = 0;
+        let r: Result<(), String> = connect_with(&hosts(&["x"]), QUICK_POLICY, |_, _| {
+            n += 1;
+            async { Err(AttemptError::Unreachable("Verbindung abgelehnt".into())) }
+        })
+        .await;
+        assert_eq!(n, 1);
+        assert_eq!(
+            r.unwrap_err(),
+            "keine Verbindung zu x: Verbindung abgelehnt"
+        );
+        let r: Result<(), String> =
+            connect_with(&[], FAST, |_, _| async { Ok::<(), AttemptError>(()) }).await;
+        assert_eq!(r.unwrap_err(), "kein Endpunkt gefunden");
+    }
+
+    #[test]
+    fn timeout_wins_in_reason_and_error_text() {
+        let reason = failure_reason(&[
+            ("a".into(), AttemptError::Timeout(Duration::from_secs(10))),
+            ("b".into(), AttemptError::Unreachable("x".into())),
+        ]);
+        assert!(reason.contains("10 s"), "{reason}");
+        let msg = RunnerError::NoEngine(reason).to_string();
+        assert!(msg.starts_with("Keine laufende Container-Engine gefunden (Zeitüberschreitung"));
+        assert!(
+            msg.ends_with("Bitte Docker Desktop oder Podman starten."),
+            "{msg}"
+        );
+        assert_eq!(CONNECT_POLICY.ping_timeout, Duration::from_secs(10));
+        const { assert!(CONNECT_POLICY.attempts >= 2) };
     }
 
     #[test]
