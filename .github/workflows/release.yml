@@ -2,8 +2,12 @@ name: Release
 
 # Baut zu einem Versions-Tag (v<version>, z. B. v0.2.0):
 #  1. die Runner-Images multi-arch (amd64/arm64) und pusht sie nach
-#     ghcr.io/<owner>/code-pruefer-<sprache>:<version> (Online-Update-Pfad),
+#     ghcr.io/<owner>/code-pruefer-<sprache>:<version> (Online-Update-Pfad);
+#     manuelle Läufe (workflow_dispatch) pushen nur :sha-<commit>, damit
+#     Versions-Tags ausschließlich aus Versions-Tags entstehen,
 #  2. je Architektur gzip-Archive der Images (Offline, im Installer enthalten),
+#     per Digest aus der Registry geholt, dazu image-digests.json mit den
+#     Prüfsummen, gegen die die App Archive und Downloads prüft,
 #  3. den Windows-Installer (NSIS, x64) und macOS-DMGs (Apple Silicon + Intel)
 #     mit eingebetteten Images (src-tauri/tauri.release.conf.json),
 #  4. ein Entwurfs-Release (draft) mit allen Installern.
@@ -82,7 +86,8 @@ jobs:
       matrix:
         language: [python, java]
     env:
-      IMAGE: ${{ needs.version.outputs.registry }}/code-pruefer-${{ matrix.language }}:${{ needs.version.outputs.version }}
+      REPO: ${{ needs.version.outputs.registry }}/code-pruefer-${{ matrix.language }}
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -98,25 +103,38 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build und Push (linux/amd64, linux/arm64)
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: images/${{ matrix.language }}
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ env.IMAGE }}
+          # :<version> nur bei einem Versions-Tag (leere Zeilen ignoriert die Action).
+          tags: |
+            ${{ env.REPO }}:sha-${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('{0}:{1}', env.REPO, env.VERSION) || '' }}
           # Bewusst ohne Build-Cache (Schutz vor Cache-Poisoning).
           no-cache: true
 
-      # Die Archive werden aus den gerade gepushten Images erzeugt, damit
-      # Offline- und Online-Variante identische Digests haben.
+      # Die Archive werden aus den gerade gepushten Images (per Digest)
+      # erzeugt, damit Offline- und Online-Variante identische Digests haben.
       - name: Image-Archive exportieren (amd64, arm64)
         env:
           MODE: pull
           LANGUAGES: ${{ matrix.language }}
           IMAGE_REGISTRY: ${{ needs.version.outputs.registry }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           scripts/export-image-archives.sh amd64 image-archives
           scripts/export-image-archives.sh arm64 image-archives
+          echo "$REPO@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-${{ matrix.language }}
+          path: image-archives/image-digests.json
+          retention-days: 7
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -157,6 +175,16 @@ jobs:
           pattern: image-*-amd64
           merge-multiple: true
           path: src-tauri/resources/images
+
+      - name: Prüfsummen der Images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digests-*
+          path: digests
+
+      - name: image-digests.json zusammenführen
+        shell: bash
+        run: jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
 
       - run: npm ci
 
@@ -217,6 +245,15 @@ jobs:
           pattern: image-*-${{ matrix.arch }}
           merge-multiple: true
           path: src-tauri/resources/images
+
+      - name: Prüfsummen der Images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digests-*
+          path: digests
+
+      - name: image-digests.json zusammenführen
+        run: jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
 
       - run: npm ci
 

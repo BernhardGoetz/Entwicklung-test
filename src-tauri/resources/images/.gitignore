@@ -1,5 +1,5 @@
-# Image-Archive (code-pruefer-<sprache>-<arch>.tar.gz) werden von
-# scripts/export-image-archives.sh bzw. dem Release-Workflow erzeugt und
-# nicht eingecheckt.
+# Image-Archive (code-pruefer-<sprache>-<arch>.tar.gz) und image-digests.json
+# werden von scripts/export-image-archives.sh bzw. dem Release-Workflow
+# erzeugt und nicht eingecheckt.
 *
 !.gitignore

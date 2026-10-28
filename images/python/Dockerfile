@@ -1,7 +1,10 @@
 # Runner-Image für Python-Abgaben des Code-Prüfers.
 # Der Container wird von der App mit Netzwerk aus, read-only Root-FS und
 # tmpfs unter /work und /tmp gestartet.
-FROM python:3.12.15-slim-bookworm
+# Basis-Image per Digest (Manifest-Liste, multi-arch) gepinnt; der Tag dient
+# nur der Lesbarkeit. Aktualisierung: Dependabot (docker) bzw.
+# `docker buildx imagetools inspect python:<tag>`.
+FROM python:3.12.15-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \

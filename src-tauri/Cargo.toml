@@ -25,6 +25,7 @@ thiserror = "2"
 base64 = "0.22"
 bytes = "1"
 flate2 = "1"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

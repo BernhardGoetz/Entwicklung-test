@@ -106,15 +106,73 @@ pub struct PullProgress {
     pub percent: Option<u8>,
 }
 
-/// Whether `image` is available in the local image store.
-pub async fn image_exists(docker: &Docker, image: &str) -> Result<bool, RunnerError> {
+/// ID and registry digests of an image in the store. The ID is the config
+/// digest (classic Docker store, Podman) or the manifest digest (Docker
+/// with the containerd image store).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageIdentity {
+    pub id: String,
+    /// `<repo>@sha256:…` references the image was pulled by.
+    pub repo_digests: Vec<String>,
+}
+
+/// Identity of `image`, `None` if it is not in the local image store.
+pub async fn inspect_identity(
+    docker: &Docker,
+    image: &str,
+) -> Result<Option<ImageIdentity>, RunnerError> {
     match docker.inspect_image(image).await {
-        Ok(_) => Ok(true),
+        Ok(info) => Ok(Some(ImageIdentity {
+            id: info.id.unwrap_or_default(),
+            repo_digests: info.repo_digests.unwrap_or_default(),
+        })),
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
-        }) => Ok(false),
+        }) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Whether `image` is available in the local image store.
+pub async fn image_exists(docker: &Docker, image: &str) -> Result<bool, RunnerError> {
+    Ok(inspect_identity(docker, image).await?.is_some())
+}
+
+/// Removes the reference `image` (the image itself goes once no other
+/// reference is left); errors are ignored (best effort).
+pub async fn remove_image(docker: &Docker, image: &str) {
+    let _ = docker
+        .remove_image(
+            image,
+            None::<bollard::query_parameters::RemoveImageOptions>,
+            None,
+        )
+        .await;
+}
+
+/// SHA-256 of a file as lowercase hex (read on a blocking thread).
+pub async fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::io::BufReader::new(std::fs::File::open(path)?);
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Pulls `image` from its registry, reporting progress.
@@ -563,6 +621,17 @@ mod tests {
         );
         assert_eq!(parse_loaded("Loaded image: a:1, b:2"), vec!["a:1", "b:2"]);
         assert!(parse_loaded("Loading layer 12 MB").is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_hash_is_sha256_hex() {
+        let path = std::env::temp_dir().join(format!("code-pruefer-hash-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            sha256_file(&path).await.unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
