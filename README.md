@@ -210,6 +210,21 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
 4. Optional: Settings → Actions → General → „Workflow permissions“ auf „Read repository
    contents and packages permissions“ stellen (die Workflows fordern ihre Rechte selbst an).
 
+## Aufgabenblatt hochladen
+
+„Aufgabe hochladen …“ übernimmt den Text eines Aufgabenblatts in das Feld
+„Aufgabenstellung“: Word (`.docx`), PDF oder ein Bild (`.png`, `.jpg`). Höchstens 20 MB
+und 20 Seiten. Alles läuft lokal:
+
+- **DOCX:** Absätze, Tabulatoren und Zeilenumbrüche werden übernommen; eingebettete
+  Bilder nicht.
+- **PDF:** Zuerst wird die Textebene gelesen. Seiten mit weniger als 50 Zeichen gelten
+  als Scan und werden per Texterkennung gelesen.
+- **Bilder und Scans:** systemeigene Texterkennung – unter Windows `Windows.Media.Ocr`
+  (dafür muss eine Sprache mit Texterkennung installiert sein: Einstellungen → Zeit und
+  Sprache → Sprache), unter macOS Apple Vision. Die Einrückung (wichtig für Python) wird
+  aus der Lage der Wörter rekonstruiert. Unter Linux gibt es keine Texterkennung.
+
 ## Ausgabevergleich
 
 Zeilenenden (CRLF/LF) werden immer vereinheitlicht. Standardmäßig werden außerdem
@@ -307,7 +322,13 @@ src/                     React-Frontend (Monaco-Editor, Testfälle, Ergebnisse)
 src-tauri/src/
   lib.rs                 Tauri-Commands: docker_status, get_engine, set_engine,
                          start_engine, list_languages, run_tests,
-                         prepare_images, update_images
+                         prepare_images, update_images, import_task_document
+  docs/mod.rs            Import von Aufgabenblättern (Bild, PDF, DOCX), Limits
+  docs/docx.rs           Text aus word/document.xml
+  docs/pdf.rs            Textebene pro Seite, Erkennung gescannter Seiten
+  docs/layout.rs         Zeilen und Einrückung aus OCR-Wortboxen rekonstruieren
+  docs/ocr/              Systemeigene Texterkennung: win.rs (Windows.Media.Ocr,
+                         Windows.Data.Pdf), mac.rs (Vision, PDFKit)
   docker_detect.rs       Erkennung: nicht installiert / nicht gestartet / ok
   engine.rs              Engine-Auswahl (Datei/Registry), Start, Podman-Pipe
   runner/mod.rs          Ablauf einer Prüfung, Bewertung der Testfälle

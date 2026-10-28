@@ -1,6 +1,7 @@
 //! Code-Prüfer: Tauri backend.
 
 pub mod docker_detect;
+pub mod docs;
 pub mod engine;
 pub mod runner;
 
@@ -14,6 +15,8 @@ pub const PROGRESS_EVENT: &str = "run-progress";
 pub const ENGINE_EVENT: &str = "engine-progress";
 /// Event name for progress while images are prepared or updated.
 pub const IMAGES_EVENT: &str = "images-progress";
+/// Event name for progress while a task document is imported.
+pub const DOCS_EVENT: &str = "docs-progress";
 
 #[tauri::command]
 async fn docker_status() -> docker_detect::DockerStatus {
@@ -77,10 +80,28 @@ async fn update_images(app: AppHandle) -> Result<images::ImagesReport, RunnerErr
     .await)
 }
 
+/// Imports a task sheet (image, PDF, DOCX) chosen in the file dialog and
+/// returns its text for review. Parsing and OCR block, so they run on a
+/// blocking thread.
+#[tauri::command]
+async fn import_task_document(
+    app: AppHandle,
+    path: String,
+) -> Result<docs::ImportResult, docs::DocsError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        docs::import_file(std::path::Path::new(&path), |p| {
+            let _ = app.emit(DOCS_EVENT, p);
+        })
+    })
+    .await
+    .map_err(|e| docs::DocsError::Invalid(format!("Interner Fehler beim Import: {e}")))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if let Ok(dir) = app.path().app_config_dir() {
                 engine::init(dir);
@@ -101,7 +122,8 @@ pub fn run() {
             list_languages,
             run_tests,
             prepare_images,
-            update_images
+            update_images,
+            import_task_document
         ])
         .build(tauri::generate_context!())
         .expect("Fehler beim Starten der Anwendung")
