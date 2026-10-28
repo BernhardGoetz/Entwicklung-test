@@ -233,7 +233,23 @@ und 20 Seiten. Alles läuft lokal:
   Screenshots wird so deutlich besser erkannt.
 
 Erkannter Text kann Fehler enthalten. Daneben steht eine Vorschau des Originals (bei
-Bildern; bei PDFs die erste Seite, soweit das System sie darstellen kann). Das Häkchen
+Bildern; bei PDFs die erste Seite, soweit das System sie darstellen kann).
+
+**Erkennungsfehler mit KI korrigieren** (nur nach einer Texterkennung, mit eingerichtetem
+KI-Modell; `src-tauri/src/ai/ocr_fix.rs`): Das lokale Modell bekommt die strikte Anweisung,
+nur Zeichenfehler zu korrigieren (1/l, 0/O, fehlende Anführungszeichen oder Klammern) und
+nichts umzuformulieren. Es liefert eine JSON-Liste von Änderungen (Zeile, alt, neu), keinen
+neuen Text. Ein **Plausibilitätsfilter** lässt nur kleine, örtliche Änderungen durch: `alt`
+muss genau einmal in der Zeile stehen (eine Zeile daneben wird toleriert), jede Änderung
+betrifft höchstens ein Wort auf jeder Seite (keine neuen oder entfernten Wörter, keine
+Zeilenumbrüche), die Bearbeitungsdistanz ist höchstens max(2, 40 % der Wortlänge) – typische
+Verwechslungen wie 1/l oder 0/O zählen halb –, und mehr als drei Änderungen in einem
+Vorschlag gelten als Umformulierung. Ganze Zeilen werden nie als Ganzes ersetzt; höchstens
+30 Vorschläge. Die Vorschläge erscheinen farbig (alt → neu) und werden einzeln oder mit
+„Alle übernehmen“ übernommen; „Ursprünglichen Text wiederherstellen“ setzt auf das Ergebnis
+der Texterkennung zurück. Jede Übernahme setzt das Häkchen „Text geprüft und korrigiert“
+zurück. Zeilennummern oder Texte der Bedienoberfläche aus Screenshots werden nicht
+entfernt. Das Häkchen
 „Text geprüft und korrigiert“ wird bei jedem Import zurückgesetzt; es ist Voraussetzung für
 „Testfälle mit KI erzeugen“ (siehe „KI und Texterkennung“).
 
@@ -440,11 +456,13 @@ src-tauri/src/
                          start_engine, list_languages, run_tests,
                          prepare_images, update_images, import_task_document,
                          ai_status, download_model, import_model, delete_model,
-                         select_model, generate_tests, cancel_ai
+                         select_model, generate_tests, suggest_ocr_fixes,
+                         cancel_ai
   ai/llama.rs            llama-server als Sidecar (Start, /health, Client, Abbruch)
   ai/models.rs           Modellkatalog (catalog.json), Hardware, Download, Import
   ai/pipeline.rs         Testfälle erzeugen: Lösungen, Beispiele, Mehrheit, Konfidenz
   ai/prompts.rs          Prompts, JSON-Schemas, Code aus Antworten extrahieren
+  ai/ocr_fix.rs          KI-Korrektur von OCR-Text: Prompt, Plausibilitätsfilter
   docs/mod.rs            Import von Aufgabenblättern (Bild, PDF, DOCX), Limits
   docs/docx.rs           Text aus word/document.xml
   docs/pdf.rs            Textebene pro Seite, Erkennung gescannter Seiten

@@ -69,6 +69,8 @@ export default function App() {
   const [ai, setAi] = useState<AiStatus | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [generating, setGenerating] = useState(false);
+  // "Erkennungsfehler mit KI korrigieren" is running (same model).
+  const [fixing, setFixing] = useState(false);
   const [aiNote, setAiNote] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
@@ -216,6 +218,7 @@ export default function App() {
     if (!ai.runtimeAvailable) return ai.runtimeError ?? "KI-Laufzeit nicht gefunden.";
     if (!ai.modelReady) return "Zuerst ein KI-Modell einrichten („KI-Modell einrichten …“).";
     if (running) return "Bitte warten, bis die Prüfung fertig ist.";
+    if (fixing) return "Bitte warten, bis die KI-Korrektur fertig ist.";
     if (compareMode === null) return "Bitte eine gültige Toleranz beim Vergleich eingeben.";
     return null;
   })();
@@ -298,6 +301,10 @@ export default function App() {
             onConfirmedChange={setTaskConfirmed}
             imported={imported}
             onImported={onImported}
+            ai={ai}
+            aiBusy={generating}
+            onOpenSetup={() => setSetupOpen(true)}
+            onFixingChange={setFixing}
           />
           <div className="toolbar">
             <LanguageSelect

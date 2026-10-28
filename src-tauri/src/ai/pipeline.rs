@@ -154,6 +154,8 @@ pub enum Phase {
     Solutions,
     Inputs,
     Majority,
+    /// OCR correction (`ocr_fix`).
+    Correction,
 }
 
 #[derive(Debug, Clone, Serialize)]

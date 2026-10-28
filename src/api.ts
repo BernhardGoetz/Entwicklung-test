@@ -277,7 +277,7 @@ export interface GenerateRequest {
 }
 
 export interface AiProgress {
-  phase: "model" | "structure" | "solutions" | "inputs" | "majority";
+  phase: "model" | "structure" | "solutions" | "inputs" | "majority" | "correction";
   message: string;
   current: number | null;
   total: number | null;
@@ -293,7 +293,42 @@ export const deleteModel = (id: string) => invoke<AiStatus>("delete_model", { id
 export const selectModel = (id: string) => invoke<AiStatus>("select_model", { id });
 export const generateTests = (request: GenerateRequest) =>
   invoke<GenerateResult>("generate_tests", { request });
-/** Cancels test generation and model downloads/imports. */
+/** A suggested OCR correction (OcrFix in src-tauri/src/ai/ocr_fix.rs). */
+export interface OcrFix {
+  /** 1-based line number. */
+  line: number;
+  /** Range of `old` in the line (JavaScript string indices). */
+  start: number;
+  end: number;
+  old: string;
+  new: string;
+  reason: string | null;
+}
+
+export interface OcrFixResult {
+  fixes: OcrFix[];
+  /** Suggestions the plausibility filter rejected. */
+  rejected: number;
+}
+
+/** "Erkennungsfehler mit KI korrigieren": suggestions only, nothing is applied. */
+export const suggestOcrFixes = (text: string) => invoke<OcrFixResult>("suggest_ocr_fixes", { text });
+export const onOcrFixProgress = (cb: (p: AiProgress) => void): Promise<UnlistenFn> =>
+  listen<AiProgress>("ocr-fix-progress", (e) => cb(e.payload));
+
+/** Applies fixes to the text they were suggested for (later ones first, so offsets stay valid). */
+export function applyOcrFixes(text: string, fixes: OcrFix[]): string {
+  const lines = text.split("\n");
+  const sorted = [...fixes].sort((a, b) => b.line - a.line || b.start - a.start);
+  for (const f of sorted) {
+    const line = lines[f.line - 1];
+    if (line === undefined || f.end > line.length || line.slice(f.start, f.end) !== f.old) continue;
+    lines[f.line - 1] = line.slice(0, f.start) + f.new + line.slice(f.end);
+  }
+  return lines.join("\n");
+}
+
+/** Cancels test generation, OCR correction and model downloads/imports. */
 export const cancelAi = () => invoke<void>("cancel_ai");
 export const onAiProgress = (cb: (p: AiProgress) => void): Promise<UnlistenFn> =>
   listen<AiProgress>("ai-progress", (e) => cb(e.payload));

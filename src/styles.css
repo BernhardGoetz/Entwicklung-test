@@ -69,6 +69,16 @@ textarea.task { font-family: ui-monospace, Menlo, Consolas, monospace; }
 .import-info { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; color: var(--muted); }
 .warn-text { color: var(--warn); }
 .confirm { margin-top: 6px; font-weight: 600; }
+.ocr-fix { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.ocr-fix .ai-progress { margin-top: 0; }
+.ocr-fix details pre { max-height: 200px; overflow: auto; }
+.fixes { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.fix { display: flex; align-items: center; gap: 4px 8px; flex-wrap: wrap; padding: 2px 0; }
+.fix.discarded .fix-diff { opacity: 0.5; }
+.fix-actions { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.fix-diff { background: var(--code-bg); padding: 1px 4px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
+.fix-old mark { background: var(--fail-bg); color: var(--fail); text-decoration: line-through; }
+.fix-new mark { background: var(--ok-bg); color: var(--ok); }
 .compare-mode { display: flex; align-items: center; gap: 4px 12px; flex-wrap: wrap; }
 input.tolerance { width: 7em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; }
 input.tolerance.invalid { border-color: var(--fail); }

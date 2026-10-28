@@ -20,6 +20,8 @@ pub const IMAGES_EVENT: &str = "images-progress";
 pub const DOCS_EVENT: &str = "docs-progress";
 /// Event name for test generation progress.
 pub const AI_EVENT: &str = "ai-progress";
+/// Event name for OCR correction progress.
+pub const OCR_FIX_EVENT: &str = "ocr-fix-progress";
 /// Event name for model download/import progress.
 pub const MODELS_EVENT: &str = "models-progress";
 
@@ -168,8 +170,22 @@ async fn generate_tests(
     .await
 }
 
-/// "Abbrechen" for AI operations: cancels test generation and model
-/// downloads and stops llama-server (frees its memory immediately).
+/// "Erkennungsfehler mit KI korrigieren": character-level corrections of
+/// OCR text as suggestions (nothing is applied here).
+#[tauri::command]
+async fn suggest_ocr_fixes(
+    app: AppHandle,
+    text: String,
+) -> Result<ai::ocr_fix::OcrFixResult, ai::AiError> {
+    let op = ai::Operation::start();
+    ai::ocr_fix::run(text, &op.token, |p| {
+        let _ = app.emit(OCR_FIX_EVENT, p);
+    })
+    .await
+}
+
+/// "Abbrechen" for AI operations: cancels test generation, OCR correction
+/// and model downloads and stops llama-server (frees its memory immediately).
 #[tauri::command]
 async fn cancel_ai() {
     ai::cancel_all();
@@ -214,6 +230,7 @@ pub fn run() {
             delete_model,
             select_model,
             generate_tests,
+            suggest_ocr_fixes,
             cancel_ai
         ])
         .build(tauri::generate_context!())

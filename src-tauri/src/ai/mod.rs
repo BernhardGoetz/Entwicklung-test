@@ -1,11 +1,13 @@
-//! Local AI: llama.cpp sidecar (`llama`), model management (`models`) and
-//! the test generation pipeline (`pipeline`, `prompts`).
+//! Local AI: llama.cpp sidecar (`llama`), model management (`models`), the
+//! test generation pipeline (`pipeline`, `prompts`) and corrections of
+//! OCR text (`ocr_fix`).
 //!
 //! Everything runs on this machine; the only network access is the model
 //! download from huggingface.co (`models`).
 
 pub mod llama;
 pub mod models;
+pub mod ocr_fix;
 pub mod pipeline;
 pub mod prompts;
 
@@ -40,7 +42,7 @@ impl Serialize for AiError {
 }
 
 /// Cancellation tokens of the AI operations in flight (test generation,
-/// model download); `cancel_ai` cancels all of them.
+/// OCR correction, model download); `cancel_ai` cancels all of them.
 static OPERATIONS: Mutex<Vec<(u64, CancellationToken)>> = Mutex::new(Vec::new());
 static NEXT_OP: AtomicU64 = AtomicU64::new(1);
 

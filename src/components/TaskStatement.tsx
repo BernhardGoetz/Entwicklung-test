@@ -4,8 +4,10 @@ import {
   onDocsProgress,
   pickTaskDocument,
   progressText,
+  type AiStatus,
   type ImportResult,
 } from "../api";
+import { OcrFixPanel } from "./OcrFixPanel";
 
 interface Props {
   value: string;
@@ -16,6 +18,12 @@ interface Props {
   /** Last imported document, for source info and preview. */
   imported: ImportResult | null;
   onImported: (r: ImportResult) => void;
+  /** Local AI status, for "Erkennungsfehler mit KI korrigieren". */
+  ai: AiStatus | null;
+  /** Test generation is running. */
+  aiBusy: boolean;
+  onOpenSetup: () => void;
+  onFixingChange: (running: boolean) => void;
 }
 
 /** Same limits as MAX_FILE_BYTES and MAX_PAGES in src-tauri/src/docs/mod.rs. */
@@ -39,10 +47,15 @@ export function TaskStatement({
   onConfirmedChange,
   imported,
   onImported,
+  ai,
+  aiBusy,
+  onOpenSetup,
+  onFixingChange,
 }: Props) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [previewLarge, setPreviewLarge] = useState(false);
+  const [fixing, setFixing] = useState(false);
 
   const upload = async () => {
     setError(null);
@@ -74,7 +87,7 @@ export function TaskStatement({
         <h2>Aufgabenstellung</h2>
         <button
           onClick={() => void upload()}
-          disabled={busy !== null}
+          disabled={busy !== null || fixing}
           title={`Bild (PNG, JPEG), PDF oder Word-Datei (DOCX), ${LIMITS_TEXT}`}
         >
           Aufgabe hochladen …
@@ -120,6 +133,23 @@ export function TaskStatement({
           spellCheck={false}
         />
       </div>
+      {imported?.ocrUsed && (
+        <OcrFixPanel
+          text={value}
+          original={imported.text}
+          onTextChange={(t) => {
+            onChange(t);
+            onConfirmedChange(false);
+          }}
+          ai={ai}
+          aiBusy={aiBusy}
+          onOpenSetup={onOpenSetup}
+          onRunningChange={(r) => {
+            setFixing(r);
+            onFixingChange(r);
+          }}
+        />
+      )}
       {value.trim() !== "" && (
         <label className="inline small confirm">
           <input
