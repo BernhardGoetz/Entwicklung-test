@@ -174,4 +174,29 @@ mod tests {
         used.sort();
         assert_eq!(allowed, used);
     }
+
+    /// The file dialog may only open files, and its filter matches the
+    /// extensions the backend accepts.
+    #[test]
+    fn dialog_capability_and_extensions_match_frontend() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read_to_string(root.join("capabilities/default.json")).unwrap();
+        let cap: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let dialog: Vec<&str> = cap["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| p.starts_with("dialog:"))
+            .collect();
+        assert_eq!(dialog, vec!["dialog:allow-open"]);
+
+        let api = std::fs::read_to_string(root.join("../src/api.ts")).unwrap();
+        let line = api
+            .lines()
+            .find(|l| l.contains("DOC_EXTENSIONS = ["))
+            .expect("DOC_EXTENSIONS in api.ts");
+        let used: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+        assert_eq!(used, crate::docs::EXTENSIONS);
+    }
 }

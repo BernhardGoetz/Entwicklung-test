@@ -3,7 +3,7 @@
 Desktop-App (Windows und macOS) für Studierende: Programmieraufgaben **lokal** gegen
 eigene Testfälle prüfen.
 
-1. Aufgabenstellung einfügen (dient zur Orientierung).
+1. Aufgabenstellung einfügen oder als Bild, PDF bzw. Word-Datei hochladen.
 2. Code im Editor schreiben oder eine Quelldatei hochladen (`.py` / `.java`).
 3. Sprache wählen (MVP: **Python 3.12** und **Java 21**).
 4. Testfälle anlegen: Eingabe (stdin) und erwartete Ausgabe (stdout).
@@ -225,10 +225,25 @@ und 20 Seiten. Alles läuft lokal:
   Sprache → Sprache), unter macOS Apple Vision. Die Einrückung (wichtig für Python) wird
   aus der Lage der Wörter rekonstruiert. Unter Linux gibt es keine Texterkennung.
 
+Erkannter Text kann Fehler enthalten. Daneben steht eine Vorschau des Originals (bei
+Bildern; bei PDFs die erste Seite, soweit das System sie darstellen kann). Das Häkchen
+„Text geprüft und korrigiert“ wird bei jedem Import zurückgesetzt; es wird für die
+geplante Erzeugung von Testfällen aus dem Aufgabentext benötigt.
+
 ## Ausgabevergleich
 
-Zeilenenden (CRLF/LF) werden immer vereinheitlicht. Standardmäßig werden außerdem
-Leerzeichen am Zeilenende und Leerzeilen am Ende ignoriert (abschaltbar).
+Zeilenenden (CRLF/LF) werden immer vereinheitlicht. Drei Modi („Vergleich:“ über den
+Testfällen):
+
+- **Zeilen (exakt)** – Standard. Zeile für Zeile; Leerzeichen am Zeilenende und
+  Leerzeilen am Ende werden ignoriert (abschaltbar).
+- **Wörter (Leerraum egal)** – die Ausgabe wird an Leerzeichen, Tabulatoren und
+  Zeilenumbrüchen in Wörter zerlegt; nur die Wörter zählen (wie der Standard-Validator von
+  Kattis, aber mit Beachtung der Groß-/Kleinschreibung).
+- **Zahlen mit Toleranz** – wie „Wörter“; ist das erwartete Wort eine Zahl, darf die
+  Ausgabe absolut oder relativ um die Toleranz abweichen (z. B. `1e-6`).
+
+Der Diff in den Ergebnissen ist immer zeilenbasiert.
 
 ## Entwicklung
 
@@ -354,7 +369,7 @@ unter `images/`.
 
 - Nur Python und Java; Java-Code muss eine Klasse `Main` enthalten (Datei `Main.java`).
 - Testfälle werden manuell eingegeben; keine Speicherung von Aufgaben/Testfällen.
-- Vergleich nur über stdout (exakt bzw. mit Whitespace-Toleranz).
+- Vergleich nur über stdout (Zeilen, Wörter oder Zahlen mit Toleranz).
 - Builds sind nicht signiert (Windows SmartScreen / macOS Gatekeeper warnen; Signatur ist
   vorbereitet), kein Auto-Update der App (die Images lassen sich über „Images aktualisieren“ neu laden).
 - Mit eingebetteten Images ist der Installer deutlich größer (Java-Image ≈ 200 MB).

@@ -1,10 +1,12 @@
-import type { TestCase } from "../api";
+import type { CompareMode, TestCase } from "../api";
+import { CompareModeSelect } from "./CompareModeSelect";
 
 interface Props {
   tests: TestCase[];
   onChange: (tests: TestCase[]) => void;
-  trimWhitespace: boolean;
-  onTrimChange: (v: boolean) => void;
+  /** null while the settings are invalid (e.g. tolerance). */
+  compareMode: CompareMode | null;
+  onCompareModeChange: (mode: CompareMode | null) => void;
 }
 
 /** Same limit as MAX_TESTS in src-tauri/src/runner/mod.rs. */
@@ -18,7 +20,7 @@ export const newTestCase = (n: number): TestCase => ({
   expected: "",
 });
 
-export function TestCaseEditor({ tests, onChange, trimWhitespace, onTrimChange }: Props) {
+export function TestCaseEditor({ tests, onChange, compareMode, onCompareModeChange }: Props) {
   const update = (id: number, patch: Partial<TestCase>) =>
     onChange(tests.map((t) => (t.id === id ? { ...t, ...patch } : t)));
 
@@ -26,14 +28,7 @@ export function TestCaseEditor({ tests, onChange, trimWhitespace, onTrimChange }
     <section className="card">
       <div className="card-header">
         <h2>Testfälle</h2>
-        <label className="inline small">
-          <input
-            type="checkbox"
-            checked={trimWhitespace}
-            onChange={(e) => onTrimChange(e.target.checked)}
-          />{" "}
-          Leerzeichen am Zeilenende und Leerzeilen am Ende ignorieren
-        </label>
+        <CompareModeSelect value={compareMode} onChange={onCompareModeChange} />
       </div>
       {tests.length === 0 && <p className="muted">Noch keine Testfälle angelegt.</p>}
       {tests.map((t) => (

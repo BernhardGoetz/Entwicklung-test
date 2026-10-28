@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 export type DockerStatus =
   | { state: "notInstalled" }
@@ -81,11 +82,21 @@ export function progressText(p: Progress | null): string {
   return `Lade Image ${p.image} herunter:${pct} ${p.status}`;
 }
 
+/** Output comparison (CompareMode in src-tauri/src/runner/compare.rs). */
+export type CompareMode =
+  | { kind: "lines"; trim: boolean }
+  | { kind: "tokens"; caseSensitive: boolean }
+  | { kind: "float"; absTol: number; relTol: number };
+
+/** Same limit as MAX_TOLERANCE in src-tauri/src/runner/compare.rs. */
+export const MAX_TOLERANCE = 1e6;
+
 export interface RunRequest {
   language: string;
   code: string;
   tests: { name: string; input: string; expected: string }[];
   trimWhitespace: boolean;
+  compareMode?: CompareMode;
 }
 
 export const dockerStatus = () => invoke<DockerStatus>("docker_status");
@@ -126,3 +137,33 @@ export const prepareImages = () => invoke<ImagesReport>("prepare_images");
 export const updateImages = () => invoke<ImagesReport>("update_images");
 export const onImagesProgress = (cb: (p: Progress) => void): Promise<UnlistenFn> =>
   listen<Progress>("images-progress", (e) => cb(e.payload));
+
+/** Result of importing a task sheet (ImportResult in src-tauri/src/docs/mod.rs). */
+export interface ImportResult {
+  fileName: string;
+  text: string;
+  source: "docx" | "pdf" | "image";
+  /** Pages (PDF), 1 for images, null for Word documents. */
+  pages: number | null;
+  /** Text (partly) from OCR: check with extra care. */
+  ocrUsed: boolean;
+  warnings: string[];
+  /** Preview of the original as data URL (image or first PDF page). */
+  preview: string | null;
+}
+
+/** Same list as EXTENSIONS in src-tauri/src/docs/mod.rs. */
+export const DOC_EXTENSIONS = ["png", "jpg", "jpeg", "pdf", "docx"];
+
+/** Opens the file dialog; resolves with the chosen path or null. */
+export const pickTaskDocument = () =>
+  open({
+    title: "Aufgabenblatt öffnen",
+    multiple: false,
+    directory: false,
+    filters: [{ name: "Aufgabenblatt (Bild, PDF, Word)", extensions: DOC_EXTENSIONS }],
+  });
+export const importTaskDocument = (path: string) =>
+  invoke<ImportResult>("import_task_document", { path });
+export const onDocsProgress = (cb: (p: Progress) => void): Promise<UnlistenFn> =>
+  listen<Progress>("docs-progress", (e) => cb(e.payload));

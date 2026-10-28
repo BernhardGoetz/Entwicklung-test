@@ -15,8 +15,10 @@ import {
   updateImages,
   type DockerStatus,
   type Engine,
+  type CompareMode,
   type EngineChoice,
   type ImagesReport,
+  type ImportResult,
   type LanguageInfo,
   type Progress,
   type RunReport,
@@ -48,10 +50,14 @@ export default function App() {
   const [languageId, setLanguageId] = useState("python");
   const [codeByLang, setCodeByLang] = useState<Record<string, string>>({});
   const [task, setTask] = useState("");
+  // "Text geprüft und korrigiert": reset by an import, kept on manual edits.
+  // Needed later before test cases are generated from the task text.
+  const [taskConfirmed, setTaskConfirmed] = useState(false);
+  const [imported, setImported] = useState<ImportResult | null>(null);
   const [tests, setTests] = useState<TestCase[]>([
     { ...newTestCase(1), input: "Welt\n", expected: "Hallo, Welt!\n" },
   ]);
-  const [trimWhitespace, setTrimWhitespace] = useState(true);
+  const [compareMode, setCompareMode] = useState<CompareMode | null>({ kind: "lines", trim: true });
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [report, setReport] = useState<RunReport | null>(null);
@@ -175,9 +181,17 @@ export default function App() {
     imagesBusy === null &&
     !running &&
     tests.length > 0 &&
+    compareMode !== null &&
     code.trim() !== "";
 
+  const onImported = (r: ImportResult) => {
+    setImported(r);
+    setTask(r.text);
+    setTaskConfirmed(false);
+  };
+
   const onRun = async () => {
+    if (compareMode === null) return;
     setRunning(true);
     setError(null);
     setReport(null);
@@ -187,7 +201,9 @@ export default function App() {
         language: languageId,
         code,
         tests: tests.map(({ name, input, expected }) => ({ name, input, expected })),
-        trimWhitespace,
+        // Old field kept for the default (lines) comparison.
+        trimWhitespace: compareMode.kind === "lines" ? compareMode.trim : true,
+        compareMode,
       });
       setReport(r);
     } catch (e) {
@@ -218,7 +234,14 @@ export default function App() {
       />
       <main>
         <div className="col">
-          <TaskStatement value={task} onChange={setTask} />
+          <TaskStatement
+            value={task}
+            onChange={setTask}
+            confirmed={taskConfirmed}
+            onConfirmedChange={setTaskConfirmed}
+            imported={imported}
+            onImported={onImported}
+          />
           <div className="toolbar">
             <LanguageSelect
               languages={languages}
@@ -237,8 +260,8 @@ export default function App() {
           <TestCaseEditor
             tests={tests}
             onChange={setTests}
-            trimWhitespace={trimWhitespace}
-            onTrimChange={setTrimWhitespace}
+            compareMode={compareMode}
+            onCompareModeChange={setCompareMode}
           />
           <div className="toolbar">
             <button className="primary" onClick={onRun} disabled={!canRun}>
