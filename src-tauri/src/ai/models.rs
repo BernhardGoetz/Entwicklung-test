@@ -663,6 +663,7 @@ async fn download_file(
             req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
         }
         let resp = tokio::select! {
+            biased;
             _ = cancel.cancelled() => return Err(AiError::Cancelled),
             r = req.send() => r.map_err(|e| AiError::Http(format!("Download fehlgeschlagen: {e}")))?,
         };
@@ -698,6 +699,7 @@ async fn download_file(
         let mut last = Instant::now();
         loop {
             let chunk = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {
                     let _ = file.flush().await;
                     return Err(AiError::Cancelled);

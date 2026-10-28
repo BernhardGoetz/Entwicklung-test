@@ -18,6 +18,8 @@ pub const ENGINE_EVENT: &str = "engine-progress";
 pub const IMAGES_EVENT: &str = "images-progress";
 /// Event name for progress while a task document is imported.
 pub const DOCS_EVENT: &str = "docs-progress";
+/// Event name for test generation progress.
+pub const AI_EVENT: &str = "ai-progress";
 /// Event name for model download/import progress.
 pub const MODELS_EVENT: &str = "models-progress";
 
@@ -152,6 +154,20 @@ async fn select_model(id: String) -> Result<ai::models::AiStatus, ai::AiError> {
         .map_err(|e| ai::AiError::Other(e.to_string()))?
 }
 
+/// Generates test cases for the (confirmed) task text with the local
+/// model; expected outputs come from executing verified solutions.
+#[tauri::command]
+async fn generate_tests(
+    app: AppHandle,
+    request: ai::pipeline::GenerateRequest,
+) -> Result<ai::pipeline::GenerateResult, ai::AiError> {
+    let op = ai::Operation::start();
+    ai::pipeline::run(request, &op.token, |p| {
+        let _ = app.emit(AI_EVENT, p);
+    })
+    .await
+}
+
 /// "Abbrechen" for AI operations: cancels test generation and model
 /// downloads and stops llama-server (frees its memory immediately).
 #[tauri::command]
@@ -197,6 +213,7 @@ pub fn run() {
             import_model,
             delete_model,
             select_model,
+            generate_tests,
             cancel_ai
         ])
         .build(tauri::generate_context!())

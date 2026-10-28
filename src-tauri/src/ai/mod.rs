@@ -6,6 +6,8 @@
 
 pub mod llama;
 pub mod models;
+pub mod pipeline;
+pub mod prompts;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

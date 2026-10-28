@@ -402,22 +402,29 @@ pub trait Llm {
         -> impl Future<Output = Result<ChatResponse, AiError>> + Send;
 }
 
-/// Body for llama-server's OpenAI-compatible `/v1/chat/completions`.
-/// `response_format` with `json_schema` makes the server constrain the
-/// sampling with a grammar derived from the schema.
-pub fn request_body(req: &ChatRequest) -> Value {
+// The client uses llama-server's native endpoints: `/apply-template`
+// renders the messages with the model's chat template, `/completion`
+// generates with an optional `json_schema`, from which the server builds a
+// grammar that constrains sampling. (The OpenAI-compatible chat endpoint
+// of the pinned build wraps that grammar into its chat-format parser,
+// which failed with a ChatML test model; the native path does not.)
+
+/// Body for `/apply-template`.
+pub fn template_body(req: &ChatRequest) -> Value {
+    json!({ "messages": req.messages })
+}
+
+/// Body for `/completion` with the rendered prompt.
+pub fn completion_body(prompt: &str, req: &ChatRequest) -> Value {
     let mut body = json!({
-        "messages": req.messages,
+        "prompt": prompt,
         "temperature": req.temperature,
-        "max_tokens": req.max_tokens,
+        "n_predict": req.max_tokens,
         "stream": false,
         "cache_prompt": true,
     });
     if let Some(schema) = &req.json_schema {
-        body["response_format"] = json!({
-            "type": "json_schema",
-            "json_schema": { "name": "answer", "strict": true, "schema": schema },
-        });
+        body["json_schema"] = schema.clone();
     }
     if let Some(seed) = req.seed {
         body["seed"] = json!(seed);
@@ -426,47 +433,48 @@ pub fn request_body(req: &ChatRequest) -> Value {
 }
 
 #[derive(Deserialize)]
-struct RawResponse {
+struct RawTemplate {
+    prompt: String,
+}
+
+#[derive(Deserialize)]
+struct RawCompletion {
     #[serde(default)]
-    choices: Vec<RawChoice>,
-    usage: Option<RawUsage>,
+    content: String,
+    tokens_predicted: Option<u64>,
+    stop_type: Option<String>,
     timings: Option<RawTimings>,
-}
-#[derive(Deserialize)]
-struct RawChoice {
-    message: Option<RawMessage>,
-    finish_reason: Option<String>,
-}
-#[derive(Deserialize)]
-struct RawMessage {
-    content: Option<String>,
-}
-#[derive(Deserialize)]
-struct RawUsage {
-    completion_tokens: Option<u64>,
 }
 #[derive(Deserialize)]
 struct RawTimings {
     predicted_per_second: Option<f64>,
 }
 
-/// Parses a `/v1/chat/completions` answer (incl. llama-server's `timings`).
-pub fn parse_response(raw: &str) -> Result<ChatResponse, AiError> {
-    let r: RawResponse = serde_json::from_str(raw)
+pub fn parse_template(raw: &str) -> Result<String, AiError> {
+    serde_json::from_str::<RawTemplate>(raw)
+        .map(|t| t.prompt)
+        .map_err(|e| AiError::Http(format!("Unerwartete Antwort ({e})")))
+}
+
+/// Parses a `/completion` answer (incl. `timings` for tokens/s).
+pub fn parse_completion(raw: &str) -> Result<ChatResponse, AiError> {
+    let r: RawCompletion = serde_json::from_str(raw)
         .map_err(|e| AiError::Http(format!("Unerwartete Antwort ({e})")))?;
-    let choice = r
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| AiError::Http("Antwort ohne Inhalt".into()))?;
     Ok(ChatResponse {
-        content: choice.message.and_then(|m| m.content).unwrap_or_default(),
-        completion_tokens: r.usage.and_then(|u| u.completion_tokens),
+        content: r.content,
+        completion_tokens: r.tokens_predicted,
         tokens_per_second: r
             .timings
             .and_then(|t| t.predicted_per_second)
             .filter(|v| v.is_finite() && *v > 0.0),
-        finish_reason: choice.finish_reason,
+        // "limit": cut off at n_predict.
+        finish_reason: r.stop_type.map(|t| {
+            if t == "limit" {
+                "length".to_string()
+            } else {
+                "stop".to_string()
+            }
+        }),
     })
 }
 
@@ -485,31 +493,41 @@ impl LlamaClient {
             cancel,
         })
     }
+
+    async fn post(&self, path: &str, body: &Value) -> Result<String, AiError> {
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.endpoint.base_url))
+            .bearer_auth(&self.endpoint.api_key)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| AiError::Http(e.to_string()))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AiError::Http(e.to_string()))?;
+        if !status.is_success() {
+            let snippet: String = text.chars().take(300).collect();
+            return Err(AiError::Http(format!("HTTP {status}: {snippet}")));
+        }
+        Ok(text)
+    }
 }
 
 impl Llm for LlamaClient {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, AiError> {
         let send = async {
-            let resp = self
-                .http
-                .post(format!("{}/v1/chat/completions", self.endpoint.base_url))
-                .bearer_auth(&self.endpoint.api_key)
-                .json(&request_body(req))
-                .send()
-                .await
-                .map_err(|e| AiError::Http(e.to_string()))?;
-            let status = resp.status();
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| AiError::Http(e.to_string()))?;
-            if !status.is_success() {
-                let snippet: String = text.chars().take(300).collect();
-                return Err(AiError::Http(format!("HTTP {status}: {snippet}")));
-            }
-            parse_response(&text)
+            let prompt = parse_template(&self.post("/apply-template", &template_body(req)).await?)?;
+            parse_completion(
+                &self
+                    .post("/completion", &completion_body(&prompt, req))
+                    .await?,
+            )
         };
         tokio::select! {
+            biased;
             _ = self.cancel.cancelled() => Err(AiError::Cancelled),
             r = send => r,
         }
@@ -611,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn request_body_with_schema() {
+    fn request_bodies() {
         let req = ChatRequest {
             messages: vec![ChatMessage::system("s"), ChatMessage::user("u")],
             temperature: 0.7,
@@ -619,41 +637,44 @@ mod tests {
             json_schema: Some(json!({"type": "object"})),
             seed: Some(7),
         };
-        let b = request_body(&req);
-        assert_eq!(b["messages"][0]["role"], "system");
-        assert_eq!(b["messages"][1]["content"], "u");
-        assert_eq!(b["max_tokens"], 100);
+        let t = template_body(&req);
+        assert_eq!(t["messages"][0]["role"], "system");
+        assert_eq!(t["messages"][1]["content"], "u");
+        let b = completion_body("<p>", &req);
+        assert_eq!(b["prompt"], "<p>");
+        assert_eq!(b["n_predict"], 100);
         assert_eq!(b["stream"], false);
         assert_eq!(b["seed"], 7);
-        assert_eq!(b["response_format"]["type"], "json_schema");
-        assert_eq!(
-            b["response_format"]["json_schema"]["schema"]["type"],
-            "object"
+        assert_eq!(b["json_schema"]["type"], "object");
+        let plain = completion_body(
+            "x",
+            &ChatRequest {
+                json_schema: None,
+                seed: None,
+                ..req
+            },
         );
-        let plain = request_body(&ChatRequest {
-            json_schema: None,
-            seed: None,
-            ..req
-        });
-        assert!(plain.get("response_format").is_none());
+        assert!(plain.get("json_schema").is_none());
         assert!(plain.get("seed").is_none());
     }
 
     #[test]
-    fn parse_response_reads_content_and_timings() {
-        let raw = r#"{"choices":[{"index":0,"finish_reason":"stop",
-            "message":{"role":"assistant","content":"hallo"}}],
-            "usage":{"completion_tokens":12,"prompt_tokens":3},
-            "timings":{"predicted_per_second":21.5,"prompt_n":3}}"#;
-        let r = parse_response(raw).unwrap();
+    fn parse_answers() {
+        assert_eq!(
+            parse_template(r#"{"prompt":"<|im_start|>user"}"#).unwrap(),
+            "<|im_start|>user"
+        );
+        assert!(parse_template("{}").is_err());
+        let raw = r#"{"index":0,"content":"hallo","tokens_predicted":12,"stop":true,
+            "stop_type":"eos","timings":{"predicted_per_second":21.5,"prompt_n":3}}"#;
+        let r = parse_completion(raw).unwrap();
         assert_eq!(r.content, "hallo");
         assert_eq!(r.completion_tokens, Some(12));
         assert_eq!(r.tokens_per_second, Some(21.5));
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
-        assert!(parse_response(r#"{"choices":[]}"#).is_err());
-        assert!(parse_response("kaputt").is_err());
-        let r = parse_response(r#"{"choices":[{"message":{"content":null}}]}"#).unwrap();
-        assert_eq!(r.content, "");
+        let r = parse_completion(r#"{"content":"x","stop_type":"limit"}"#).unwrap();
+        assert_eq!(r.finish_reason.as_deref(), Some("length"));
         assert_eq!(r.tokens_per_second, None);
+        assert!(parse_completion("kaputt").is_err());
     }
 }
