@@ -45,7 +45,7 @@ fn setup_images() {
 async fn llama_server_answers_with_json_schema() {
     let cancel = CancellationToken::new();
     let started = Instant::now();
-    let endpoint = llama::ensure_running(&model(), &cancel, |m| eprintln!("{m}"))
+    let endpoint = llama::ensure_running(&model(), 4, &cancel, |m| eprintln!("{m}"))
         .await
         .expect("llama-server starten");
     eprintln!(
@@ -54,7 +54,7 @@ async fn llama_server_answers_with_json_schema() {
     );
 
     // Reuse: same model, same endpoint.
-    let again = llama::ensure_running(&model(), &cancel, |_| {})
+    let again = llama::ensure_running(&model(), 4, &cancel, |_| {})
         .await
         .unwrap();
     assert_eq!(again.base_url, endpoint.base_url);
@@ -87,6 +87,8 @@ async fn llama_server_answers_with_json_schema() {
             max_tokens: 256,
             json_schema: Some(schema),
             seed: Some(1),
+            prefill: None,
+            stop: Vec::new(),
         })
         .await
         .expect("chat");
@@ -105,7 +107,7 @@ async fn llama_server_answers_with_json_schema() {
 
     // Cancelling an ongoing request.
     let cancel2 = CancellationToken::new();
-    let endpoint = llama::ensure_running(&model(), &cancel2, |_| {})
+    let endpoint = llama::ensure_running(&model(), 4, &cancel2, |_| {})
         .await
         .unwrap();
     let client = LlamaClient::new(endpoint, cancel2.clone()).unwrap();
@@ -121,9 +123,53 @@ async fn llama_server_answers_with_json_schema() {
             max_tokens: 4000,
             json_schema: None,
             seed: None,
+            prefill: None,
+            stop: Vec::new(),
         })
         .await;
-    assert!(matches!(r, Err(AiError::Cancelled)), "{r:?}");
+    match &r {
+        Err(AiError::Cancelled) => {}
+        // Tiny test models reach their end-of-text within the 20 ms.
+        Ok(a) if a.finish_reason.as_deref() == Some("stop") => {
+            eprintln!(
+                "Antwort vor dem Abbruch fertig ({:?} Tokens)",
+                a.completion_tokens
+            )
+        }
+        _ => panic!("{r:?}"),
+    }
+
+    // Parallel slots: four requests at once (as the solutions), with the
+    // answer starting inside a code block and a stop string.
+    let cancel3 = CancellationToken::new();
+    let endpoint = llama::ensure_running(&model(), 4, &cancel3, |_| {})
+        .await
+        .unwrap();
+    let client = LlamaClient::new(endpoint, cancel3).unwrap();
+    let req = ChatRequest {
+        messages: vec![ChatMessage::user("Print 42 in Python.")],
+        temperature: 0.7,
+        max_tokens: 64,
+        json_schema: None,
+        seed: None,
+        prefill: Some("```python\n".into()),
+        stop: vec!["\n```".into()],
+    };
+    let started = Instant::now();
+    let answers = futures_util::future::join_all((0..4).map(|_| client.chat(&req))).await;
+    eprintln!(
+        "4 parallele Anfragen: {:.2} s",
+        started.elapsed().as_secs_f64()
+    );
+    for a in &answers {
+        let a = a.as_ref().expect("parallele Anfrage");
+        assert!(a.content.starts_with("```python\n"), "{:?}", a.content);
+    }
+    assert_eq!(
+        client.template_calls(),
+        1,
+        "identische Anfragen: ein Template-Aufruf"
+    );
     llama::shutdown().await;
 }
 
@@ -166,7 +212,7 @@ const SAMPLES: &[Sample] = &[
 async fn pipeline_on_sample_tasks() {
     setup_images();
     let cancel = CancellationToken::new();
-    let endpoint = llama::ensure_running(&model(), &cancel, |m| eprintln!("{m}"))
+    let endpoint = llama::ensure_running(&model(), 4, &cancel, |m| eprintln!("{m}"))
         .await
         .expect("llama-server starten");
     let solutions: usize = std::env::var("CODE_PRUEFER_TEST_SOLUTIONS")
@@ -308,6 +354,8 @@ async fn pipeline_with_real_sandbox() {
     .await
     .expect("Pipeline Python");
     eprintln!("Python: {:?} {:?}\n{:?}", r.confidence, r.stats, r.tests);
+    // One container and one compile per solution (+1 compile for the repair).
+    assert_eq!(exec.counts(), (4, 5));
     assert_eq!(r.stats.examples_found, 1, "invented example dropped");
     assert_eq!(r.stats.solutions_repaired, 1);
     assert_eq!(r.stats.solutions_passed, 3);
@@ -346,6 +394,7 @@ async fn pipeline_with_real_sandbox() {
     .await
     .expect("Pipeline Java");
     eprintln!("Java: {:?} {:?}\n{:?}", r.confidence, r.stats, r.tests);
+    assert_eq!(exec.counts(), (4 + 3, 5 + 3));
     assert_eq!(r.stats.solutions_passed, 3);
     // Two solutions (long) agree, one (int) overflows: 2 of 3 = 67 % -> yellow.
     assert_eq!(r.confidence.level, ConfidenceLevel::Yellow);

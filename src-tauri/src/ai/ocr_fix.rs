@@ -143,6 +143,8 @@ pub fn fix_request(text: &str) -> ChatRequest {
         max_tokens: FIX_MAX_TOKENS,
         json_schema: Some(fix_schema()),
         seed: Some(FIX_SEED),
+        prefill: None,
+        stop: Vec::new(),
     }
 }
 
@@ -463,7 +465,7 @@ pub async fn run(
 
     let model = super::models::selected_model()?;
     on_progress(AiProgress::new(Phase::Model, "KI-Modell wird geladen …"));
-    let endpoint = super::llama::ensure_running(&model.path, cancel, |m| {
+    let endpoint = super::llama::ensure_running(&model.path, model.server_slots(), cancel, |m| {
         on_progress(AiProgress::new(Phase::Model, m))
     })
     .await?;

@@ -45,9 +45,16 @@ function sameMode(a: CompareMode | null, b: CompareMode | null): boolean {
 
 function progressLine(p: AiProgress | null, seconds: number): string {
   if (!p) return `KI wird gestartet … (${seconds} s)`;
-  const tps =
-    p.tokensPerSecond !== null ? ` · ${p.tokensPerSecond.toFixed(1).replace(".", ",")} Token/s` : "";
-  return `${p.message}${tps} · ${seconds} s`;
+  const parts = [p.message];
+  if (p.tokensPerSecond !== null) parts.push(`${p.tokensPerSecond.toFixed(1).replace(".", ",")} Token/s`);
+  if (p.etaSeconds !== null && p.etaSeconds > 0) parts.push(`noch ca. ${formatDuration(p.etaSeconds)}`);
+  parts.push(`${formatDuration(seconds)} vergangen`);
+  return parts.join(" · ");
+}
+
+function formatDuration(s: number): string {
+  if (s < 60) return `${s} s`;
+  return `${Math.floor(s / 60)} min ${s % 60} s`;
 }
 
 /** "Testfälle mit KI erzeugen": progress, cancel, confidence, reference solution. */

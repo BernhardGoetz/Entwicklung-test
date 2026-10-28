@@ -297,6 +297,8 @@ export interface AiProgress {
   current: number | null;
   total: number | null;
   tokensPerSecond: number | null;
+  /** Rough remaining time of the model work in seconds (null: unknown). */
+  etaSeconds: number | null;
 }
 
 export const aiStatus = () => invoke<AiStatus>("ai_status");
@@ -309,6 +311,8 @@ export const deleteModel = (id: string) => invoke<AiStatus>("delete_model", { id
 export const selectModel = (id: string) => invoke<AiStatus>("select_model", { id });
 export const generateTests = (request: GenerateRequest) =>
   invoke<GenerateResult>("generate_tests", { request });
+/** Loads the selected model in the background (no-op if it runs already). */
+export const warmUpAi = () => invoke<boolean>("warm_up_ai");
 /** A suggested OCR correction (OcrFix in src-tauri/src/ai/ocr_fix.rs). */
 export interface OcrFix {
   /** 1-based line number. */

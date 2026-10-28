@@ -21,8 +21,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -32,7 +32,7 @@ use super::prompts::{self, SolutionContext, MAX_EXAMPLES, MAX_INPUTS};
 use super::AiError;
 use crate::engine;
 use crate::runner::compare::{group_outputs, normalize_newlines, CompareMode};
-use crate::runner::{self, languages, CollectedOutputs, StepOutput};
+use crate::runner::{self, languages, StepOutput};
 
 /// Longest accepted task text (the model context is 8192 tokens).
 pub const MAX_TASK_CHARS: usize = 12_000;
@@ -44,8 +44,9 @@ pub const SOLUTION_TEMPERATURE: f32 = 0.7;
 const STRUCTURE_TEMPERATURE: f32 = 0.0;
 const INPUTS_TEMPERATURE: f32 = 0.4;
 const RETRY_TEMPERATURE: f32 = 0.3;
-const STRUCTURE_MAX_TOKENS: u32 = 1024;
-const SOLUTION_MAX_TOKENS: u32 = 1536;
+const STRUCTURE_MAX_TOKENS: u32 = 768;
+/// The answer ends at the closing code fence, so this only bounds runaways.
+const SOLUTION_MAX_TOKENS: u32 = 1024;
 const INPUTS_MAX_TOKENS: u32 = 1024;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -173,6 +174,8 @@ pub struct AiProgress {
     pub current: Option<usize>,
     pub total: Option<usize>,
     pub tokens_per_second: Option<f64>,
+    /// Rough remaining time of the model work (see [`eta_seconds`]).
+    pub eta_seconds: Option<u64>,
 }
 
 impl AiProgress {
@@ -183,19 +186,40 @@ impl AiProgress {
             current: None,
             total: None,
             tokens_per_second: None,
+            eta_seconds: None,
         }
     }
 }
 
-/// Runs a program once per input in the sandbox. Errors (no engine, …)
-/// abort the pipeline; compile failures are part of the result.
-pub trait Executor {
+/// Result of compiling a program in a [`Session`].
+#[derive(Debug, Clone)]
+pub struct CompileOutcome {
+    /// Compiler output (`None` for languages without a compile step).
+    pub output: Option<StepOutput>,
+    pub ok: bool,
+}
+
+/// One sandbox for one candidate solution: compiled once, then run on the
+/// sheet's examples and later on the generated inputs (the majority vote),
+/// without a second container or compile run. Errors (no engine, …) abort
+/// the pipeline; compile failures are part of the result.
+pub trait Session: Send + Sync {
+    /// Writes `code` (replacing an earlier program, e.g. after a repair)
+    /// and compiles it.
+    fn compile(&self, code: &str) -> impl Future<Output = Result<CompileOutcome, AiError>> + Send;
+    /// Runs the compiled program once per input.
     fn run(
         &self,
-        language: &str,
-        code: &str,
         inputs: &[String],
-    ) -> impl Future<Output = Result<CollectedOutputs, AiError>> + Send;
+    ) -> impl Future<Output = Result<Vec<StepOutput>, AiError>> + Send;
+    /// Removes the sandbox.
+    fn close(self) -> impl Future<Output = ()> + Send;
+}
+
+/// Opens sandbox sessions.
+pub trait Executor: Sync {
+    type Session: Session;
+    fn open(&self, language: &str) -> impl Future<Output = Result<Self::Session, AiError>> + Send;
 }
 
 /// Engine status messages ("Docker Desktop wird gestartet …").
@@ -204,8 +228,10 @@ pub type Notify = Arc<dyn Fn(String) + Send + Sync>;
 /// How often one test generation may restart/reconnect the engine.
 const MAX_ENGINE_RECOVERIES: usize = 3;
 /// How long a recovery waits for an engine that does not answer.
-const RECOVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
-const RECOVERY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const RECOVERY_WAIT: Duration = Duration::from_secs(60);
+const RECOVERY_POLL: Duration = Duration::from_secs(2);
+/// Removing a container of an engine that just failed must not hang.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The connection of a run; `generation` counts reconnects.
 struct Connection {
@@ -213,18 +239,25 @@ struct Connection {
     generation: u64,
 }
 
-/// [`Executor`] using the real sandbox. One engine connection per test
-/// generation: orphan cleanup and the image check run once per language,
-/// not before every program. If the engine fails (e.g. Docker Desktop
-/// restarts or answers too slowly), it is started again via
-/// [`engine::ensure_running`] and the program runs once more.
-pub struct SandboxExecutor {
+struct ExecInner {
     cancel: CancellationToken,
     notify: Notify,
     conn: tokio::sync::Mutex<Connection>,
     /// Image per language, from [`runner::prepare`].
     images: tokio::sync::Mutex<HashMap<&'static str, String>>,
     recoveries: AtomicUsize,
+    containers: AtomicUsize,
+    compiles: AtomicUsize,
+}
+
+/// [`Executor`] using the real sandbox. One engine connection per test
+/// generation: orphan cleanup and the image check run once per language,
+/// not before every program; one container per candidate solution. If the
+/// engine fails (e.g. Docker Desktop restarts or answers too slowly), it is
+/// started again via [`engine::ensure_running`], the container is
+/// recreated, the program recompiled and the step repeated.
+pub struct SandboxExecutor {
+    inner: Arc<ExecInner>,
 }
 
 impl SandboxExecutor {
@@ -242,68 +275,78 @@ impl SandboxExecutor {
         })
         .await?;
         Ok(Self {
-            cancel,
-            notify,
-            conn: tokio::sync::Mutex::new(Connection {
-                docker,
-                generation: 0,
+            inner: Arc::new(ExecInner {
+                cancel,
+                notify,
+                conn: tokio::sync::Mutex::new(Connection {
+                    docker,
+                    generation: 0,
+                }),
+                images: tokio::sync::Mutex::new(HashMap::new()),
+                recoveries: AtomicUsize::new(0),
+                containers: AtomicUsize::new(0),
+                compiles: AtomicUsize::new(0),
             }),
-            images: tokio::sync::Mutex::new(HashMap::new()),
-            recoveries: AtomicUsize::new(0),
         })
     }
 
     /// Number of engine recoveries so far.
     pub fn recoveries(&self) -> usize {
-        self.recoveries.load(AtomicOrdering::SeqCst)
+        self.inner.recoveries.load(AtomicOrdering::SeqCst)
     }
 
+    /// Containers started and compile runs so far.
+    pub fn counts(&self) -> (usize, usize) {
+        (
+            self.inner.containers.load(AtomicOrdering::SeqCst),
+            self.inner.compiles.load(AtomicOrdering::SeqCst),
+        )
+    }
+
+    /// Removes orphans and checks the image of `language` (once per language).
+    pub async fn prepare(&self, language: &str) -> Result<String, AiError> {
+        self.inner.prepare(language).await
+    }
+}
+
+impl ExecInner {
     async fn client(&self) -> (bollard::Docker, u64) {
         let c = self.conn.lock().await;
         (c.docker.clone(), c.generation)
     }
 
-    /// Removes orphans and checks the image of `lang` (once per language).
-    pub async fn prepare(&self, language: &str) -> Result<String, AiError> {
+    async fn prepare(&self, language: &str) -> Result<String, AiError> {
         let lang = runner::language(language).map_err(|e| AiError::Other(e.to_string()))?;
         let mut images = self.images.lock().await;
         if let Some(image) = images.get(lang.id) {
             return Ok(image.clone());
         }
-        let notify = self.notify.clone();
-        let image = self
-            .with_engine(|docker| {
-                let notify = notify.clone();
-                async move {
-                    runner::prepare(&docker, lang, &mut |p| notify(engine_progress_text(&p))).await
-                }
-            })
-            .await?;
-        images.insert(lang.id, image.clone());
-        Ok(image)
-    }
-
-    /// Runs `op` with the current client; after an engine error the engine
-    /// is (re)started and `op` runs once more (at most
-    /// [`MAX_ENGINE_RECOVERIES`] times per test generation).
-    async fn with_engine<T, F, Fut>(&self, mut op: F) -> Result<T, AiError>
-    where
-        F: FnMut(bollard::Docker) -> Fut,
-        Fut: Future<Output = Result<T, runner::RunnerError>>,
-    {
         loop {
             let (docker, generation) = self.client().await;
-            let err = match cancellable(&self.cancel, async { Ok(op(docker).await) }).await? {
-                Ok(v) => return Ok(v),
-                Err(e) => e,
-            };
-            if !err.is_engine_error()
-                || self.recoveries.fetch_add(1, AtomicOrdering::SeqCst) >= MAX_ENGINE_RECOVERIES
-            {
-                return Err(AiError::Other(err.to_string()));
+            let notify = self.notify.clone();
+            let r = cancellable(&self.cancel, async {
+                Ok(runner::prepare(&docker, lang, &mut |p| notify(engine_progress_text(&p))).await)
+            })
+            .await?;
+            match r {
+                Ok(image) => {
+                    images.insert(lang.id, image.clone());
+                    return Ok(image);
+                }
+                Err(e) => self.handle(e, generation).await?,
             }
-            self.recover(generation).await?;
         }
+    }
+
+    /// After an engine error: recover (the caller repeats its step) or
+    /// give up with the error.
+    async fn handle(&self, e: runner::RunnerError, generation: u64) -> Result<(), AiError> {
+        if !e.is_engine_error()
+            || self.recoveries.fetch_add(1, AtomicOrdering::SeqCst) >= MAX_ENGINE_RECOVERIES
+        {
+            return Err(AiError::Other(e.to_string()));
+        }
+        self.recover(generation).await
     }
 
     /// New connection after an engine error; concurrent callers share one
@@ -345,6 +388,147 @@ impl SandboxExecutor {
     }
 }
 
+/// Container of a [`SandboxSession`] and the connection it belongs to.
+struct SessionState {
+    sandbox: Option<(runner::SandboxSession, u64)>,
+    /// The program, recompiled after a recovery.
+    code: Option<String>,
+}
+
+/// [`Session`] of the [`SandboxExecutor`].
+pub struct SandboxSession {
+    inner: Arc<ExecInner>,
+    lang: &'static languages::LanguageConfig,
+    image: String,
+    state: tokio::sync::Mutex<SessionState>,
+}
+
+impl SandboxSession {
+    /// Makes sure a container exists; `true` if it was (re)created.
+    async fn ensure(&self, st: &mut SessionState) -> Result<(u64, bool), AiError> {
+        if let Some((_, generation)) = &st.sandbox {
+            return Ok((*generation, false));
+        }
+        loop {
+            let (docker, generation) = self.inner.client().await;
+            let r = cancellable(&self.inner.cancel, async {
+                Ok(runner::SandboxSession::open(&docker, self.lang, &self.image).await)
+            })
+            .await?;
+            match r {
+                Ok(s) => {
+                    self.inner.containers.fetch_add(1, AtomicOrdering::SeqCst);
+                    st.sandbox = Some((s, generation));
+                    return Ok((generation, true));
+                }
+                Err(e) => self.inner.handle(e, generation).await?,
+            }
+        }
+    }
+
+    /// Drops the (dead) container and recovers the engine.
+    async fn fail(
+        &self,
+        st: &mut SessionState,
+        e: runner::RunnerError,
+        generation: u64,
+    ) -> Result<(), AiError> {
+        if e.is_engine_error() {
+            if let Some((s, _)) = st.sandbox.take() {
+                let _ = tokio::time::timeout(CLOSE_TIMEOUT, s.close()).await;
+            }
+        }
+        self.inner.handle(e, generation).await
+    }
+
+    async fn compile_locked(
+        &self,
+        st: &mut SessionState,
+        code: &str,
+    ) -> Result<CompileOutcome, AiError> {
+        loop {
+            let (generation, _) = self.ensure(st).await?;
+            let sandbox = &st.sandbox.as_ref().expect("ensured").0;
+            self.inner.compiles.fetch_add(1, AtomicOrdering::SeqCst);
+            let r = cancellable(&self.inner.cancel, async {
+                Ok(sandbox.compile(code, &mut |_| {}).await)
+            })
+            .await?;
+            match r {
+                Ok((output, ok)) => return Ok(CompileOutcome { output, ok }),
+                Err(e) => self.fail(st, e, generation).await?,
+            }
+        }
+    }
+}
+
+impl Session for SandboxSession {
+    async fn compile(&self, code: &str) -> Result<CompileOutcome, AiError> {
+        let mut st = self.state.lock().await;
+        st.code = Some(code.to_string());
+        self.compile_locked(&mut st, code).await
+    }
+
+    async fn run(&self, inputs: &[String]) -> Result<Vec<StepOutput>, AiError> {
+        let mut st = self.state.lock().await;
+        loop {
+            let (generation, fresh) = self.ensure(&mut st).await?;
+            if fresh {
+                // New container after a recovery: compile the program again.
+                let Some(code) = st.code.clone() else {
+                    return Err(AiError::Other("Kein Programm übersetzt.".into()));
+                };
+                if !self.compile_locked(&mut st, &code).await?.ok {
+                    return Err(AiError::Other(
+                        "Das Programm ließ sich nach dem Neustart der Container-Engine nicht \
+                         mehr übersetzen."
+                            .into(),
+                    ));
+                }
+                continue;
+            }
+            let sandbox = &st.sandbox.as_ref().expect("ensured").0;
+            let r = cancellable(&self.inner.cancel, async {
+                Ok(sandbox.run(inputs, &mut |_| {}).await)
+            })
+            .await?;
+            match r {
+                Ok(outputs) => return Ok(outputs),
+                Err(e) => self.fail(&mut st, e, generation).await?,
+            }
+        }
+    }
+
+    async fn close(self) {
+        if let Some((s, _)) = self.state.into_inner().sandbox {
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, s.close()).await;
+        }
+    }
+}
+
+impl Executor for SandboxExecutor {
+    type Session = SandboxSession;
+
+    async fn open(&self, language: &str) -> Result<SandboxSession, AiError> {
+        let lang = runner::language(language).map_err(|e| AiError::Other(e.to_string()))?;
+        let image = self.inner.prepare(language).await?;
+        let session = SandboxSession {
+            inner: self.inner.clone(),
+            lang,
+            image,
+            state: tokio::sync::Mutex::new(SessionState {
+                sandbox: None,
+                code: None,
+            }),
+        };
+        // Start the container right away (it starts while the model writes).
+        let mut st = session.state.lock().await;
+        session.ensure(&mut st).await?;
+        drop(st);
+        Ok(session)
+    }
+}
+
 /// Runs `f` unless `cancel` fires first.
 async fn cancellable<T>(
     cancel: &CancellationToken,
@@ -370,23 +554,6 @@ fn engine_progress_text(p: &runner::Progress) -> String {
             p.image,
             p.percent.map(|x| format!(": {x} %")).unwrap_or_default()
         ),
-    }
-}
-
-impl Executor for SandboxExecutor {
-    async fn run(
-        &self,
-        language: &str,
-        code: &str,
-        inputs: &[String],
-    ) -> Result<CollectedOutputs, AiError> {
-        let lang = runner::language(language).map_err(|e| AiError::Other(e.to_string()))?;
-        let image = self.prepare(language).await?;
-        self.with_engine(|docker| {
-            let image = image.clone();
-            async move { runner::run_program(&docker, lang, &image, code, inputs, |_| {}).await }
-        })
-        .await
     }
 }
 
@@ -657,17 +824,92 @@ pub fn decide_confidence(e: &Evidence) -> Confidence {
 // ---------------------------------------------------------------------------
 // Flow
 
-struct Run<'a, L, E, P> {
-    llm: &'a L,
-    exec: &'a E,
-    cancel: &'a CancellationToken,
-    on_progress: P,
+/// Expected answer lengths for the time estimate (tokens).
+const STRUCTURE_EXPECTED_TOKENS: f64 = 200.0;
+const SOLUTION_EXPECTED_TOKENS: f64 = 350.0;
+
+/// Rough remaining time in seconds from the measured generation speed (per
+/// sequence; parallel solutions finish at about the same time). `None`
+/// while the speed is unknown or the rest is sandbox work. Pure,
+/// unit-tested.
+pub fn eta_seconds(phase: Phase, done: usize, total: usize, tps: Option<f64>) -> Option<u64> {
+    let tps = tps.filter(|t| *t > 0.0)?;
+    let tokens = match phase {
+        Phase::Structure => STRUCTURE_EXPECTED_TOKENS + SOLUTION_EXPECTED_TOKENS,
+        Phase::Solutions => {
+            let left = total.saturating_sub(done) as f64 / total.max(1) as f64;
+            SOLUTION_EXPECTED_TOKENS * left
+        }
+        _ => return None,
+    };
+    Some((tokens / tps).ceil() as u64)
+}
+
+/// Repair rounds are skipped once a clear majority of the solutions passed
+/// already (more than half, at least two): another passing solution would
+/// not change the vote much, but costs a full generation. Pure.
+pub fn repairs_needed(solutions: usize, passed: usize) -> bool {
+    !(passed >= 2 && passed * 2 > solutions)
+}
+
+struct Shared<P> {
     stats: Stats,
     tps_sum: f64,
     tps_n: usize,
+    on_progress: P,
 }
 
-impl<L: Llm, E: Executor, P: FnMut(AiProgress)> Run<'_, L, E, P> {
+/// State of one test generation, shared by the concurrent solution tasks.
+struct Run<'a, L, E, P> {
+    llm: &'a L,
+    exec: &'a E,
+    lang: &'static languages::LanguageConfig,
+    /// Cancelled by the user or after a fatal error in one of the tasks.
+    cancel: CancellationToken,
+    shared: Mutex<Shared<P>>,
+}
+
+/// One candidate solution while it is generated, checked and repaired.
+struct Attempt<S> {
+    messages: Vec<super::llama::ChatMessage>,
+    answer: Option<String>,
+    session: Option<S>,
+    /// Why the program did not compile (missing code block, `class Main`,
+    /// compiler message): reason for a repair round.
+    failure: Option<String>,
+    code: Option<String>,
+    compiled: bool,
+    passes: bool,
+    example_outputs: Vec<StepOutput>,
+    /// The model failed for this solution (counts as failed).
+    llm_error: Option<AiError>,
+    /// The sandbox failed or the run was cancelled: aborts everything.
+    fatal: Option<AiError>,
+}
+
+impl<S> Attempt<S> {
+    fn new(messages: Vec<super::llama::ChatMessage>) -> Self {
+        Self {
+            messages,
+            answer: None,
+            session: None,
+            failure: None,
+            code: None,
+            compiled: false,
+            passes: false,
+            example_outputs: Vec::new(),
+            llm_error: None,
+            fatal: None,
+        }
+    }
+}
+
+impl<L, E, P> Run<'_, L, E, P>
+where
+    L: Llm + Sync,
+    E: Executor,
+    P: FnMut(AiProgress) + Send,
+{
     fn check(&self) -> Result<(), AiError> {
         if self.cancel.is_cancelled() {
             Err(AiError::Cancelled)
@@ -676,45 +918,52 @@ impl<L: Llm, E: Executor, P: FnMut(AiProgress)> Run<'_, L, E, P> {
         }
     }
 
-    fn progress(&mut self, phase: Phase, message: String, step: Option<(usize, usize)>) {
-        let tps = (self.tps_n > 0).then(|| self.tps_sum / self.tps_n as f64);
-        (self.on_progress)(AiProgress {
+    fn shared(&self) -> std::sync::MutexGuard<'_, Shared<P>> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn tps(&self) -> Option<f64> {
+        let s = self.shared();
+        (s.tps_n > 0).then(|| s.tps_sum / s.tps_n as f64)
+    }
+
+    fn progress(&self, phase: Phase, message: String, step: Option<(usize, usize)>) {
+        let tps = self.tps();
+        let eta = eta_seconds(phase, step.map_or(0, |s| s.0), step.map_or(1, |s| s.1), tps);
+        let mut s = self.shared();
+        (s.on_progress)(AiProgress {
             phase,
             message,
             current: step.map(|s| s.0),
             total: step.map(|s| s.1),
             tokens_per_second: tps,
+            eta_seconds: eta,
         });
     }
 
-    async fn chat(&mut self, req: ChatRequest) -> Result<ChatResponse, AiError> {
+    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, AiError> {
         self.check()?;
-        let r = self.llm.chat(&req).await?;
-        self.stats.llm_calls += 1;
-        self.stats.completion_tokens += r.completion_tokens.unwrap_or(0);
-        if let Some(t) = r.tokens_per_second {
-            self.tps_sum += t;
-            self.tps_n += 1;
+        let r = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => Err(AiError::Cancelled),
+            r = self.llm.chat(&req) => r,
+        }?;
+        {
+            let mut s = self.shared();
+            s.stats.llm_calls += 1;
+            s.stats.completion_tokens += r.completion_tokens.unwrap_or(0);
+            if let Some(t) = r.tokens_per_second {
+                s.tps_sum += t;
+                s.tps_n += 1;
+            }
         }
-        self.check()?;
-        Ok(r)
-    }
-
-    async fn exec(
-        &self,
-        lang: &str,
-        code: &str,
-        inputs: &[String],
-    ) -> Result<CollectedOutputs, AiError> {
-        self.check()?;
-        let r = self.exec.run(lang, code, inputs).await?;
         self.check()?;
         Ok(r)
     }
 
     /// JSON step with one retry on unparsable answers.
     async fn json_step<T: serde::de::DeserializeOwned>(
-        &mut self,
+        &self,
         messages: Vec<super::llama::ChatMessage>,
         schema: serde_json::Value,
         temperature: f32,
@@ -728,6 +977,8 @@ impl<L: Llm, E: Executor, P: FnMut(AiProgress)> Run<'_, L, E, P> {
                     max_tokens,
                     json_schema: Some(schema.clone()),
                     seed: None,
+                    prefill: None,
+                    stop: Vec::new(),
                 })
                 .await?;
             if let Some(v) = parse_json(&r.content) {
@@ -736,43 +987,133 @@ impl<L: Llm, E: Executor, P: FnMut(AiProgress)> Run<'_, L, E, P> {
         }
         Ok(None)
     }
+
+    /// A solution request: the answer starts inside the code block and
+    /// ends at its closing fence (no explanations).
+    fn solution_request(&self, messages: Vec<super::llama::ChatMessage>) -> ChatRequest {
+        ChatRequest {
+            messages,
+            temperature: SOLUTION_TEMPERATURE,
+            max_tokens: SOLUTION_MAX_TOKENS,
+            json_schema: None,
+            seed: None,
+            prefill: Some(prompts::code_prefill(self.lang.id)),
+            stop: vec![prompts::CODE_STOP.to_string()],
+        }
+    }
+
+    /// Compiles the answer in the attempt's sandbox and runs the examples.
+    async fn check_answer(
+        &self,
+        a: &mut Attempt<E::Session>,
+        examples: &[Example],
+        example_mode: &CompareMode,
+        example_inputs: &[String],
+    ) -> Result<(), AiError> {
+        let answer = a.answer.clone().unwrap_or_default();
+        a.failure = None;
+        a.passes = false;
+        let code = match prompts::extract_code(&answer, self.lang.id) {
+            None => {
+                a.failure = Some("No code block found in the answer.".into());
+                return Ok(());
+            }
+            Some(c) if languages::precheck(self.lang, &c).is_some() => {
+                a.failure = Some("The program must contain `public class Main`.".into());
+                return Ok(());
+            }
+            Some(c) => c,
+        };
+        let Some(session) = a.session.as_ref() else {
+            return Ok(());
+        };
+        self.check()?;
+        let compiled = session.compile(&code).await?;
+        if !compiled.ok {
+            a.failure = Some(compiler_text(compiled.output.as_ref()));
+            return Ok(());
+        }
+        a.compiled = true;
+        a.code = Some(code);
+        a.example_outputs = if example_inputs.is_empty() {
+            Vec::new()
+        } else {
+            self.check()?;
+            session.run(example_inputs).await?
+        };
+        a.passes = a.example_outputs.len() == examples.len()
+            && examples
+                .iter()
+                .zip(&a.example_outputs)
+                .all(|(ex, o)| valid(o) && example_mode.matches(&ex.output, &o.stdout));
+        Ok(())
+    }
+
+    /// Records an error: the model failed for this solution, or (sandbox,
+    /// cancel) everything stops.
+    fn record_error(&self, a: &mut Attempt<E::Session>, e: AiError, from_llm: bool) {
+        if from_llm && !matches!(e, AiError::Cancelled) {
+            a.llm_error = Some(e);
+        } else {
+            if !matches!(e, AiError::Cancelled) {
+                // Stop the other tasks quickly.
+                self.cancel.cancel();
+            }
+            a.fatal = Some(e);
+        }
+    }
 }
 
 /// Compile output as text for the repair prompt.
-fn compiler_text(c: &CollectedOutputs) -> String {
-    c.compile
-        .as_ref()
-        .map(|o| {
-            if o.timed_out {
-                "Compilation timed out.".to_string()
-            } else {
-                format!("{}\n{}", o.stderr, o.stdout).trim().to_string()
-            }
-        })
-        .unwrap_or_default()
+fn compiler_text(c: Option<&StepOutput>) -> String {
+    c.map(|o| {
+        if o.timed_out {
+            "Compilation timed out.".to_string()
+        } else {
+            format!("{}\n{}", o.stderr, o.stdout).trim().to_string()
+        }
+    })
+    .unwrap_or_default()
 }
 
-pub async fn generate<L: Llm, E: Executor>(
+/// The error that ends the run: a real failure wins over the
+/// cancellations it caused in the other tasks.
+fn first_fatal<S>(attempts: &mut [Attempt<S>]) -> Option<AiError> {
+    let pos = attempts
+        .iter()
+        .position(|a| matches!(&a.fatal, Some(e) if !matches!(e, AiError::Cancelled)))
+        .or_else(|| attempts.iter().position(|a| a.fatal.is_some()))?;
+    attempts[pos].fatal.take()
+}
+
+async fn close_all<S: Session>(sessions: impl IntoIterator<Item = S>) {
+    futures_util::future::join_all(sessions.into_iter().map(|s| s.close())).await;
+}
+
+pub async fn generate<L: Llm + Sync, E: Executor>(
     llm: &L,
     exec: &E,
     req: &GenerateRequest,
     settings: Settings,
     cancel: &CancellationToken,
-    on_progress: impl FnMut(AiProgress),
+    on_progress: impl FnMut(AiProgress) + Send,
 ) -> Result<GenerateResult, AiError> {
     let started = Instant::now();
     let lang = req.validate()?;
-    let mut run = Run {
+    let run = Run {
         llm,
         exec,
-        cancel,
-        on_progress,
-        stats: Stats {
-            solutions_requested: settings.solutions,
-            ..Stats::default()
-        },
-        tps_sum: 0.0,
-        tps_n: 0,
+        lang,
+        cancel: cancel.child_token(),
+        shared: Mutex::new(Shared {
+            stats: Stats {
+                solutions_requested: settings.solutions,
+                ..Stats::default()
+            },
+            tps_sum: 0.0,
+            tps_n: 0,
+            on_progress,
+        }),
     };
 
     // 1. Structure.
@@ -791,8 +1132,11 @@ pub async fn generate<L: Llm, E: Executor>(
         .await?
         .unwrap_or_default();
     let (examples, discarded) = verify_examples(&req.task_text, &structure.examples);
-    run.stats.examples_found = examples.len();
-    run.stats.examples_discarded = discarded;
+    {
+        let mut s = run.shared();
+        s.stats.examples_found = examples.len();
+        s.stats.examples_discarded = discarded;
+    }
     let suggested = suggested_mode(&structure);
     let mode = req.compare_mode.or(suggested).unwrap_or_default();
     // Sheet text cannot show trailing spaces: examples are checked leniently.
@@ -806,7 +1150,10 @@ pub async fn generate<L: Llm, E: Executor>(
         .map(|e| (e.input.clone(), e.output.clone()))
         .collect();
 
-    // 2.–4. Solutions: generate, compile (+ repair), check the examples.
+    // 2.–4. Solutions, all at the same time (llama-server has a slot per
+    // solution): generate while the containers start, check each one as
+    // soon as it is written. The test inputs (5.) only need the task, so
+    // they are generated alongside.
     let ctx = SolutionContext {
         input_format: &structure.input_format,
         output_format: &structure.output_format,
@@ -814,85 +1161,157 @@ pub async fn generate<L: Llm, E: Executor>(
     };
     let base_messages = prompts::solution_messages(&req.task_text, lang.id, &ctx);
     let n = settings.solutions;
-    let mut survivors: Vec<String> = Vec::new();
-    for i in 0..n {
-        run.progress(
-            Phase::Solutions,
-            format!("Lösung {} von {n} wird geschrieben …", i + 1),
-            Some((i + 1, n)),
-        );
-        let mut messages = base_messages.clone();
-        let mut answer = run
-            .chat(ChatRequest {
-                messages: messages.clone(),
-                temperature: SOLUTION_TEMPERATURE,
-                max_tokens: SOLUTION_MAX_TOKENS,
-                json_schema: None,
-                seed: None,
-            })
-            .await?
-            .content;
-        let mut repairs_left = settings.repair_rounds;
-        let outputs = loop {
-            let failure = match prompts::extract_code(&answer, lang.id) {
-                None => "No code block found in the answer.".to_string(),
-                Some(c) if languages::precheck(lang, &c).is_some() => {
-                    "The program must contain `public class Main`.".to_string()
-                }
-                Some(c) => {
-                    run.progress(
-                        Phase::Solutions,
-                        format!("Lösung {} von {n} wird geprüft …", i + 1),
-                        Some((i + 1, n)),
-                    );
-                    let out = run.exec(lang.id, &c, &example_inputs).await?;
-                    if out.compile_ok {
-                        break Some((c, out));
+    run.progress(
+        Phase::Solutions,
+        format!("{n} Lösungen werden gleichzeitig geschrieben …"),
+        Some((0, n)),
+    );
+    let done = AtomicUsize::new(0);
+    let first_round = (0..n).map(|_| {
+        let run = &run;
+        let messages = base_messages.clone();
+        let (examples, example_mode, example_inputs, done) =
+            (&examples, &example_mode, &example_inputs, &done);
+        async move {
+            let mut a = Attempt::new(messages.clone());
+            let (answer, session) =
+                futures_util::future::join(run.chat(run.solution_request(messages)), async {
+                    run.check()?;
+                    tokio::select! {
+                        biased;
+                        _ = run.cancel.cancelled() => Err(AiError::Cancelled),
+                        s = run.exec.open(lang.id) => s,
                     }
-                    compiler_text(&out)
-                }
-            };
-            if repairs_left == 0 {
-                break None;
+                })
+                .await;
+            match session {
+                Ok(s) => a.session = Some(s),
+                Err(e) => run.record_error(&mut a, e, false),
             }
-            repairs_left -= 1;
+            match answer {
+                Ok(r) => a.answer = Some(r.content),
+                Err(e) => run.record_error(&mut a, e, true),
+            }
+            if a.fatal.is_none() && a.llm_error.is_none() {
+                if let Err(e) = run
+                    .check_answer(&mut a, examples, example_mode, example_inputs)
+                    .await
+                {
+                    run.record_error(&mut a, e, false);
+                }
+            }
+            let d = done.fetch_add(1, AtomicOrdering::SeqCst) + 1;
             run.progress(
                 Phase::Solutions,
-                format!("Lösung {} von {n} wird repariert …", i + 1),
-                Some((i + 1, n)),
+                format!("Lösung {d} von {n} geschrieben und geprüft …"),
+                Some((d, n)),
             );
-            messages = prompts::repair_messages(messages, &answer, &failure, lang.id);
-            answer = run
-                .chat(ChatRequest {
-                    messages: messages.clone(),
-                    temperature: SOLUTION_TEMPERATURE,
-                    max_tokens: SOLUTION_MAX_TOKENS,
-                    json_schema: None,
-                    seed: None,
-                })
-                .await?
-                .content;
-            run.stats.solutions_repaired += 1;
-        };
-        let Some((code, out)) = outputs else { continue };
-        run.stats.solutions_compiled += 1;
-        let passes = examples
-            .iter()
-            .zip(&out.outputs)
-            .all(|(ex, o)| valid(o) && example_mode.matches(&ex.output, &o.stdout))
-            && out.outputs.len() == examples.len();
-        if passes {
-            survivors.push(code);
+            a
+        }
+    });
+    let inputs_step = async {
+        run.json_step::<InputsAnswer>(
+            prompts::inputs_messages(&req.task_text, &structure.input_format, &example_inputs),
+            prompts::inputs_schema(),
+            INPUTS_TEMPERATURE,
+            INPUTS_MAX_TOKENS,
+        )
+        .await
+    };
+    let solutions_step = async {
+        let mut attempts = futures_util::future::join_all(first_round).await;
+        // Repair rounds only for programs that did not compile, and only if
+        // no clear majority passed already.
+        for _ in 0..settings.repair_rounds {
+            let passed = attempts.iter().filter(|a| a.passes).count();
+            if attempts.iter().any(|a| a.fatal.is_some()) || !repairs_needed(n, passed) {
+                break;
+            }
+            let repairs = attempts
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, a)| a.failure.is_some() && a.session.is_some())
+                .map(|(i, a)| {
+                    let run = &run;
+                    let (examples, example_mode, example_inputs) =
+                        (&examples, &example_mode, &example_inputs);
+                    async move {
+                        run.progress(
+                            Phase::Solutions,
+                            format!("Lösung {} von {n} wird repariert …", i + 1),
+                            Some((i + 1, n)),
+                        );
+                        let failure = a.failure.clone().unwrap_or_default();
+                        let answer = a.answer.clone().unwrap_or_default();
+                        a.messages = prompts::repair_messages(
+                            std::mem::take(&mut a.messages),
+                            &answer,
+                            &failure,
+                            lang.id,
+                        );
+                        match run.chat(run.solution_request(a.messages.clone())).await {
+                            Ok(r) => {
+                                a.answer = Some(r.content);
+                                run.shared().stats.solutions_repaired += 1;
+                                if let Err(e) = run
+                                    .check_answer(a, examples, example_mode, example_inputs)
+                                    .await
+                                {
+                                    run.record_error(a, e, false);
+                                }
+                            }
+                            Err(e) => {
+                                a.failure = None;
+                                run.record_error(a, e, true);
+                            }
+                        }
+                    }
+                });
+            futures_util::future::join_all(repairs).await;
+        }
+        attempts
+    };
+    let (mut attempts, inputs_answer) =
+        futures_util::future::join(solutions_step, inputs_step).await;
+
+    let sessions_of = |attempts: &mut Vec<Attempt<E::Session>>, keep: bool| -> Vec<E::Session> {
+        attempts
+            .iter_mut()
+            .filter(|a| keep || !a.passes)
+            .filter_map(|a| a.session.take())
+            .collect()
+    };
+    if let Some(e) = first_fatal(&mut attempts) {
+        close_all(sessions_of(&mut attempts, true)).await;
+        return Err(e);
+    }
+    if attempts.iter().all(|a| a.llm_error.is_some()) {
+        close_all(sessions_of(&mut attempts, true)).await;
+        if let Some(e) = attempts.iter_mut().find_map(|a| a.llm_error.take()) {
+            return Err(e);
         }
     }
-    run.stats.solutions_passed = survivors.len();
+    let compiled = attempts.iter().filter(|a| a.compiled).count();
+    // Containers of failed solutions are no longer needed.
+    close_all(sessions_of(&mut attempts, false)).await;
+    let survivors: Vec<(String, Vec<StepOutput>, E::Session)> = attempts
+        .into_iter()
+        .filter(|a| a.passes)
+        .filter_map(|a| Some((a.code?, a.example_outputs, a.session?)))
+        .collect();
+    {
+        let mut s = run.shared();
+        s.stats.solutions_compiled = compiled;
+        s.stats.solutions_passed = survivors.len();
+    }
 
     let finish = |run: Run<'_, L, E, _>,
                   tests: Vec<GeneratedTest>,
                   reference: Option<String>,
                   ev: Evidence| {
-        let mut stats = run.stats;
-        stats.tokens_per_second = (run.tps_n > 0).then(|| run.tps_sum / run.tps_n as f64);
+        let shared = run.shared.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut stats = shared.stats;
+        stats.tokens_per_second = (shared.tps_n > 0).then(|| shared.tps_sum / shared.tps_n as f64);
         stats.duration_ms = started.elapsed().as_millis() as u64;
         let confidence = decide_confidence(&ev);
         // Red: no tests, no reference solution – only the honest message.
@@ -908,7 +1327,7 @@ pub async fn generate<L: Llm, E: Executor>(
     };
     let mut evidence = Evidence {
         solutions: n,
-        compiled: run.stats.solutions_compiled,
+        compiled,
         survivors: survivors.len(),
         examples: examples.len(),
         ..Evidence::default()
@@ -918,52 +1337,109 @@ pub async fn generate<L: Llm, E: Executor>(
     }
 
     // 5. Test inputs (the model writes inputs only).
-    run.progress(Phase::Inputs, "Testeingaben werden erzeugt …".into(), None);
-    let answer: Option<InputsAnswer> = run
-        .json_step(
-            prompts::inputs_messages(&req.task_text, &structure.input_format, &example_inputs),
-            prompts::inputs_schema(),
-            INPUTS_TEMPERATURE,
-            INPUTS_MAX_TOKENS,
-        )
-        .await?;
-    let generated = clean_inputs(
-        &answer.map(|a| a.inputs).unwrap_or_default(),
-        &example_inputs,
-    );
-    run.stats.inputs_generated = generated.len();
+    let generated = match inputs_answer {
+        Ok(answer) => clean_inputs(
+            &answer.map(|a| a.inputs).unwrap_or_default(),
+            &example_inputs,
+        ),
+        Err(e) => {
+            close_all(survivors.into_iter().map(|s| s.2)).await;
+            return Err(e);
+        }
+    };
+    run.shared().stats.inputs_generated = generated.len();
 
-    // 6. Majority vote over all surviving solutions.
+    // 6. Majority vote: every surviving solution runs the new inputs in its
+    // container (compiled once; the example outputs are reused).
+    let s = survivors.len();
+    run.progress(
+        Phase::Majority,
+        format!(
+            "Mehrheitsentscheid: {s} Lösungen laufen auf {} Eingaben …",
+            generated.len()
+        ),
+        Some((0, s)),
+    );
+    let majority_done = AtomicUsize::new(0);
+    let runs = survivors.iter().map(|(_, _, session)| {
+        let (run, generated, majority_done) = (&run, &generated, &majority_done);
+        async move {
+            let r = if generated.is_empty() {
+                Ok(Vec::new())
+            } else {
+                run.check()?;
+                tokio::select! {
+                    biased;
+                    _ = run.cancel.cancelled() => Err(AiError::Cancelled),
+                    r = session.run(generated) => r,
+                }
+            };
+            if r.is_err() {
+                run.cancel.cancel();
+            }
+            let d = majority_done.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            run.progress(
+                Phase::Majority,
+                format!("Mehrheitsentscheid: Lösung {d} von {s} ausgeführt …"),
+                Some((d, s)),
+            );
+            r
+        }
+    });
+    let outputs = futures_util::future::join_all(runs).await;
+    let (codes, example_outputs): (Vec<String>, Vec<Vec<StepOutput>>) = {
+        let mut codes = Vec::with_capacity(s);
+        let mut ex = Vec::with_capacity(s);
+        let mut sessions = Vec::with_capacity(s);
+        for (c, e, session) in survivors {
+            codes.push(c);
+            ex.push(e);
+            sessions.push(session);
+        }
+        close_all(sessions).await;
+        (codes, ex)
+    };
+    let mut generated_outputs = Vec::with_capacity(s);
+    let mut error: Option<AiError> = None;
+    for r in outputs {
+        match r {
+            Ok(o) => generated_outputs.push(o),
+            Err(e) => {
+                if error
+                    .as_ref()
+                    .is_none_or(|old| matches!(old, AiError::Cancelled))
+                {
+                    error = Some(e);
+                }
+                generated_outputs.push(Vec::new());
+            }
+        }
+    }
+    if let Some(e) = error {
+        return Err(e);
+    }
+
     let all_inputs: Vec<String> = example_inputs
         .iter()
         .cloned()
         .chain(generated.iter().cloned())
         .collect();
-    let mut results: Vec<Option<CollectedOutputs>> = Vec::with_capacity(survivors.len());
-    let s = survivors.len();
-    for (i, code) in survivors.iter().enumerate() {
-        run.progress(
-            Phase::Majority,
-            format!(
-                "Lösung {} von {s} läuft auf {} Eingaben …",
-                i + 1,
-                all_inputs.len()
-            ),
-            Some((i + 1, s)),
-        );
-        let out = run.exec(lang.id, code, &all_inputs).await?;
-        results.push((out.compile_ok && out.outputs.len() == all_inputs.len()).then_some(out));
-    }
+    let results: Vec<Option<Vec<StepOutput>>> = example_outputs
+        .into_iter()
+        .zip(generated_outputs)
+        .map(|(mut e, g)| {
+            e.extend(g);
+            (e.len() == all_inputs.len()).then_some(e)
+        })
+        .collect();
 
     let mut tests = Vec::new();
     let mut wins = vec![0usize; s];
     let mut min_agreement: Option<f64> = None;
     let mut dropped = 0;
     for (j, input) in all_inputs.iter().enumerate() {
-        let outputs: Vec<Option<&StepOutput>> = results
-            .iter()
-            .map(|r| r.as_ref().map(|o| &o.outputs[j]))
-            .collect();
+        let outputs: Vec<Option<&StepOutput>> =
+            results.iter().map(|r| r.as_ref().map(|o| &o[j])).collect();
         let from_sheet = j < example_inputs.len();
         let Some((rep, members)) = majority(&mode, &outputs) else {
             dropped += 1;
@@ -999,12 +1475,12 @@ pub async fn generate<L: Llm, E: Executor>(
             agreement,
         });
     }
-    run.stats.tests_dropped = dropped;
+    run.shared().stats.tests_dropped = dropped;
     let reference = wins
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(&a.0)))
-        .map(|(i, _)| survivors[i].clone());
+        .map(|(i, _)| codes[i].clone());
 
     // 7. Confidence.
     evidence.tests = tests.len();
@@ -1053,7 +1529,7 @@ pub async fn run(
     exec.prepare(lang.id).await?;
 
     on_progress(AiProgress::new(Phase::Model, "KI-Modell wird geladen …"));
-    let endpoint = super::llama::ensure_running(&model.path, cancel, |m| {
+    let endpoint = super::llama::ensure_running(&model.path, model.server_slots(), cancel, |m| {
         on_progress(AiProgress::new(Phase::Model, m))
     })
     .await?;
@@ -1069,7 +1545,6 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::ai::llama::Role;
-    use std::sync::Mutex;
 
     // --- Mocks --------------------------------------------------------------
 
@@ -1104,6 +1579,7 @@ mod tests {
                 completion_tokens: Some(10),
                 tokens_per_second: Some(20.0),
                 finish_reason: Some("stop".into()),
+                stopping_word: None,
             })
         }
     }
@@ -1123,68 +1599,108 @@ mod tests {
     /// Fake sandbox: the "program" is a keyword in the code.
     /// `double`/`triple`/`plus1` compute on the first integer of the input,
     /// `float` prints n/3 with 4 or 6 decimals, `crash` exits with 1,
-    /// `SYNTAX` does not compile.
+    /// `SYNTAX` does not compile. Counts containers, compiles and runs.
+    #[derive(Default)]
+    struct Counters {
+        opened: usize,
+        closed: usize,
+        compiles: usize,
+        runs: usize,
+    }
+
     struct MockExec {
-        runs: Mutex<usize>,
+        counters: Arc<Mutex<Counters>>,
+        /// Sandbox error on the n-th compile (1-based).
+        fail_compile: Option<usize>,
     }
 
     impl MockExec {
         fn new() -> Self {
             Self {
-                runs: Mutex::new(0),
+                counters: Arc::new(Mutex::new(Counters::default())),
+                fail_compile: None,
             }
+        }
+        fn get(&self) -> std::sync::MutexGuard<'_, Counters> {
+            self.counters.lock().unwrap()
+        }
+    }
+
+    struct MockSession {
+        counters: Arc<Mutex<Counters>>,
+        code: Mutex<String>,
+        fail_compile: Option<usize>,
+    }
+
+    fn output_for(code: &str, input: &str) -> StepOutput {
+        let n: i64 = input
+            .split_whitespace()
+            .next()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(0);
+        if code.contains("crash") {
+            step("", 1)
+        } else if code.contains("double") {
+            step(&format!("{}\n", n * 2), 0)
+        } else if code.contains("triple") {
+            step(&format!("{}\n", n * 3), 0)
+        } else if code.contains("plus1") {
+            step(&format!("{}\n", n + 1), 0)
+        } else if code.contains("float4") {
+            step(&format!("{:.4}\n", n as f64 / 3.0), 0)
+        } else if code.contains("float6") {
+            step(&format!("{:.6}\n", n as f64 / 3.0), 0)
+        } else {
+            step("?\n", 0)
+        }
+    }
+
+    impl Session for MockSession {
+        async fn compile(&self, code: &str) -> Result<CompileOutcome, AiError> {
+            let n = {
+                let mut c = self.counters.lock().unwrap();
+                c.compiles += 1;
+                c.compiles
+            };
+            if self.fail_compile == Some(n) {
+                return Err(AiError::Other("Fehler der Container-Engine: weg".into()));
+            }
+            *self.code.lock().unwrap() = code.to_string();
+            if code.contains("SYNTAX") {
+                return Ok(CompileOutcome {
+                    output: Some(StepOutput {
+                        stderr: "SyntaxError: invalid syntax".into(),
+                        ..step("", 1)
+                    }),
+                    ok: false,
+                });
+            }
+            Ok(CompileOutcome {
+                output: Some(step("", 0)),
+                ok: true,
+            })
+        }
+
+        async fn run(&self, inputs: &[String]) -> Result<Vec<StepOutput>, AiError> {
+            self.counters.lock().unwrap().runs += inputs.len();
+            let code = self.code.lock().unwrap().clone();
+            Ok(inputs.iter().map(|i| output_for(&code, i)).collect())
+        }
+
+        async fn close(self) {
+            self.counters.lock().unwrap().closed += 1;
         }
     }
 
     impl Executor for MockExec {
-        async fn run(
-            &self,
-            _l: &str,
-            code: &str,
-            inputs: &[String],
-        ) -> Result<CollectedOutputs, AiError> {
-            *self.runs.lock().unwrap() += 1;
-            if code.contains("SYNTAX") {
-                return Ok(CollectedOutputs {
-                    image: "mock".into(),
-                    compile: Some(StepOutput {
-                        stderr: "SyntaxError: invalid syntax".into(),
-                        ..step("", 1)
-                    }),
-                    compile_ok: false,
-                    outputs: Vec::new(),
-                });
-            }
-            let outputs = inputs
-                .iter()
-                .map(|i| {
-                    let n: i64 = i
-                        .split_whitespace()
-                        .next()
-                        .and_then(|t| t.parse().ok())
-                        .unwrap_or(0);
-                    if code.contains("crash") {
-                        step("", 1)
-                    } else if code.contains("double") {
-                        step(&format!("{}\n", n * 2), 0)
-                    } else if code.contains("triple") {
-                        step(&format!("{}\n", n * 3), 0)
-                    } else if code.contains("plus1") {
-                        step(&format!("{}\n", n + 1), 0)
-                    } else if code.contains("float4") {
-                        step(&format!("{:.4}\n", n as f64 / 3.0), 0)
-                    } else if code.contains("float6") {
-                        step(&format!("{:.6}\n", n as f64 / 3.0), 0)
-                    } else {
-                        step("?\n", 0)
-                    }
-                })
-                .collect();
-            Ok(CollectedOutputs {
-                image: "mock".into(),
-                compile: Some(step("", 0)),
-                compile_ok: true,
-                outputs,
+        type Session = MockSession;
+
+        async fn open(&self, _language: &str) -> Result<MockSession, AiError> {
+            self.counters.lock().unwrap().opened += 1;
+            Ok(MockSession {
+                counters: self.counters.clone(),
+                code: Mutex::new(String::new()),
+                fail_compile: self.fail_compile,
             })
         }
     }
@@ -1530,8 +2046,9 @@ mod tests {
             r#"{"inputs": ["3"]}"#,
         ));
         let r = generate_with(&llm, req(None), 3).unwrap();
-        // 1 structure + 3 × (solution + repair); no input step after red.
-        assert_eq!(r.stats.llm_calls, 7);
+        // 1 structure + 3 × (solution + repair) + the input step, which runs
+        // alongside the solutions.
+        assert_eq!(r.stats.llm_calls, 8);
         assert_eq!(r.stats.solutions_compiled, 0);
         assert_eq!(r.confidence.level, ConfidenceLevel::Red);
         assert!(r.confidence.reasons[0].contains("kompilieren"));
@@ -1745,7 +2262,7 @@ mod tests {
         ));
         assert!(matches!(r, Err(AiError::Cancelled)));
         assert_eq!(llm.calls().len(), 2);
-        assert_eq!(*exec.runs.lock().unwrap(), 0);
+        assert_eq!(exec.get().opened, 0);
     }
 
     #[test]
@@ -1765,18 +2282,310 @@ mod tests {
         let exec = MockExec::new();
         let token = CancellationToken::new();
         let mut phases = Vec::new();
+        let mut etas = Vec::new();
         block_on(generate(
             &llm,
             &exec,
             &req(None),
             settings(2),
             &token,
-            |p| phases.push((p.phase, p.current, p.total)),
+            |p| {
+                phases.push((p.phase, p.current, p.total));
+                etas.push((p.phase, p.eta_seconds, p.tokens_per_second));
+            },
         ))
         .unwrap();
         assert_eq!(phases[0].0, Phase::Structure);
+        // "Lösung i/N": 0 of 2 at the start, then each finished one.
+        assert!(phases.contains(&(Phase::Solutions, Some(0), Some(2))));
+        assert!(phases.contains(&(Phase::Solutions, Some(1), Some(2))));
         assert!(phases.contains(&(Phase::Solutions, Some(2), Some(2))));
-        assert!(phases.iter().any(|p| p.0 == Phase::Inputs));
-        assert!(phases.iter().any(|p| p.0 == Phase::Majority));
+        assert!(
+            phases.contains(&(Phase::Majority, Some(2), Some(2))),
+            "{phases:?}"
+        );
+        // After the structure step the speed (20 tokens/s) gives an estimate.
+        assert!(etas.contains(&(Phase::Solutions, Some(18), Some(20.0))));
+        assert!(etas.contains(&(Phase::Solutions, Some(0), Some(20.0))));
+    }
+
+    #[test]
+    fn eta_from_tokens_per_second() {
+        assert_eq!(eta_seconds(Phase::Solutions, 0, 3, None), None);
+        assert_eq!(eta_seconds(Phase::Solutions, 0, 3, Some(0.0)), None);
+        // 350 expected tokens at 7 tokens/s; parallel solutions count once.
+        assert_eq!(eta_seconds(Phase::Solutions, 0, 3, Some(7.0)), Some(50));
+        assert_eq!(eta_seconds(Phase::Solutions, 3, 3, Some(7.0)), Some(0));
+        assert_eq!(eta_seconds(Phase::Structure, 0, 1, Some(10.0)), Some(55));
+        assert_eq!(eta_seconds(Phase::Majority, 0, 3, Some(7.0)), None);
+    }
+
+    #[test]
+    fn repairs_only_without_clear_majority() {
+        assert!(!repairs_needed(3, 2));
+        assert!(!repairs_needed(5, 3));
+        assert!(repairs_needed(5, 2));
+        assert!(repairs_needed(3, 1));
+        assert!(repairs_needed(2, 1));
+        assert!(repairs_needed(1, 1));
+        assert!(repairs_needed(3, 0));
+    }
+
+    // --- Concurrency, sessions, early exit -------------------------------------
+
+    type AnswerFn = Box<dyn Fn(&ChatRequest, usize) -> Result<String, AiError> + Sync + Send>;
+
+    /// Model with a delay per solution request: the i-th request (0-based)
+    /// waits `delays[i]` ms, so they finish out of order.
+    struct SlowLlm {
+        inner: MockLlm<AnswerFn>,
+        delays: Vec<u64>,
+        solution_calls: Mutex<usize>,
+        active: Mutex<(usize, usize)>,
+    }
+
+    impl Llm for SlowLlm {
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, AiError> {
+            let mut index = None;
+            if !is_structure(req) && !is_inputs(req) {
+                let i = {
+                    let mut c = self.solution_calls.lock().unwrap();
+                    *c += 1;
+                    *c - 1
+                };
+                {
+                    let mut a = self.active.lock().unwrap();
+                    a.0 += 1;
+                    a.1 = a.1.max(a.0);
+                }
+                let ms = self.delays.get(i).copied().unwrap_or(0);
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                self.active.lock().unwrap().0 -= 1;
+                index = Some(i);
+            }
+            let mut r = self.inner.chat(req).await?;
+            if let Some(i) = index {
+                // Marks the answer with the index of its request.
+                r.content =
+                    r.content
+                        .replacen("```python\n", &format!("```python\n# request {i}\n"), 1);
+            }
+            Ok(r)
+        }
+    }
+
+    fn slow(
+        answer: impl Fn(&ChatRequest, usize) -> Result<String, AiError> + Sync + Send + 'static,
+        delays: Vec<u64>,
+    ) -> SlowLlm {
+        SlowLlm {
+            inner: MockLlm::new(Box::new(answer)),
+            delays,
+            solution_calls: Mutex::new(0),
+            active: Mutex::new((0, 0)),
+        }
+    }
+
+    #[test]
+    fn solutions_are_generated_concurrently_in_stable_order() {
+        // Request 0 is the slowest; results still follow the request order.
+        let structure = structure_json(&[("21", "42")], "lines");
+        let llm = slow(
+            move |r: &ChatRequest, _| {
+                if is_structure(r) {
+                    Ok(structure.clone())
+                } else if is_inputs(r) {
+                    Ok(r#"{"inputs": ["1", "2"]}"#.into())
+                } else {
+                    Ok(program("double"))
+                }
+            },
+            vec![60, 20, 1],
+        );
+        let exec = MockExec::new();
+        let started = std::time::Instant::now();
+        let r = block_on(generate(
+            &llm,
+            &exec,
+            &req(None),
+            settings(3),
+            &CancellationToken::new(),
+            |_| {},
+        ))
+        .unwrap();
+        // All three requests were in flight at once: ~60 ms, not 81 ms.
+        assert_eq!(llm.active.lock().unwrap().1, 3);
+        assert!(started.elapsed() < std::time::Duration::from_millis(78));
+        assert_eq!(r.confidence.level, ConfidenceLevel::Green);
+        // Tie in wins: the first solution (request order) is the reference.
+        assert!(r.reference_solution.unwrap().contains("# request 0"));
+        // Solution requests start inside the code block and stop after it.
+        let sol = llm
+            .inner
+            .calls()
+            .into_iter()
+            .find(|c| !is_structure(c) && !is_inputs(c))
+            .unwrap();
+        assert_eq!(sol.prefill.as_deref(), Some("```python\n"));
+        assert_eq!(sol.stop, vec!["\n```".to_string()]);
+        assert_eq!(sol.max_tokens, 1024);
+    }
+
+    #[test]
+    fn one_container_and_one_compile_per_solution() {
+        let llm = MockLlm::new(scripted(
+            structure_json(&[("21", "42"), ("5", "10")], "lines"),
+            vec!["double", "double", "plus1"],
+            r#"{"inputs": ["1", "2", "3"]}"#,
+        ));
+        let exec = MockExec::new();
+        let r = block_on(generate(
+            &llm,
+            &exec,
+            &req(None),
+            settings(3),
+            &CancellationToken::new(),
+            |_| {},
+        ))
+        .unwrap();
+        assert_eq!(r.stats.solutions_passed, 2);
+        let c = exec.get();
+        assert_eq!(c.opened, 3, "one container per solution");
+        assert_eq!(c.compiles, 3, "examples and majority share the compile");
+        assert_eq!(c.closed, 3, "every container is removed");
+        // 3 × 2 examples + 2 survivors × 3 new inputs (examples not rerun).
+        assert_eq!(c.runs, 3 * 2 + 2 * 3);
+    }
+
+    #[test]
+    fn clear_majority_skips_repairs() {
+        let llm = MockLlm::new(scripted(
+            structure_json(&[("21", "42")], "lines"),
+            vec!["double", "SYNTAX", "double"],
+            r#"{"inputs": ["1"]}"#,
+        ));
+        let r = generate_with(&llm, req(None), 3).unwrap();
+        assert_eq!(r.stats.solutions_repaired, 0);
+        assert_eq!(r.stats.solutions_passed, 2);
+        // structure + 3 solutions + inputs, no repair request.
+        assert_eq!(r.stats.llm_calls, 5);
+        assert!(!llm.calls().iter().any(is_repair));
+        // Without a clear majority the broken one is repaired.
+        let llm = MockLlm::new(scripted(
+            structure_json(&[("21", "42")], "lines"),
+            vec!["double", "SYNTAX", "triple"],
+            r#"{"inputs": ["1"]}"#,
+        ));
+        let r = generate_with(&llm, req(None), 3).unwrap();
+        assert_eq!(r.stats.solutions_repaired, 1);
+    }
+
+    #[test]
+    fn model_error_in_one_of_n_solutions_is_a_failed_solution() {
+        let structure = structure_json(&[("21", "42")], "lines");
+        let calls = Mutex::new(0usize);
+        let llm = MockLlm::new(move |r: &ChatRequest, _| {
+            if is_structure(r) {
+                return Ok(structure.clone());
+            }
+            if is_inputs(r) {
+                return Ok(r#"{"inputs": ["1"]}"#.into());
+            }
+            let mut c = calls.lock().unwrap();
+            *c += 1;
+            if *c == 2 {
+                Err(AiError::Http("Zeitüberschreitung".into()))
+            } else {
+                Ok(program("double"))
+            }
+        });
+        let exec = MockExec::new();
+        let r = block_on(generate(
+            &llm,
+            &exec,
+            &req(None),
+            settings(3),
+            &CancellationToken::new(),
+            |_| {},
+        ))
+        .unwrap();
+        assert_eq!(r.stats.solutions_passed, 2);
+        assert_eq!(r.confidence.level, ConfidenceLevel::Green);
+        let c = exec.get();
+        assert_eq!(c.opened, c.closed);
+        // Every solution request failing is an error, not "red".
+        let e = generate_with(
+            &MockLlm::new({
+                let s = structure_json(&[("21", "42")], "lines");
+                move |r: &ChatRequest, _| {
+                    if is_structure(r) {
+                        Ok(s.clone())
+                    } else {
+                        Err(AiError::Http("weg".into()))
+                    }
+                }
+            }),
+            req(None),
+            3,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("weg"), "{e}");
+    }
+
+    #[test]
+    fn sandbox_error_aborts_and_removes_all_containers() {
+        let llm = MockLlm::new(scripted(
+            structure_json(&[("21", "42")], "lines"),
+            vec!["double"],
+            r#"{"inputs": ["1"]}"#,
+        ));
+        let mut exec = MockExec::new();
+        exec.fail_compile = Some(2);
+        let e = block_on(generate(
+            &llm,
+            &exec,
+            &req(None),
+            settings(3),
+            &CancellationToken::new(),
+            |_| {},
+        ))
+        .unwrap_err();
+        assert!(e.to_string().contains("Container-Engine"), "{e}");
+        let c = exec.get();
+        // Tasks not started yet stop before opening a container.
+        assert!(c.opened >= 2);
+        assert_eq!(c.closed, c.opened, "every container is removed");
+    }
+
+    #[test]
+    fn cancel_while_solutions_are_written() {
+        let token = CancellationToken::new();
+        let structure = structure_json(&[("21", "42")], "lines");
+        let llm = slow(
+            move |r: &ChatRequest, _| {
+                if is_structure(r) {
+                    Ok(structure.clone())
+                } else {
+                    Ok(program("double"))
+                }
+            },
+            vec![500, 500, 500],
+        );
+        let exec = MockExec::new();
+        let t = token.clone();
+        let started = std::time::Instant::now();
+        let r = block_on(async {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                t.cancel();
+            });
+            generate(&llm, &exec, &req(None), settings(3), &token, |_| {}).await
+        });
+        assert!(matches!(r, Err(AiError::Cancelled)), "{r:?}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+        let c = exec.get();
+        assert_eq!(c.opened, 3);
+        assert_eq!(c.closed, 3, "containers are removed after a cancel");
+        assert_eq!(c.compiles, 0);
     }
 }

@@ -612,6 +612,15 @@ pub struct SelectedModel {
     pub solutions: u32,
 }
 
+impl SelectedModel {
+    /// llama-server slots: one per solution plus one for the test inputs,
+    /// which are generated at the same time. OCR correction uses the same
+    /// number, so it reuses the running server.
+    pub fn server_slots(&self) -> usize {
+        self.solutions as usize + 1
+    }
+}
+
 pub fn selected_model() -> Result<SelectedModel, AiError> {
     let not_ready = || {
         AiError::Other(

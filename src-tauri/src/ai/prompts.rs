@@ -124,6 +124,15 @@ pub fn solution_messages(
     vec![ChatMessage::system(system), ChatMessage::user(user)]
 }
 
+/// Start of a solution answer (written into the prompt): the model
+/// continues inside the code block.
+pub fn code_prefill(language: &str) -> String {
+    format!("```{}\n", fence(language))
+}
+
+/// Generation stops at the closing fence: nothing after the code.
+pub const CODE_STOP: &str = "\n```";
+
 /// Follow-up after a failed compile: the previous answer plus the
 /// compiler message (truncated).
 pub fn repair_messages(

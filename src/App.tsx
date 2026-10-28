@@ -12,6 +12,7 @@ import {
   progressText,
   runTests,
   setEngine,
+  warmUpAi,
   startEngine,
   updateImages,
   type AiStatus,
@@ -225,6 +226,14 @@ export default function App() {
     if (compareMode === null) return "Bitte eine gültige Toleranz beim Vergleich eingeben.";
     return null;
   })();
+
+  // Warm-up: once the task text is confirmed and a model is ready, load the
+  // model in the background (cancellable with "Abbrechen", no error popups).
+  const aiReady = ai !== null && ai.modelReady && ai.runtimeAvailable;
+  useEffect(() => {
+    if (!taskConfirmed || !aiReady) return;
+    warmUpAi().catch(() => undefined);
+  }, [taskConfirmed, aiReady, ai?.selected]);
 
   // Generated tests are appended (never replace existing ones), up to
   // MAX_TESTS. The ref holds the current list (edits during generation).

@@ -186,6 +186,15 @@ async fn generate_tests(
     .await
 }
 
+/// Loads the selected model into llama-server in the background (called
+/// when the task text is confirmed). Cancellable via `cancel_ai`; errors
+/// are only returned for logging, the frontend shows none.
+#[tauri::command]
+async fn warm_up_ai() -> Result<bool, ai::AiError> {
+    let op = ai::Operation::start();
+    ai::llama::warm_up(&op.token).await
+}
+
 /// "Erkennungsfehler mit KI korrigieren": character-level corrections of
 /// OCR text as suggestions (nothing is applied here).
 #[tauri::command]
@@ -246,6 +255,7 @@ pub fn run() {
             delete_model,
             select_model,
             generate_tests,
+            warm_up_ai,
             suggest_ocr_fixes,
             cancel_ai
         ])

@@ -285,10 +285,17 @@ Ablauf (`src-tauri/src/ai/pipeline.rs`):
    (JSON, per JSON-Schema grammatikgebunden). Ein Beispiel zählt nur, wenn Ein- und
    Ausgabe **wörtlich** im Aufgabentext stehen (Zeilenenden und Leerraum am Zeilenrand
    egal) – erfundene Beispiele werden verworfen.
-2. **Lösungen:** 5 (1.5B-Modell) bzw. 3 (7B-Modell) unabhängige Lösungen, Temperatur 0,7.
-3. **Kompilieren** in der Sandbox; höchstens eine Reparaturrunde mit der Fehlermeldung.
+2. **Lösungen:** 5 (1.5B-Modell) bzw. 3 (7B-Modell) unabhängige Lösungen, Temperatur 0,7,
+   **gleichzeitig** erzeugt (llama-server mit einem Slot je Lösung; auf der CPU begrenzt die
+   Speicherbandbreite, mehrere Sequenzen kosten kaum mehr als eine). Die Antwort beginnt im
+   Codeblock und endet an dessen Ende (keine Erklärtexte).
+3. **Kompilieren** in der Sandbox, sobald eine Lösung fertig ist – ein Container je Lösung,
+   der auch für die Beispiele und den Mehrheitsentscheid dient (nur ein Kompilierlauf).
+   Höchstens eine Reparaturrunde mit der Fehlermeldung; sie entfällt, wenn schon eine klare
+   Mehrheit (mehr als die Hälfte, mindestens zwei) die Beispiele bestanden hat.
 4. **Beispiele des Blatts:** Lösungen, die sie nicht bestehen, fallen heraus.
-5. **Testeingaben:** höchstens 10, inklusive Grenzfällen – nur Eingaben.
+5. **Testeingaben:** höchstens 10, inklusive Grenzfällen – nur Eingaben; parallel zu den
+   Lösungen erzeugt.
 6. **Mehrheitsentscheid:** Alle verbliebenen Lösungen laufen auf jede Eingabe; die
    Ausgaben werden im gewählten Vergleichsmodus gruppiert, die größte Gruppe liefert den
    Erwartungswert. Ohne echte Mehrheit (z. B. 2 gegen 2) wird die Eingabe verworfen.
@@ -299,6 +306,12 @@ Ablauf (`src-tauri/src/ai/pipeline.rs`):
      verworfene Eingaben – die Testfälle sind **nur ein Hinweis**.
    - **Rot:** Keine Lösung besteht (oder keine Eingabe hat eine Mehrheit). Dann gibt es
      **keine** Testfälle, sondern eine ehrliche Meldung.
+
+Vor dem Laden des Modells prüft die App die Container-Engine und startet sie bei Bedarf
+selbst (wie beim „Prüfen“); fällt sie während des Laufs aus, wird sie neu verbunden bzw.
+gestartet und der Schritt wiederholt. Ist ein Modell gewählt, lädt die App es schon nach
+„Text geprüft und korrigiert“ im Hintergrund. Die Fortschrittsanzeige nennt Phase,
+„Lösung i von N“, Token/s und eine grobe Restzeit.
 
 Die Testfälle werden an die vorhandenen angehängt (höchstens 50 insgesamt), mit „KI“
 markiert und bleiben bearbeitbar. Die Musterlösung (die Lösung, die am häufigsten mit der
@@ -328,7 +341,13 @@ auch bei Weiterleitungen; feste Revision, SHA-256 und Größe aus dem Katalog,
 `src-tauri/src/ai/catalog.json`). llama-server lauscht nur auf `127.0.0.1` mit zufälligem
 API-Schlüssel und startet mit `--offline`. Aufgabentexte und Code verlassen den Rechner nie.
 
-**Modell offline einrichten:** Die `.gguf`-Datei (Links und Prüfsummen in `catalog.json`)
+**Modell einrichten:** Unter „KI-Modell …“ beim empfohlenen Eintrag „Herunterladen“, danach
+„Auswählen“. Revision, Dateiname, Größe und SHA-256 trägt der Release-Workflow aus der
+Hugging-Face-API ein (`scripts/pin-models.sh`) und nennt sie in den Release-Notizen; im
+Repository ist der Katalog nicht gepinnt, Entwickler-Builds haben deshalb keinen
+Download-Knopf.
+
+**Modell offline einrichten** (unter „Weitere Optionen (ohne Internet)“): Die `.gguf`-Datei (Links und Prüfsummen in `catalog.json`)
 auf einem Rechner mit Internet herunterladen, z. B. per USB-Stick übertragen und unter
 „KI-Modell …“ beim passenden Eintrag mit „Datei importieren …“ einlesen (erwartet:
 `*q5_k_m*.gguf` für 1.5B, `*q4_k_m*.gguf` für 7B; ist die Datei auf Hugging Face in Teile
