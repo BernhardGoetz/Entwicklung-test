@@ -26,7 +26,7 @@ if [ "${1:-}" = "--check" ]; then
     | select((.revision | test("^[0-9a-f]{40}$") | not)
         or (.files | length) == 0
         or any(.files[]; (.sha256 | test("^[0-9a-f]{64}$") | not) or .size <= 0))
-    | .id' "$catalog")"
+    | .id' "$catalog" | tr '\n' ' ')"
   if [ -n "$unpinned" ]; then
     echo "Nicht gepinnte Modelle in catalog.json: $unpinned (scripts/pin-models.sh ausführen)" >&2
     exit 1

@@ -9,7 +9,9 @@ name: Release
 #     per Digest aus der Registry geholt, dazu image-digests.json mit den
 #     Prüfsummen, gegen die die App Archive und Downloads prüft,
 #  3. den Windows-Installer (NSIS, x64) und macOS-DMGs (Apple Silicon + Intel)
-#     mit eingebetteten Images (src-tauri/tauri.release.conf.json),
+#     mit eingebetteten Images und llama-server (KI-Laufzeit, Version und
+#     SHA-256 gepinnt in scripts/fetch-llama-server.sh;
+#     src-tauri/tauri.release.conf.json). KI-Modelle sind nicht enthalten.
 #  4. ein Entwurfs-Release (draft) mit allen Installern, SHA256SUMS.txt und
 #     einer Build-Provenance-Attestierung (gh attestation verify …).
 # Die App erwartet <IMAGE_REGISTRY>/code-pruefer-<sprache>:<Cargo-Version>;
@@ -72,6 +74,9 @@ jobs:
             echo "::error::Die App erwartet Images unter $app_registry, der Workflow würde nach $registry pushen (IMAGE_REGISTRY in languages.rs anpassen)."
             exit 1
           fi
+          # KI-Modellkatalog: Revision, Größe und SHA-256 müssen eingetragen sein
+          # (sonst könnte die App kein Modell herunterladen).
+          scripts/pin-models.sh --check
           echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
           echo "registry=$registry" >> "$GITHUB_OUTPUT"
           echo "Images: $registry/code-pruefer-<sprache>:$cargo_version" >> "$GITHUB_STEP_SUMMARY"
@@ -192,6 +197,26 @@ jobs:
         shell: bash
         run: jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
 
+      - name: llama-server (KI-Laufzeit, Windows x64) holen und prüfen
+        shell: bash
+        run: scripts/fetch-llama-server.sh win-x64
+
+      # llama-server braucht die Visual-C++-Laufzeit (MSVCP140.dll,
+      # VCRUNTIME140.dll, VCRUNTIME140_1.dll), die nicht auf jedem Windows
+      # installiert ist. Sie wird app-lokal neben llama-server.exe gelegt
+      # (Redist-Ordner der Visual-Studio-Installation des Runners).
+      - name: Visual-C++-Laufzeit für llama-server
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem -Path "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "Visual-C++-Redist-Ordner nicht gefunden" }
+          foreach ($dll in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
+            Copy-Item (Join-Path $crt.FullName $dll) src-tauri/resources/llama/
+          }
+          Get-ChildItem src-tauri/resources/llama
+
       - run: npm ci
 
       # OPTIONAL – wird übersprungen, solange das Secret WINDOWS_CERTIFICATE
@@ -218,7 +243,7 @@ jobs:
           } } }
           $config | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 src-tauri/tauri.sign.conf.json
 
-      - name: Installer bauen (NSIS, deutsch, mit Images)
+      - name: Installer bauen (NSIS, deutsch, mit Images und KI-Laufzeit)
         shell: bash
         run: |
           sign=()
@@ -244,11 +269,13 @@ jobs:
             runner: macos-15
             target: aarch64-apple-darwin
             arch: arm64
+            llama: macos-arm64
           # Intel-Build per Cross-Kompilierung auf dem (Apple-Silicon-)Runner.
           - name: macos-x64
             runner: macos-15
             target: x86_64-apple-darwin
             arch: amd64
+            llama: macos-x64
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -258,6 +285,7 @@ jobs:
     environment: release
     env:
       TARGET: ${{ matrix.target }}
+      LLAMA_PLATFORM: ${{ matrix.llama }}
       # Secrets sind in `if:` nicht direkt verfügbar.
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
@@ -287,6 +315,9 @@ jobs:
 
       - name: image-digests.json zusammenführen
         run: jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
+
+      - name: llama-server (KI-Laufzeit) holen und prüfen
+        run: scripts/fetch-llama-server.sh "$LLAMA_PLATFORM"
 
       - run: npm ci
 
@@ -369,7 +400,10 @@ jobs:
             \`gh attestation verify <Datei> --repo ${GH_REPO}\`
 
           Die Runner-Images (Python, Java) sind in den Installern enthalten und werden
-          beim ersten Start automatisch in Docker bzw. Podman geladen. Online-Update:
+          beim ersten Start automatisch in Docker bzw. Podman geladen. Die KI-Laufzeit
+          (llama.cpp) ist enthalten, das KI-Modell nicht: es wird in der App einmalig
+          von huggingface.co geladen oder als .gguf-Datei importiert
+          (Lizenzen: THIRD_PARTY_NOTICES.txt). Online-Update:
           \`${REGISTRY}/code-pruefer-python:${VERSION}\`
           und \`${REGISTRY}/code-pruefer-java:${VERSION}\`.
           EOF

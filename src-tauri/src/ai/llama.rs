@@ -547,6 +547,8 @@ mod tests {
             script.contains(&format!("version=\"{LLAMA_CPP_VERSION}\"")),
             "fetch-llama-server.sh pins another llama.cpp version"
         );
+        let notices = std::fs::read_to_string(root.join("../THIRD_PARTY_NOTICES.txt")).unwrap();
+        assert!(notices.contains(&format!("Release {LLAMA_CPP_VERSION}")));
     }
 
     #[test]
