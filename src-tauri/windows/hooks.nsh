@@ -4,6 +4,9 @@
 ; installation page, stores the choice in HKCU\Software\Code-Pruefer\Engine
 ; ("docker" | "podman", default "docker") and, if the chosen engine is
 ; missing, offers to install it with winget (or opens the download page).
+; winget is only started via its absolute path in the user's WindowsApps
+; folder, never as a bare "winget" (Windows would also look for it next to
+; the installer, e.g. in the Downloads folder).
 ; A failed engine installation never fails the Code-Prüfer installation.
 ;
 ; The page is inserted via the macro CODE_PRUEFER_CUSTOM_PAGES, which our
@@ -26,6 +29,7 @@
   Var CpUrl           ; official download page
   Var CpWingetId      ; winget package id
   Var CpFound         ; "1" if the chosen engine is installed
+  Var CpWinget        ; absolute path of winget.exe
 
   Page custom CpEnginePageCreate CpEnginePageLeave
 
@@ -133,17 +137,22 @@
     cp_install:
 
     ; winget ("App-Installer") is missing on some older/managed systems.
-    nsExec::Exec 'winget --version'
-    Pop $0
+    ; Its app execution alias lives in the user's WindowsApps folder.
+    StrCpy $CpWinget "$LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
+    StrCpy $0 "nicht gefunden"
+    ${If} ${FileExists} "$CpWinget"
+      nsExec::Exec '"$CpWinget" --version'
+      Pop $0
+    ${EndIf}
     ${If} $0 != 0
-      DetailPrint "winget ist nicht verfügbar ($0)."
+      DetailPrint "winget ist nicht verfügbar ($CpWinget: $0)."
       MessageBox MB_OK|MB_ICONEXCLAMATION "Die automatische Installation ist nicht möglich, weil winget (App-Installer) auf diesem Computer nicht verfügbar ist.$\r$\n$\r$\nBitte $CpName manuell installieren."
       Call CpOpenDownloadPage
       Return
     ${EndIf}
 
     DetailPrint "Installiere $CpName über winget – das kann einige Minuten dauern …"
-    nsExec::ExecToLog 'winget install -e --id $CpWingetId --accept-package-agreements --accept-source-agreements'
+    nsExec::ExecToLog '"$CpWinget" install -e --id $CpWingetId --source winget --accept-package-agreements --accept-source-agreements --disable-interactivity'
     Pop $0
     ${If} $0 == 0
       DetailPrint "$CpName wurde installiert."
