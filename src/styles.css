@@ -80,6 +80,12 @@ textarea.task { font-family: ui-monospace, Menlo, Consolas, monospace; }
 .fix-old mark { background: var(--fail-bg); color: var(--fail); text-decoration: line-through; }
 .fix-new mark { background: var(--ok-bg); color: var(--ok); }
 .compare-mode { display: flex; align-items: center; gap: 4px 12px; flex-wrap: wrap; }
+/* Visible whitespace: markers are muted and not selectable, the real characters stay copyable. */
+.ws { position: relative; }
+.ws-mark { color: var(--muted); opacity: 0.75; user-select: none; -webkit-user-select: none; }
+.ws-real { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: pre; }
+.field-status { font-size: 11px; color: var(--muted); min-height: 1em; }
+.field-status.warn-text { color: var(--warn); }
 input.tolerance { width: 7em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; }
 input.tolerance.invalid { border-color: var(--fail); }
 button {

@@ -106,6 +106,7 @@ async fn load_via_app(archived_as: &str) {
             }],
             trim_whitespace: true,
             compare_mode: None,
+            forbid_trailing_newline: false,
         },
         |_| {},
     )

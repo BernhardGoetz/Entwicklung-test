@@ -1,5 +1,7 @@
+import { useState } from "react";
 import type { CompareMode, TestCase } from "../api";
 import { CompareModeSelect } from "./CompareModeSelect";
+import { endingStatus, endsWithNewline } from "./VisibleWhitespace";
 
 interface Props {
   tests: TestCase[];
@@ -9,6 +11,9 @@ interface Props {
   onCompareModeChange: (mode: CompareMode | null) => void;
   /** Changes when the mode is set from outside (AI suggestion). */
   compareModeKey?: number;
+  /** „Zeilenumbruch am Ende verbieten“ (independent of the compare mode). */
+  forbidTrailingNewline: boolean;
+  onForbidTrailingNewlineChange: (forbid: boolean) => void;
 }
 
 /** Same limit as MAX_TESTS in src-tauri/src/runner/mod.rs. */
@@ -22,16 +27,54 @@ export const newTestCase = (n: number): TestCase => ({
   expected: "",
 });
 
-export function TestCaseEditor({ tests, onChange, compareMode, onCompareModeChange, compareModeKey }: Props) {
+export function TestCaseEditor({
+  tests,
+  onChange,
+  compareMode,
+  onCompareModeChange,
+  compareModeKey,
+  forbidTrailingNewline,
+  onForbidTrailingNewlineChange,
+}: Props) {
   const update = (id: number, patch: Partial<TestCase>) =>
     onChange(tests.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  // AI expected outputs are the executed reference solution; if that ends
+  // with a line break, the forbid option can make these tests fail. The
+  // hint is shown once (again only when more such tests appear).
+  const aiWithNewline = forbidTrailingNewline
+    ? tests.filter((t) => t.origin === "ai" && endsWithNewline(t.expected)).length
+    : 0;
+  const [hintDismissedAt, setHintDismissedAt] = useState(0);
 
   return (
     <section className="card">
       <div className="card-header">
         <h2>Testfälle</h2>
-        <CompareModeSelect key={compareModeKey} value={compareMode} onChange={onCompareModeChange} />
+        <div className="compare-mode small">
+          <CompareModeSelect key={compareModeKey} value={compareMode} onChange={onCompareModeChange} />
+          <label
+            className="inline"
+            title="Jede Ausgabe, die mit einem Zeilenumbruch endet (z. B. durch println oder print()), gilt als nicht bestanden – unabhängig vom Vergleich und von der erwarteten Ausgabe."
+          >
+            <input
+              type="checkbox"
+              checked={forbidTrailingNewline}
+              onChange={(e) => onForbidTrailingNewlineChange(e.target.checked)}
+            />{" "}
+            Zeilenumbruch am Ende verbieten
+          </label>
+        </div>
       </div>
+      {aiWithNewline > hintDismissedAt && (
+        <div className="hint small">
+          Die erwarteten Ausgaben der KI-Testfälle stammen aus der ausgeführten Musterlösung – und die
+          endet selbst mit einem Zeilenumbruch ({aiWithNewline}{" "}
+          {aiWithNewline === 1 ? "Testfall" : "Testfälle"}). Mit „Zeilenumbruch am Ende verbieten“
+          können diese Tests deshalb fehlschlagen, bei „Zeilen (exakt)“ ohne Ignorieren des
+          Zeilenendes sogar immer. Bitte die erwartete Ausgabe prüfen.{" "}
+          <button onClick={() => setHintDismissedAt(aiWithNewline)}>Verstanden</button>
+        </div>
+      )}
       {tests.length === 0 && <p className="muted">Noch keine Testfälle angelegt.</p>}
       {tests.map((t) => (
         <div key={t.id} className="testcase">
@@ -73,6 +116,15 @@ export function TestCaseEditor({ tests, onChange, compareMode, onCompareModeChan
                 spellCheck={false}
                 onChange={(e) => update(t.id, { expected: e.target.value })}
               />
+              <span
+                className={
+                  forbidTrailingNewline && endsWithNewline(t.expected)
+                    ? "field-status warn-text"
+                    : "field-status"
+                }
+              >
+                {endingStatus(t.expected)}
+              </span>
             </label>
           </div>
         </div>

@@ -266,7 +266,18 @@ Testfällen):
 - **Zahlen mit Toleranz** – wie „Wörter“; ist das erwartete Wort eine Zahl, darf die
   Ausgabe absolut oder relativ um die Toleranz abweichen (z. B. `1e-6`).
 
-Der Diff in den Ergebnissen ist immer zeilenbasiert.
+Der Diff in den Ergebnissen ist immer zeilenbasiert. Leerzeichen am Zeilenende werden dort
+und in der stdout-Anzeige als `·` dargestellt, ein Zeilenumbruch am Ende als `⏎` (nur
+Anzeige; kopiert wird der Originaltext). Unter jeder erwarteten Ausgabe steht, ob sie mit
+einem Zeilenumbruch endet und in welchen Zeilen Leerzeichen am Ende stehen. Unterscheiden
+sich erwartete und tatsächliche Ausgabe nur dort, zeigt das Ergebnis den Hinweis
+„Unterschied nur am Zeilenende (Leerzeichen/Zeilenumbruch)“.
+
+**Zeilenumbruch am Ende verbieten** (unabhängig vom Modus): Endet die Ausgabe mit einem
+Zeilenumbruch (z. B. durch `println` oder `print()`), ist der Test nicht bestanden – egal,
+was die erwartete Ausgabe enthält. Die KI-Testfälle übernehmen die Ausgabe der Musterlösung
+unverändert; endet diese selbst mit einem Zeilenumbruch, weist der Testfall-Editor einmalig
+darauf hin.
 
 ## KI und Texterkennung
 

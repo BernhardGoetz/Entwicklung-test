@@ -44,6 +44,7 @@ async fn run(language: &str, code: &str, tests: Vec<TestCase>) -> RunReport {
             tests,
             trim_whitespace: true,
             compare_mode: None,
+            forbid_trailing_newline: false,
         },
         |_| {},
     )
@@ -194,6 +195,7 @@ async fn tokens_mode_ignores_line_structure() {
         tests: vec![tc("3\n", "0\n1\n2\n")],
         trim_whitespace: true,
         compare_mode: Some(mode),
+        forbid_trailing_newline: false,
     };
     let tokens = CompareMode::Tokens {
         case_sensitive: true,
@@ -206,6 +208,39 @@ async fn tokens_mode_ignores_line_structure() {
         .await
         .unwrap();
     assert_eq!(statuses(&r), vec![TestStatus::Failed]);
+}
+
+#[tokio::test]
+#[ignore = "benötigt Docker und die Runner-Images"]
+async fn forbid_trailing_newline_rejects_print() {
+    setup();
+    let request = |code: &str, forbid| RunRequest {
+        language: "python".into(),
+        code: code.into(),
+        tests: vec![tc("", "Hallo")],
+        trim_whitespace: true,
+        compare_mode: None,
+        forbid_trailing_newline: forbid,
+    };
+    let with_newline = "print('Hallo')\n";
+    let without = "print('Hallo', end='')\n";
+    let r = runner::run_submission(request(with_newline, true), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(statuses(&r), vec![TestStatus::Failed]);
+    assert_eq!(
+        r.tests[0].message.as_deref(),
+        Some(runner::TRAILING_NEWLINE_FORBIDDEN)
+    );
+    let r = runner::run_submission(request(without, true), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(statuses(&r), vec![TestStatus::Passed], "{:?}", r.tests[0]);
+    // Off (trimmed lines): both pass.
+    let r = runner::run_submission(request(with_newline, false), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(statuses(&r), vec![TestStatus::Passed]);
 }
 
 #[tokio::test]
@@ -337,6 +372,7 @@ async fn falls_back_to_local_dev_image_without_override() {
             tests: vec![tc("x\n", "x\n")],
             trim_whitespace: true,
             compare_mode: None,
+            forbid_trailing_newline: false,
         },
         |_| {},
     )
@@ -364,6 +400,7 @@ async fn missing_override_image_gives_actionable_error() {
             tests: vec![tc("", "1")],
             trim_whitespace: true,
             compare_mode: None,
+            forbid_trailing_newline: false,
         },
         |_| {},
     )

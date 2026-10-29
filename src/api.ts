@@ -46,6 +46,8 @@ export type DiffKind = "equal" | "expected" | "actual";
 export interface DiffLine {
   kind: DiffKind;
   text: string;
+  /** Last line of its output, and that output ends with a line break. */
+  finalNewline: boolean;
 }
 
 export type TestStatus = "passed" | "failed" | "timeout" | "runtimeError" | "error";
@@ -57,6 +59,8 @@ export interface TestResult {
   output: StepOutput | null;
   diff: DiffLine[];
   message: string | null;
+  /** Failed, and the outputs differ only in trailing whitespace/line breaks. */
+  onlyTrailingWhitespaceDiffers: boolean;
 }
 
 export interface RunReport {
@@ -99,6 +103,8 @@ export interface RunRequest {
   tests: { name: string; input: string; expected: string }[];
   trimWhitespace: boolean;
   compareMode?: CompareMode;
+  /** Outputs ending with a line break fail (independent of the mode). */
+  forbidTrailingNewline?: boolean;
 }
 
 export const dockerStatus = () => invoke<DockerStatus>("docker_status");

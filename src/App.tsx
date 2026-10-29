@@ -64,6 +64,8 @@ export default function App() {
     { ...newTestCase(1), input: "Welt\n", expected: "Hallo, Welt!\n" },
   ]);
   const [compareMode, setCompareMode] = useState<CompareMode | null>({ kind: "lines", trim: true });
+  // „Zeilenumbruch am Ende verbieten“: independent of the compare mode.
+  const [forbidTrailingNewline, setForbidTrailingNewline] = useState(false);
   // Remounts the mode select when the mode is set from the AI suggestion.
   const [compareModeKey, setCompareModeKey] = useState(0);
   // Local AI: model status, setup dialog, generation running.
@@ -276,6 +278,7 @@ export default function App() {
         // Old field kept for the default (lines) comparison.
         trimWhitespace: compareMode.kind === "lines" ? compareMode.trim : true,
         compareMode,
+        forbidTrailingNewline,
       });
       setReport(r);
       // The backend may have started the engine.
@@ -360,6 +363,8 @@ export default function App() {
             compareMode={compareMode}
             onCompareModeChange={setCompareMode}
             compareModeKey={compareModeKey}
+            forbidTrailingNewline={forbidTrailingNewline}
+            onForbidTrailingNewlineChange={setForbidTrailingNewline}
           />
           <div className="toolbar">
             <button className="primary" onClick={onRun} disabled={!canRun}>

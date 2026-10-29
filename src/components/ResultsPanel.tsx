@@ -1,5 +1,6 @@
 import type { RunReport, StepOutput, TestResult, TestStatus } from "../api";
 import { DiffView } from "./DiffView";
+import { VisibleWhitespace } from "./VisibleWhitespace";
 
 const LABEL: Record<TestStatus, string> = {
   passed: "Bestanden",
@@ -17,7 +18,8 @@ function Output({ title, text, truncated }: { title: string; text: string; trunc
         {title}
         {truncated && " (nach 64 KB abgeschnitten)"}
       </summary>
-      <pre className="output">{text}</pre>
+      {/* stdout: trailing spaces and the final line break made visible. */}
+      <pre className="output">{title === "stdout" ? <VisibleWhitespace text={text} /> : text}</pre>
     </details>
   );
 }
@@ -40,6 +42,9 @@ function TestRow({ t }: { t: TestResult }) {
         {t.output && <span className="muted small">{t.output.durationMs} ms</span>}
       </div>
       {t.message && <p className="small">{t.message}</p>}
+      {t.onlyTrailingWhitespaceDiffers && (
+        <p className="hint small">Unterschied nur am Zeilenende (Leerzeichen/Zeilenumbruch)</p>
+      )}
       <DiffView diff={t.diff} />
       {t.output && <StepOutputs out={t.output} />}
     </div>

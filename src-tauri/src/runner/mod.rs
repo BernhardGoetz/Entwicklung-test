@@ -7,7 +7,10 @@ pub mod languages;
 
 use serde::{Deserialize, Serialize};
 
-use compare::{line_diff, normalize_newlines, CompareMode, DiffLine};
+use compare::{
+    ends_with_newline, line_diff, normalize_newlines, only_trailing_whitespace_differs,
+    CompareMode, DiffLine,
+};
 use docker::{PullProgress, Sandbox, STDIN_FILE};
 
 /// Maximum accepted size of source code and of a single test input/expectation.
@@ -85,6 +88,10 @@ pub struct RunRequest {
     /// How outputs are compared; `None` = lines, trimmed per `trim_whitespace`.
     #[serde(default)]
     pub compare_mode: Option<CompareMode>,
+    /// Fail every test whose stdout ends with a line break, independent of
+    /// the comparison mode and the expected output (default off).
+    #[serde(default)]
+    pub forbid_trailing_newline: bool,
 }
 
 impl RunRequest {
@@ -166,7 +173,14 @@ pub struct TestResult {
     pub diff: Vec<DiffLine>,
     /// Additional German explanation (e.g. timeout, memory limit).
     pub message: Option<String>,
+    /// Failed, and expected and actual output differ only in trailing
+    /// whitespace per line or line breaks/empty lines at the end.
+    pub only_trailing_whitespace_differs: bool,
 }
+
+/// German message when [`RunRequest::forbid_trailing_newline`] rejects an output.
+pub const TRAILING_NEWLINE_FORBIDDEN: &str =
+    "Die Ausgabe endet mit einem Zeilenumbruch – laut Einstellung nicht erlaubt.";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -483,7 +497,15 @@ async fn run_in_sandbox(
             test.name.clone()
         };
         let result = match run_input(sandbox, lang, &test.input).await {
-            Ok(out) => evaluate(index, name, out, &test.expected, &mode, lang),
+            Ok(out) => evaluate(
+                index,
+                name,
+                out,
+                &test.expected,
+                &mode,
+                req.forbid_trailing_newline,
+                lang,
+            ),
             Err(e) => TestResult {
                 index,
                 name,
@@ -491,6 +513,7 @@ async fn run_in_sandbox(
                 output: None,
                 diff: Vec::new(),
                 message: Some(e.to_string()),
+                only_trailing_whitespace_differs: false,
             },
         };
         results.push(result);
@@ -498,16 +521,20 @@ async fn run_in_sandbox(
     Ok((compile, true, results))
 }
 
-/// Classifies a finished test run. Pure, unit-tested.
+/// Classifies a finished test run. With `forbid_trailing_newline`, an
+/// output ending with a line break fails even if it matches. Pure,
+/// unit-tested.
 pub fn evaluate(
     index: usize,
     name: String,
     out: docker::ExecOutput,
     expected: &str,
     mode: &CompareMode,
+    forbid_trailing_newline: bool,
     lang: &languages::LanguageConfig,
 ) -> TestResult {
     let matches = mode.matches(expected, &out.stdout);
+    let newline_forbidden = forbid_trailing_newline && ends_with_newline(&out.stdout);
     let diff = if matches {
         Vec::new()
     } else {
@@ -531,11 +558,19 @@ pub fn evaluate(
             None => "Exit-Code unbekannt.".to_string(),
         };
         (TestStatus::RuntimeError, Some(msg))
+    } else if newline_forbidden {
+        (
+            TestStatus::Failed,
+            Some(TRAILING_NEWLINE_FORBIDDEN.to_string()),
+        )
     } else if matches {
         (TestStatus::Passed, None)
     } else {
         (TestStatus::Failed, None)
     };
+    let only_trailing_whitespace_differs = status == TestStatus::Failed
+        && !matches
+        && only_trailing_whitespace_differs(expected, &out.stdout);
     let message = match (message, out.stdout_truncated) {
         (m, true) => Some(
             [
@@ -555,6 +590,7 @@ pub fn evaluate(
         output: Some(out.into()),
         diff,
         message,
+        only_trailing_whitespace_differs,
     }
 }
 
@@ -584,6 +620,7 @@ mod tests {
             out("42\n", Some(0), false),
             "42\r\n",
             &CompareMode::lines(true),
+            false,
             py(),
         );
         assert_eq!(r.status, TestStatus::Passed);
@@ -598,6 +635,7 @@ mod tests {
             out("41\n", Some(0), false),
             "42\n",
             &CompareMode::lines(true),
+            false,
             py(),
         );
         assert_eq!(r.status, TestStatus::Failed);
@@ -612,6 +650,7 @@ mod tests {
             out("", None, true),
             "x",
             &CompareMode::lines(true),
+            false,
             py(),
         );
         assert_eq!(r.status, TestStatus::Timeout);
@@ -622,6 +661,7 @@ mod tests {
             out("x\n", Some(1), false),
             "x",
             &CompareMode::lines(true),
+            false,
             py(),
         );
         assert_eq!(r.status, TestStatus::RuntimeError);
@@ -631,7 +671,15 @@ mod tests {
     fn evaluate_marks_truncation() {
         let mut o = out("x", Some(0), false);
         o.stdout_truncated = true;
-        let r = evaluate(0, "t".into(), o, "y", &CompareMode::lines(true), py());
+        let r = evaluate(
+            0,
+            "t".into(),
+            o,
+            "y",
+            &CompareMode::lines(true),
+            false,
+            py(),
+        );
         assert!(r.message.unwrap().contains("64 KB"));
     }
 
@@ -668,6 +716,7 @@ mod tests {
                 .collect(),
             trim_whitespace: true,
             compare_mode: None,
+            forbid_trailing_newline: false,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -690,6 +739,138 @@ mod tests {
         .unwrap();
         assert!(req.trim_whitespace);
         assert_eq!(req.mode(), CompareMode::lines(true));
+        assert!(!req.forbid_trailing_newline);
+        let req: RunRequest = serde_json::from_str(
+            r#"{"language":"python","code":"","tests":[],"forbidTrailingNewline":true}"#,
+        )
+        .unwrap();
+        assert!(req.forbid_trailing_newline);
+    }
+
+    fn eval_forbid(stdout: &str, expected: &str, mode: CompareMode) -> TestResult {
+        evaluate(
+            0,
+            "t".into(),
+            out(stdout, Some(0), false),
+            expected,
+            &mode,
+            true,
+            py(),
+        )
+    }
+
+    #[test]
+    fn forbidden_trailing_newline_fails_in_every_mode() {
+        let modes = [
+            CompareMode::lines(true),
+            CompareMode::lines(false),
+            CompareMode::Tokens {
+                case_sensitive: true,
+            },
+            CompareMode::Float {
+                abs_tol: 1e-6,
+                rel_tol: 1e-6,
+            },
+        ];
+        for mode in modes {
+            // Fails although the output equals the expected output.
+            for stdout in ["42\n", "42\r\n", "42\r", "\n"] {
+                let expected = if stdout == "\n" { "" } else { "42\n" };
+                let r = eval_forbid(stdout, expected, mode);
+                assert_eq!(r.status, TestStatus::Failed, "{mode:?} {stdout:?}");
+                assert_eq!(
+                    r.message.as_deref(),
+                    Some(TRAILING_NEWLINE_FORBIDDEN),
+                    "{mode:?}"
+                );
+            }
+            // Without a final line break: compared as usual.
+            let r = eval_forbid("42", "42", mode);
+            assert_eq!(r.status, TestStatus::Passed, "{mode:?}");
+            assert!(r.message.is_none());
+            let r = eval_forbid("41", "42", mode);
+            assert_eq!(r.status, TestStatus::Failed, "{mode:?}");
+            assert!(r.message.is_none());
+            // Empty output has no line break.
+            let r = eval_forbid("", "", mode);
+            assert_eq!(r.status, TestStatus::Passed, "{mode:?}");
+        }
+        // Expected output with a line break: trimmed lines still pass,
+        // exact lines fail (expected and actual differ at the end).
+        assert_eq!(
+            eval_forbid("42", "42\n", CompareMode::lines(true)).status,
+            TestStatus::Passed
+        );
+        let r = eval_forbid("42", "42\n", CompareMode::lines(false));
+        assert_eq!(r.status, TestStatus::Failed);
+        assert!(r.only_trailing_whitespace_differs);
+        // Off: line breaks at the end are fine.
+        let r = evaluate(
+            0,
+            "t".into(),
+            out("42\n", Some(0), false),
+            "42\n",
+            &CompareMode::lines(false),
+            false,
+            py(),
+        );
+        assert_eq!(r.status, TestStatus::Passed);
+    }
+
+    #[test]
+    fn forbidden_newline_does_not_hide_runtime_errors() {
+        let r = evaluate(
+            0,
+            "t".into(),
+            out("x\n", Some(1), false),
+            "x\n",
+            &CompareMode::lines(true),
+            true,
+            py(),
+        );
+        assert_eq!(r.status, TestStatus::RuntimeError);
+        assert!(!r.message.unwrap().contains("Zeilenumbruch"));
+    }
+
+    #[test]
+    fn evaluate_flags_trailing_whitespace_only_differences() {
+        let exact = CompareMode::lines(false);
+        let eval = |stdout: &str, expected: &str, mode: &CompareMode| {
+            evaluate(
+                0,
+                "t".into(),
+                out(stdout, Some(0), false),
+                expected,
+                mode,
+                false,
+                py(),
+            )
+        };
+        let r = eval("Hallo\n", "Hallo", &exact);
+        assert_eq!(r.status, TestStatus::Failed);
+        assert!(r.only_trailing_whitespace_differs);
+        // The diff shows the difference (final line break).
+        assert_eq!(r.diff.len(), 2);
+        assert!(r.diff[1].final_newline);
+        assert!(eval("a  \nb", "a\nb", &exact).only_trailing_whitespace_differs);
+        assert!(!eval("b\n", "a\n", &exact).only_trailing_whitespace_differs);
+        // Passed tests never carry the flag.
+        let r = eval("Hallo\n", "Hallo", &CompareMode::lines(true));
+        assert_eq!(r.status, TestStatus::Passed);
+        assert!(!r.only_trailing_whitespace_differs);
+        // Runtime errors neither.
+        let r = evaluate(
+            0,
+            "t".into(),
+            out("a\n", Some(1), false),
+            "a",
+            &exact,
+            false,
+            py(),
+        );
+        assert!(!r.only_trailing_whitespace_differs);
+        let json = serde_json::to_value(eval("a\n", "a", &exact)).unwrap();
+        assert_eq!(json["onlyTrailingWhitespaceDiffers"], true);
     }
 
     #[test]
@@ -723,6 +904,7 @@ mod tests {
             out("1  2\n3\n", Some(0), false),
             "1 2 3",
             &tokens,
+            false,
             py(),
         );
         assert_eq!(r.status, TestStatus::Passed);
@@ -736,6 +918,7 @@ mod tests {
             out("0.3334\n", Some(0), false),
             "0.3333",
             &float,
+            false,
             py(),
         );
         assert_eq!(r.status, TestStatus::Passed);
@@ -745,6 +928,7 @@ mod tests {
             out("0.34\n", Some(0), false),
             "0.3333",
             &float,
+            false,
             py(),
         );
         assert_eq!(r.status, TestStatus::Failed);
@@ -770,6 +954,7 @@ mod tests {
                 abs_tol: -1.0,
                 rel_tol: 0.0,
             }),
+            forbid_trailing_newline: false,
         };
         let msg = block_on(run_submission(req, |_| {}))
             .unwrap_err()

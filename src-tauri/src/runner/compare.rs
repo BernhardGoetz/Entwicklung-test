@@ -36,6 +36,17 @@ pub fn outputs_match(expected: &str, actual: &str, trim: bool) -> bool {
     normalize_output(expected, trim) == normalize_output(actual, trim)
 }
 
+/// Whether the output ends with a line break (after CRLF/CR normalization).
+pub fn ends_with_newline(s: &str) -> bool {
+    s.ends_with('\n') || s.ends_with('\r')
+}
+
+/// Whether two outputs differ, but only in trailing whitespace per line or
+/// trailing newlines/empty lines – i.e. they are equal once trimmed.
+pub fn only_trailing_whitespace_differs(expected: &str, actual: &str) -> bool {
+    !outputs_match(expected, actual, false) && outputs_match(expected, actual, true)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -237,25 +248,40 @@ pub enum DiffKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DiffLine {
     pub kind: DiffKind,
     pub text: String,
+    /// The line is the last one of its output and that output ends with a
+    /// line break (shown as ⏎). Part of the comparison, so `"a"` and `"a\n"`
+    /// show up as different lines.
+    pub final_newline: bool,
 }
 
-fn split_lines(s: &str) -> Vec<&str> {
+/// Lines with the final-newline flag of the last line.
+fn split_lines(s: &str) -> Vec<(&str, bool)> {
     if s.is_empty() {
         return Vec::new();
     }
-    s.strip_suffix('\n').unwrap_or(s).split('\n').collect()
+    let (body, final_newline) = match s.strip_suffix('\n') {
+        Some(b) => (b, true),
+        None => (s, false),
+    };
+    let mut lines: Vec<(&str, bool)> = body.split('\n').map(|l| (l, false)).collect();
+    if let Some(last) = lines.last_mut() {
+        last.1 = final_newline;
+    }
+    lines
 }
 
 /// Line diff of already normalized texts.
 pub fn line_diff(expected: &str, actual: &str) -> Vec<DiffLine> {
     let a = split_lines(expected);
     let b = split_lines(actual);
-    let line = |kind, text: &str| DiffLine {
+    let line = |kind, &(text, final_newline): &(&str, bool)| DiffLine {
         kind,
         text: text.to_string(),
+        final_newline,
     };
 
     if a.len().saturating_mul(b.len()) > LCS_CELL_LIMIT {
@@ -293,14 +319,14 @@ pub fn line_diff(expected: &str, actual: &str) -> Vec<DiffLine> {
     let mut out = Vec::with_capacity(n.max(m));
     while i < n && j < m {
         if a[i] == b[j] {
-            out.push(line(DiffKind::Equal, a[i]));
+            out.push(line(DiffKind::Equal, &a[i]));
             i += 1;
             j += 1;
         } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            out.push(line(DiffKind::Expected, a[i]));
+            out.push(line(DiffKind::Expected, &a[i]));
             i += 1;
         } else {
-            out.push(line(DiffKind::Actual, b[j]));
+            out.push(line(DiffKind::Actual, &b[j]));
             j += 1;
         }
     }
@@ -551,7 +577,8 @@ mod tests {
             d,
             vec![DiffLine {
                 kind: DiffKind::Expected,
-                text: "a".into()
+                text: "a".into(),
+                final_newline: true,
             }]
         );
         let d = line_diff("", "b");
@@ -559,9 +586,61 @@ mod tests {
             d,
             vec![DiffLine {
                 kind: DiffKind::Actual,
-                text: "b".into()
+                text: "b".into(),
+                final_newline: false,
             }]
         );
+    }
+
+    #[test]
+    fn diff_shows_a_missing_final_newline() {
+        let d = line_diff("a\nb", "a\nb\n");
+        let lines: Vec<_> = d
+            .iter()
+            .map(|l| (l.kind, l.text.as_str(), l.final_newline))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (DiffKind::Equal, "a", false),
+                (DiffKind::Expected, "b", false),
+                (DiffKind::Actual, "b", true),
+            ]
+        );
+        // Only the last line carries the flag.
+        let d = line_diff("x\n\n", "x\n\n");
+        assert_eq!(
+            d.iter().map(|l| l.final_newline).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        let json = serde_json::to_string(&d[1]).unwrap();
+        assert_eq!(json, r#"{"kind":"equal","text":"","finalNewline":true}"#);
+    }
+
+    #[test]
+    fn newline_at_end_detection() {
+        assert!(ends_with_newline("a\n"));
+        assert!(ends_with_newline("a\r\n"));
+        assert!(ends_with_newline("a\r"));
+        assert!(ends_with_newline("\n"));
+        assert!(!ends_with_newline(""));
+        assert!(!ends_with_newline("a"));
+        assert!(!ends_with_newline("a\nb "));
+    }
+
+    #[test]
+    fn trailing_whitespace_only_difference() {
+        assert!(only_trailing_whitespace_differs("a\n", "a"));
+        assert!(only_trailing_whitespace_differs("a", "a\n\n"));
+        assert!(only_trailing_whitespace_differs("a \nb", "a\nb"));
+        assert!(only_trailing_whitespace_differs("", "\n"));
+        // Equal outputs (also after CRLF normalization) do not differ.
+        assert!(!only_trailing_whitespace_differs("a\r\n", "a\n"));
+        assert!(!only_trailing_whitespace_differs("a", "a"));
+        // Other differences.
+        assert!(!only_trailing_whitespace_differs("a", " a"));
+        assert!(!only_trailing_whitespace_differs("a\n", "b"));
+        assert!(!only_trailing_whitespace_differs("a\n\nb", "a\nb"));
     }
 
     #[test]
