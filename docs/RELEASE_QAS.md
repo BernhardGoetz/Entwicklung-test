@@ -15,7 +15,7 @@ Workflow: [`.github/workflows/release.yml`](../.github/workflows/release.yml).
  push auf Branch qas ───────────────────────────────── (oder „Run workflow“ auf qas)
         │
         ▼
- version ── Versionen gleich? v<version> noch frei? Modellkatalog pinnen
+ version ── Versionen gleich? v<version> noch frei? Modell-Pins gegen Hugging Face prüfen
         │
         ├─► images ─────────── Images bauen, push :<version>-qas.<n> und :sha-<commit>
         │                      (nie :<version>), Archive + image-digests.json
@@ -128,6 +128,28 @@ Releases entstehen nur noch über QAS und Abnahme.
 5. **pull-request:** Legt den PR `qas` → `main` mit dem Titel „Release v<version> nach
    main“ an. Existiert schon ein offener PR, legt er keinen zweiten an. Auf `main` wird
    nie direkt geschrieben. Den PR prüfst und mergst du selbst.
+
+## KI-Modellkatalog: Pins per Pull Request
+
+Der Release pinnt den Katalog nicht selbst. Wäre das Hugging-Face-Repository des
+Herausgebers in dem Moment kompromittiert, würde sonst die bösartige Datei gepinnt
+(Vertrauen beim ersten Abruf). Stattdessen:
+
+1. **Einmalig (und bei jedem gewollten Modell-Update):** Actions → „KI-Modellkatalog
+   pinnen“ (`.github/workflows/pin-models.yml`) → „Run workflow“ auf dem Branch, in den
+   der PR soll (z. B. `qas`). Der Workflow trägt Revision, Datei(en), Größe und SHA-256
+   aus der Hugging-Face-API ein (`scripts/pin-models.sh`) und legt einen Pull Request mit
+   Tabelle und Links an. Voraussetzung: „Allow GitHub Actions to create and approve pull
+   requests“ (siehe unten). Für PRs des `GITHUB_TOKEN` startet GitHub keine weiteren
+   Workflows; CI für den PR ggf. durch Schließen und Wiederöffnen oder einen eigenen
+   Commit anstoßen.
+2. **Bernhard prüft** die Werte auf huggingface.co (Revision in der Commit-Historie des
+   Herausgebers, Größe und SHA-256 der Datei unter „Files and versions“) und mergt.
+3. **Jeder Release** (Job `version`): `scripts/pin-models.sh --check` (vollständig
+   gepinnt, sonst Abbruch mit Hinweis auf den Workflow) und `--verify` (die API muss für
+   die gepinnte Revision genau dieselben Dateien, Größen und SHA-256 melden; gelöschte
+   Revision oder jede Abweichung → Abbruch). Eine neuere Revision auf `main` wird nur als
+   Hinweis gemeldet; übernommen wird sie nur über einen neuen Pin-PR.
 
 ## Integrität der Artefakte zwischen den Jobs
 

@@ -42,10 +42,14 @@ name: Release (QAS und Abnahme)
 # TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) aus dem Environment "release".
 # QAS-Pre-Releases bekommen nie eine latest.json; die App fragt nur
 # releases/latest ab (keine Entwürfe, keine Pre-Releases).
-# Der Job "version" pinnt außerdem den KI-Modellkatalog (Revision, Datei,
-# Größe, SHA-256 aus der Hugging-Face-API; scripts/pin-models.sh), prüft ihn
-# und gibt ihn als Artefakt an die Bundle-Jobs weiter; die Werte stehen in
-# der Job-Zusammenfassung und in den Release-Notizen.
+# Der KI-Modellkatalog (Revision, Datei, Größe, SHA-256) ist im Repository
+# gepinnt: Pins entstehen nur über den Workflow pin-models.yml als Pull
+# Request, den Bernhard prüft und mergt. Der Job "version" pinnt nicht
+# selbst (kein Vertrauen beim ersten Abruf), sondern vergleicht die
+# eingecheckten Pins mit der Hugging-Face-API und bricht bei jeder
+# Abweichung ab (scripts/pin-models.sh --verify); dann gibt er den Katalog
+# als Artefakt an die Bundle-Jobs weiter. Die Werte stehen in der
+# Job-Zusammenfassung und in den Release-Notizen.
 # Die App erwartet <IMAGE_REGISTRY>/code-pruefer-<sprache>:<Cargo-Version>;
 # der Job "version" bricht ab, wenn Cargo.toml, tauri.conf.json,
 # package.json oder der Registry-Namensraum nicht zusammenpassen oder die
@@ -137,16 +141,19 @@ jobs:
           VERSION: ${{ steps.v.outputs.version }}
         run: scripts/check-version-unreleased.sh "v$VERSION"
 
-      # Der eingecheckte Katalog ist nicht gepinnt (Hugging Face ist in der
-      # Entwicklungsumgebung nicht erreichbar). Hier werden Revision,
-      # Dateiname, Größe und SHA-256 aus der Hugging-Face-API eingetragen und
-      # vollständig geprüft; ohne vollständige Werte bricht der Release ab.
-      # Die Bundle-Jobs bauen genau diese Datei in die App ein.
-      - name: KI-Modellkatalog pinnen und prüfen
+      # Die Pins kommen aus dem Repository (PR aus pin-models.yml). Hier nur
+      # Vollständigkeit prüfen und mit der Hugging-Face-API vergleichen:
+      # andere Dateien, Größen oder SHA-256 für die gepinnte Revision, oder
+      # eine gelöschte Revision → Abbruch. Die Bundle-Jobs bauen genau diese
+      # Datei in die App ein.
+      - name: KI-Modellkatalog prüfen (eingecheckte Pins gegen Hugging Face)
         run: |
           set -euo pipefail
-          scripts/pin-models.sh
-          scripts/pin-models.sh --check
+          if ! scripts/pin-models.sh --check; then
+            echo '::error::catalog.json ist nicht (vollständig) gepinnt. Workflow „KI-Modellkatalog pinnen“ (pin-models.yml) starten, den Pull Request prüfen und mergen (docs/RELEASE_QAS.md).'
+            exit 1
+          fi
+          scripts/pin-models.sh --verify
           {
             echo "### KI-Modelle (in die App eingebaut, Download per Knopf)"
             echo

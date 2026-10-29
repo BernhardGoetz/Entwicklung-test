@@ -1646,7 +1646,8 @@ mod tests {
             assert_eq!(script_ok, app, "{name}: Skript {script_ok}, App {app}");
             assert_eq!(script_ok, *name == "ok" || *name == "split", "{name}");
         }
-        // The committed catalog is unpinned (pinned in the release workflow).
+        // The committed catalog (pinned via pin-models.yml, or not yet):
+        // script and app agree.
         let committed: serde_json::Value = serde_json::from_str(CATALOG_JSON).unwrap();
         assert_eq!(
             check("committed", &committed),

@@ -193,6 +193,22 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
   (`Programme`, `Windows`); sonst erscheint eine Fehlermeldung
   (`src-tauri/src/runner/pipe_owner.rs`). **[ungeprüft auf echtem Windows: entwickelt und
   per Cross-Compile geprüft; die Regeln sind Unit-getestet]**
+- **Aufgabenblätter und Modelldateien sind nicht vertrauenswürdig** (Mitschüler,
+  Lernplattform, gefälschte Mail). Dokumente (PDF, Bilder, DOCX) werden in einem eigenen,
+  begrenzten Hilfsprozess gelesen (dieselbe Exe mit verstecktem Argument; 1,5 GB
+  Arbeitsspeicher, Zeitlimit, begrenzte Ausgabe; Windows: Job-Objekt). Vorher werden
+  PDFs auf Dekompressionsbomben und sich selbst enthaltende Grafikobjekte geprüft und
+  Bilder anhand ihres Headers auf ihre Größe. Bricht der Hilfsprozess ab, meldet die App
+  „Das PDF konnte nicht sicher gelesen werden …“ und läuft weiter
+  (`src-tauri/src/docs/worker.rs`, `pdf_guard.rs`). Importierte `.gguf`-Dateien werden
+  vor dem Laden auf plausible Metadaten geprüft; Modelle ohne geprüfte Prüfsumme laufen
+  mit der eingebauten ChatML-Vorlage statt der Vorlage aus der Datei.
+- **Lokale KI-Laufzeit:** llama-server lauscht nur auf `127.0.0.1`, der zufällige
+  API-Schlüssel steht in seiner Umgebung (nicht in der Kommandozeile), und vor der ersten
+  Anfrage prüft die App per zufälligem Modellnamen (`--alias`), dass sie wirklich mit
+  ihrem eigenen Server spricht. Stürzt die App ab, beendet Windows den Server über ein
+  Job-Objekt; unter macOS/Linux beendet ihn der nächste App-Start (Pid-Datei, nur nach
+  Prüfung der Exe).
 - **Lieferkette:** Runner-Images und Installer entstehen ausschließlich im
   Release-Workflow auf dem Branch `qas` (QAS-Lauf, danach manuelle Abnahme). Basis-Images
   und GitHub-Actions sind per Digest bzw. Commit-SHA gepinnt (Updates über Dependabot,
@@ -201,6 +217,26 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
   Digest. Die App prüft eingebettete Archive und Downloads gegen
   `image-digests.json`; zum Release gehören `SHA256SUMS.txt` und eine
   Build-Provenance-Attestierung (`gh attestation verify <Datei> --repo BernhardGoetz/Entwicklung-test`).
+
+### Datenschutz und Netzwerkzugriffe
+
+Die App hat keine Konten, keine Telemetrie, keine Absturzberichte und sendet weder Code
+noch Aufgaben, Testfälle oder andere Daten an den Autor oder an Dritte. Netzwerk nutzt sie
+nur hier (abgeglichen mit dem Code):
+
+| Wann | Wohin | Was |
+|---|---|---|
+| „Herunterladen“ eines KI-Modells | `huggingface.co` (und CDN `*.huggingface.co`, `*.hf.co`) | nur HTTPS, gepinnte Datei, SHA-256 geprüft (`src-tauri/src/ai/models.rs`) |
+| Runner-Images fehlen bzw. „Images aktualisieren“ | `ghcr.io`, über Docker/Podman | Pull der gepinnten Images (`runner/images.rs`) |
+| Update-Suche (nur Installer-Version, abschaltbar) | `github.com` (`releases/latest/download/latest.json`, beim Update der Installer) | signaturgeprüft (`app_update.rs`, [`docs/UPDATER.md`](docs/UPDATER.md)) |
+| Podman gewählt und von der App gestartet, erstes Mal | über Podman: Download des Podman-VM-Images (`podman machine init`, Server des Podman-Projekts) | einmalig, einige hundert MB (`engine.rs`) |
+| Windows-Installer, nur auf Nachfrage | über winget: Microsoft-winget-Quelle und Download von Docker Desktop bzw. Podman beim Hersteller | nur wenn die Engine fehlt und „Ja“ gewählt wird (`windows/hooks.nsh`) |
+| Klick auf Download-/Release-Links | Browser: docker.com, podman.io, GitHub-Release-Seite | nur diese drei Adressen (Capability) |
+
+Alles andere bleibt lokal: die Container-Engine (Socket bzw. Named Pipe), llama-server
+auf `127.0.0.1` (startet mit `--offline`), die Container laufen **ohne Netzwerk**. Docker
+Desktop und Podman selbst können nach ihren eigenen Einstellungen Verbindungen zu ihren
+Herstellern aufbauen (z. B. Update-Prüfung); das liegt außerhalb des Code-Prüfers.
 
 ### Restrisiken
 
@@ -392,9 +428,10 @@ API-Schlüssel und startet mit `--offline`. Aufgabentexte und Code verlassen den
 **Modell einrichten:** Unter Zahnrad → „Einstellungen“ → „KI-Modell verwalten …“ (oder
 „KI-Modell einrichten …“ im Tab „Testfälle“) beim empfohlenen Eintrag „Herunterladen“, danach
 „Auswählen“. Revision, Dateiname, Größe und SHA-256 trägt der Release-Workflow aus der
-Hugging-Face-API ein (`scripts/pin-models.sh`) und nennt sie in den Release-Notizen; im
-Repository ist der Katalog nicht gepinnt, Entwickler-Builds haben deshalb keinen
-Download-Knopf.
+Hugging-Face-API ein (`scripts/pin-models.sh`, über den Workflow „KI-Modellkatalog
+pinnen“ als Pull Request zur Prüfung); der Release-Workflow vergleicht die eingecheckten
+Werte mit der API und nennt sie in den Release-Notizen. Solange der Katalog im Repository
+nicht gepinnt ist, haben Builds keinen Download-Knopf.
 
 **Modell offline einrichten** (unter „Weitere Optionen (ohne Internet)“): Die `.gguf`-Datei (Links und Prüfsummen in `catalog.json`)
 auf einem Rechner mit Internet herunterladen, z. B. per USB-Stick übertragen und unter
@@ -413,11 +450,17 @@ Bestätigung als „unbekanntes Modell“ übernommen. Modelle liegen im App-Dat
 
 **Modellkatalog pinnen:** `scripts/pin-models.sh` trägt Revision, Größe und SHA-256 aus der
 Hugging-Face-API ein (bei aufgeteilten GGUF-Dateien alle Teile; llama.cpp lädt sie über den
-ersten Teil). Solange das nicht geschehen ist, verweigert die App den Download (Import
-geht) und der Release-Workflow bricht ab (`scripts/pin-models.sh --check`).
+ersten Teil). Das geschieht nicht im Release, sondern über den Workflow
+`.github/workflows/pin-models.yml` (Actions → „KI-Modellkatalog pinnen“ → „Run workflow“):
+er legt einen Pull Request mit dem gepinnten `catalog.json` an, Bernhard prüft die Werte
+auf huggingface.co und mergt. Jeder Release prüft danach nur noch
+(`scripts/pin-models.sh --check` und `--verify`): Meldet Hugging Face für die gepinnte
+Revision andere Dateien, Größen oder SHA-256, oder fehlen die Pins, bricht er ab. So
+vertraut kein Release dem ersten Abruf. Solange nicht gepinnt ist, verweigert die App
+den Download (Import geht).
 **Stand:** In dieser Version ist der Katalog noch **nicht** gepinnt – der Build-Umgebung war
-huggingface.co nicht erreichbar. Vor dem nächsten Release einmal mit Internet ausführen und
-`catalog.json` committen.
+huggingface.co nicht erreichbar. Vor dem nächsten Release den Workflow „KI-Modellkatalog
+pinnen“ starten und den Pull Request mergen; ohne Pins bricht der Release ab.
 
 **KI-Laufzeit:** llama.cpp Release `b11700` (offizielle Binaries, SHA-256 je Plattform in
 `scripts/fetch-llama-server.sh`), im Installer unter `llama/`. Unter Windows braucht
@@ -597,9 +640,12 @@ scripts/export-image-archives.sh
                          Image-Archive und image-digests.json erzeugen
 scripts/fetch-llama-server.sh
                          llama-server (gepinnt, SHA-256) nach resources/llama/
-scripts/pin-models.sh    Modellkatalog aus der Hugging-Face-API pinnen
+scripts/pin-models.sh    Modellkatalog aus der Hugging-Face-API pinnen (--check, --verify)
+scripts/artifact-manifest.sh  SHA-256-Manifeste der Release-Artefakte zwischen Jobs
+scripts/install-signer.sh     nur die Tauri-CLI für die Updater-Signatur (ohne npm ci)
 THIRD_PARTY_NOTICES.txt  Lizenzen von llama.cpp u. a. (wird mitgeliefert)
-.github/workflows/       ci.yml, images.yml (edge), release.yml (Branch qas: QAS, Abnahme, Release)
+.github/workflows/       ci.yml, images.yml (edge), release.yml (Branch qas: QAS, Abnahme, Release),
+                         pin-models.yml (Modellkatalog pinnen → Pull Request)
 .github/dependabot.yml   Updates für Actions, npm, cargo, Basis-Images
 ```
 
@@ -636,8 +682,10 @@ Installer. Mit dem Release-Zertifikat wird erst nach der QAS-Abnahme signiert.
 Autor, Committer, Reviewer und Approver ist Bernhard Götz. Jeder Signaturauftrag wird
 von Hand freigegeben. Datenschutz: Die App arbeitet lokal, ohne Telemetrie. Netzwerk nutzt
 sie nur für den optionalen Modell-Download von huggingface.co, für das Laden der
-Runner-Images von ghcr.io (über Docker/Podman) und für die Update-Suche auf github.com
-(abschaltbar, [`docs/UPDATER.md`](docs/UPDATER.md)). Einrichtung und offene Punkte (z. B.
+Runner-Images von ghcr.io (über Docker/Podman), für die Update-Suche auf github.com
+(abschaltbar, [`docs/UPDATER.md`](docs/UPDATER.md)), über Podman einmalig für dessen
+VM-Image (`podman machine init`) und im Installer auf Nachfrage über winget
+(vollständige Liste: „Datenschutz und Netzwerkzugriffe“). Einrichtung und offene Punkte (z. B.
 Fremdbinaries wie llama.cpp): [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md).
 
 ## Lizenz

@@ -92,8 +92,20 @@ The only network connections the application makes are:
   installed. Builds without that key and the portable Windows version never check.
   GitHub's privacy statement applies:
   <https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement>.
-- **Local only:** the app talks to the local container engine and to the bundled AI
-  runtime on `127.0.0.1`. User code is executed in containers **without network access**.
-- Links to the Docker and Podman websites are opened in the user's browser only when the
-  user clicks them. The Windows installer can, on request, install Docker Desktop or
-  Podman through `winget`.
+- **Podman virtual machine (only if the user chose Podman and lets the app start it):**
+  on the first start the app runs `podman machine init`, which makes Podman download its
+  virtual machine image once from the Podman project's servers (several hundred MB). The
+  app itself sends nothing; Podman's own behaviour and the policies of its image hosts
+  apply.
+- **Container engine installation (Windows installer, only on request):** if the chosen
+  engine is missing and the user agrees, the installer runs `winget install` for Docker
+  Desktop or Podman. winget contacts the Microsoft winget source and downloads the
+  installer from the vendor (Docker, or the Podman project on GitHub). Microsoft's,
+  Docker's and GitHub's privacy statements apply.
+- **Local only:** the app talks to the local container engine (socket or named pipe) and
+  to the bundled AI runtime on `127.0.0.1` (started with `--offline`). User code is
+  executed in containers **without network access**.
+- Links to the Docker and Podman websites and to the project's release page are opened in
+  the user's browser only when the user clicks them.
+- Docker Desktop and Podman, once started, may contact their vendors according to their
+  own settings (for example update checks); this is outside Code-Prüfer.
