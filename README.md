@@ -170,10 +170,11 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
   steuern kann (Docker-Socket, Named Pipe, `DOCKER_HOST`), hat faktisch
   Administratorrechte – das gilt unabhängig vom Code-Prüfer.
 - **Lieferkette:** Runner-Images und Installer entstehen ausschließlich im
-  Release-Workflow aus einem Versions-Tag. Basis-Images und GitHub-Actions sind per
-  Digest bzw. Commit-SHA gepinnt (Updates über Dependabot, 7 Tage Wartezeit), Release-Jobs
-  laufen ohne Caches und mit minimalen Token-Rechten, Versions-Tags der Images werden nur
-  bei Versions-Tags gepusht. Die App prüft eingebettete Archive und Downloads gegen
+  Release-Workflow auf dem Branch `qas` (QAS-Lauf, danach manuelle Abnahme). Basis-Images
+  und GitHub-Actions sind per Digest bzw. Commit-SHA gepinnt (Updates über Dependabot,
+  7 Tage Wartezeit), Release-Jobs laufen ohne Caches und mit minimalen Token-Rechten. Den
+  Versions-Tag `:<version>` der Images setzt erst die Abnahme, und zwar auf den getesteten
+  Digest. Die App prüft eingebettete Archive und Downloads gegen
   `image-digests.json`; zum Release gehören `SHA256SUMS.txt` und eine
   Build-Provenance-Attestierung (`gh attestation verify <Datei> --repo BernhardGoetz/Entwicklung-test`).
 
@@ -192,24 +193,30 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
   einem manipulierten Installationsordner (Abhilfe: signierte Installer).
 - Prozesse, die ein Test im Hintergrund startet, werden beendet, bleiben aber bis zum
   Ende der Prüfung als Zombie-Prozess im Container (zählen zum Limit von 64 Prozessen).
-- Ohne Pflicht-Reviewer im Environment `release` kann jeder mit Schreibrecht auf das
-  Repository einen Release auslösen (siehe nächster Abschnitt).
+- Ohne Pflicht-Reviewer im Environment `production` und ohne Schutz des Branches `qas`
+  kann jeder mit Schreibrecht auf das Repository einen Release auslösen (siehe nächster
+  Abschnitt).
 
 ### Nötige GitHub-Einstellungen (einmalig, durch den Repository-Inhaber)
 
-1. **Environment `release`** anlegen (Settings → Environments → New environment):
-   „Required reviewers“ = Bernhard, „Deployment branches and tags“ = „Selected branches and
-   tags“ mit der Tag-Regel `v*`. Die Apple-Secrets (`APPLE_CERTIFICATE`, …) und das
-   SignPath-Secret `SIGNPATH_API_TOKEN` samt Variablen (siehe
-   [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md)) dort als **Environment-Secrets**
-   bzw. **Environment-Variablen** hinterlegen, nicht im Repository. Die Jobs
-   `bundle-windows` und `bundle-macos` warten dann auf die Freigabe.
-2. **Tag-Schutz:** Settings → Rules → Rulesets → New tag ruleset, Ziel `v*`, „Restrict
-   creations“, „Restrict updates“ und „Restrict deletions“, Bypass nur für Bernhard.
-3. **GHCR-Pakete öffentlich:** `code-pruefer-python` und `code-pruefer-java` unter
+1. **Environments `qas`, `production` und `release`** anlegen (Settings → Environments),
+   jeweils mit „Deployment branches and tags“ = Branch `qas`. In `production` ist Bernhard
+   „Required reviewer“ (QAS-Abnahme). Die Apple-Secrets (`APPLE_CERTIFICATE`, …) und die
+   SignPath-Einträge für Test-Signing kommen nach `qas`, die SignPath-Einträge für
+   Release-Signing nach `release`, jeweils als **Environment-Secrets** bzw.
+   **Environment-Variablen** und nicht im Repository. Genaue Tabelle:
+   [`docs/RELEASE_QAS.md`](docs/RELEASE_QAS.md); SignPath:
+   [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md).
+2. **Branch `qas` schützen** (Ruleset: Push/Merge nur durch Bernhard, keine Force-Pushes).
+   **Tag-Schutz:** Settings → Rules → Rulesets → New tag ruleset, Ziel `v*`, „Restrict
+   updates“ und „Restrict deletions“. Die Tags `v*` legt der Workflow selbst an, deshalb
+   entweder „Restrict creations“ weglassen oder „GitHub Actions“ als Bypass eintragen.
+3. **Actions darf PRs anlegen:** Settings → Actions → General → „Allow GitHub Actions to
+   create and approve pull requests“ (für den PR `qas` → `main` nach der Abnahme).
+4. **GHCR-Pakete öffentlich:** `code-pruefer-python` und `code-pruefer-java` unter
    GitHub → Packages → Package settings → „Change visibility“ auf **public** stellen
    (sonst funktionieren Download und „Images aktualisieren“ nicht).
-4. Optional: Settings → Actions → General → „Workflow permissions“ auf „Read repository
+5. Optional: Settings → Actions → General → „Workflow permissions“ auf „Read repository
    contents and packages permissions“ stellen (die Workflows fordern ihre Rechte selbst an).
 
 ## Aufgabenblatt hochladen
@@ -457,12 +464,16 @@ Integrationstest für das Laden aus einem Archiv:
   `IMAGE_REGISTRY = ghcr.io/bernhardgoetz` (`runner/languages.rs`) und `<version>` =
   `CARGO_PKG_VERSION`. `Cargo.toml`, `tauri.conf.json` und `package.json` müssen dieselbe
   Version haben (Unit-Test `versions_are_in_sync`).
-- Release auslösen: Version in den drei Dateien erhöhen, committen, Tag `v<version>`
-  pushen (z. B. `git tag v0.2.0 && git push origin v0.2.0`). Alternativ
-  „Run workflow“ für `.github/workflows/release.yml` (Option „Entwurfs-Release anlegen“);
-  ein manueller Lauf pusht die Images nur als `:sha-<commit>`, nie als `:<version>`.
-- Der Workflow prüft Tag/Versionen/Registry-Namensraum, baut die Images multi-arch
-  (linux/amd64, linux/arm64, ohne Build-Cache), pusht sie als `:<version>` nach GHCR,
+- Release auslösen (QAS mit Abnahme, [`docs/RELEASE_QAS.md`](docs/RELEASE_QAS.md)): Version
+  in den drei Dateien erhöhen, committen und auf den Branch **`qas`** bringen. Jeder Push
+  auf `qas` startet einen QAS-Lauf, der ein Pre-Release `v<version>-qas.<n>` zum Testen
+  anlegt. Nach „Approve and deploy“ (Environment `production`) wird genau dieser Build
+  befördert: Images per Digest auf `:<version>` umgetaggt, Windows mit Release-Signing neu
+  signiert, Tag `v<version>` und Entwurfs-Release angelegt, PR `qas` → `main` geöffnet.
+  Einen Tag `v*` von Hand zu pushen, startet keinen Release mehr.
+- Der Workflow prüft Versionen, Registry-Namensraum und dass `v<version>` noch frei ist,
+  baut die Images multi-arch (linux/amd64, linux/arm64, ohne Build-Cache), pusht sie als
+  `:<version>-qas.<n>` nach GHCR (`:<version>` erst nach der Abnahme),
   exportiert daraus per Digest die Archive je Architektur
   (`scripts/export-image-archives.sh`, `MODE=pull` – identische Digests wie online) samt
   `image-digests.json`, baut den Windows-Installer (windows-latest, MSVC, NSIS deutsch) und
@@ -471,12 +482,14 @@ Integrationstest für das Laden aus einem Archiv:
   `SHA256SUMS.txt` und Build-Provenance-Attestierung an.
   macOS-Signatur/Notarisierung ist vorbereitet, läuft aber nur, wenn das Secret
   `APPLE_CERTIFICATE` (plus `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
-  `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`) im Environment `release` gesetzt ist;
-  die Windows-Signatur über SignPath, sobald `SIGNPATH_API_TOKEN` und die
-  SignPath-Variablen im Environment `release` gesetzt sind (sonst unsigniert mit Warnung;
-  [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md)). Windows wird dafür in zwei Jobs
-  gebaut: `build-windows` kompiliert die App, `bundle-windows` bündelt sie mit
-  `tauri bundle` und signiert dabei in Runden (`scripts/signpath-stage.mjs`).
+  `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`) im Environment `qas` gesetzt ist.
+  Die Windows-Signatur läuft über SignPath, sobald `SIGNPATH_API_TOKEN` und die
+  SignPath-Variablen gesetzt sind: in `qas` für Test-Signing, in `release` für
+  Release-Signing. Sonst bleibt Windows unsigniert, mit Warnung
+  ([`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md)). Windows wird dafür in Jobs
+  aufgeteilt: `build-windows` kompiliert die App, `bundle-windows` (QAS) und
+  `promote-windows` (nach der Abnahme) bündeln sie mit `tauri bundle` und signieren
+  dabei in Runden (`scripts/signpath-stage.mjs`).
 - `.github/workflows/images.yml` baut die Images bei Änderungen nur noch als `:edge` /
   `:sha-…`; Versions-Tags kommen ausschließlich aus dem Release-Workflow.
 - GHCR-Namen müssen klein geschrieben sein (der Workflow wandelt den Owner um).
@@ -540,9 +553,12 @@ src-tauri/tauri.release.conf.json
 images/                  Dockerfiles der Runner-Images
 scripts/signpath-stage.mjs, scripts/signpath-round.sh
                          Windows-Signatur über SignPath in Runden (release.yml)
+scripts/check-version-unreleased.sh, scripts/release-notes.sh
+                         Release-Workflow: Version frei?, Release-Notizen
 .signpath/               SignPath-Artefaktkonfigurationen (zum Einfügen in SignPath)
 docs/CODE_SIGNING_POLICY.md, docs/RELEASE_SIGNING.md
                          Code-Signing-Policy (englisch) und Einrichtung (deutsch)
+docs/RELEASE_QAS.md      Release-Ablauf mit QAS-Stufe und Abnahme
 LICENSE                  MIT-Lizenz
 scripts/export-image-archives.sh
                          Image-Archive und image-digests.json erzeugen
@@ -550,7 +566,7 @@ scripts/fetch-llama-server.sh
                          llama-server (gepinnt, SHA-256) nach resources/llama/
 scripts/pin-models.sh    Modellkatalog aus der Hugging-Face-API pinnen
 THIRD_PARTY_NOTICES.txt  Lizenzen von llama.cpp u. a. (wird mitgeliefert)
-.github/workflows/       ci.yml, images.yml (edge), release.yml (Tags v*)
+.github/workflows/       ci.yml, images.yml (edge), release.yml (Branch qas: QAS, Abnahme, Release)
 .github/dependabot.yml   Updates für Actions, npm, cargo, Basis-Images
 ```
 
@@ -582,7 +598,8 @@ werden:
 
 Kurzfassung der [Code-Signing-Policy](docs/CODE_SIGNING_POLICY.md) (englisch, verbindlich):
 Signiert werden nur Windows-Builds, die GitHub Actions in diesem Repository aus einem
-Versions-Tag `v*` baut, und zwar `code-pruefer.exe`, `uninstall.exe` und der Installer.
+Release-Branch `qas` baut, und zwar `code-pruefer.exe`, `uninstall.exe` und der
+Installer. Mit dem Release-Zertifikat wird erst nach der QAS-Abnahme signiert.
 Autor, Committer, Reviewer und Approver ist Bernhard Götz. Jeder Signaturauftrag wird
 von Hand freigegeben. Datenschutz: Die App arbeitet lokal, ohne Telemetrie. Netzwerk nutzt
 sie nur für den optionalen Modell-Download von huggingface.co und für das Laden der

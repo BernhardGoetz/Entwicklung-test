@@ -64,9 +64,11 @@ Vorgehen:
 - **build-windows** (ohne Secrets): `tauri build --no-bundle` baut `code-pruefer.exe`;
   dazu kommen die llama.cpp-Laufzeit und die Visual-C++-Laufzeit. Alles landet als
   Artefakt `windows-unsigned` mit `SHA256SUMS.txt`.
-- **bundle-windows** (Environment `release`): prüft die SHA-256-Summen und bündelt dann
-  mit `tauri bundle --bundles nsis --no-binary-patching` (die App wird dabei **nicht** neu
-  gebaut). Mit SignPath läuft das in Runden:
+- **bundle-windows** (QAS, Environment `qas`, Test-Signing) und **promote-windows**
+  (nach der Abnahme, Environment `release`, Release-Signing; siehe
+  [`RELEASE_QAS.md`](RELEASE_QAS.md)) haben dieselben Schritte. Sie prüfen die
+  SHA-256-Summen und bündeln dann mit `tauri bundle --bundles nsis --no-binary-patching`.
+  Die App wird dabei **nicht** neu gebaut. Mit SignPath läuft das in Runden:
   1. Runde 1: Tauri ruft für jede zu signierende Datei den `signCommand` auf, hier
      `node scripts/signpath-stage.mjs <datei>`. Das Skript legt eine Kopie in
      `signpath/stage-1/` ab. Das Verzeichnis geht als GitHub-Artefakt an SignPath
@@ -180,8 +182,11 @@ Die Foundation legt die Organisation an und lädt Bernhard ein. Dann in SignPath
 4. **Signing Policies**:
    - `test-signing`: Testzertifikat, ohne manuelle Freigabe. Zum Ausprobieren.
    - `release-signing`: Zertifikat der Foundation, Origin Verification an, manuelle
-     Freigabe durch Bernhard (Approver). Erlaubte Refs: die Versions-Tags `v*`, also
-     `refs/tags/v*`.
+     Freigabe durch Bernhard (Approver). Erlaubter Ref: der Branch `qas`
+     (`refs/heads/qas`). Signiert wird erst nach der QAS-Abnahme im Job
+     `promote-windows` desselben Workflow-Laufs, und zwar die unsignierten Dateien,
+     die in QAS getestet wurden ([`RELEASE_QAS.md`](RELEASE_QAS.md)).
+   - Für `test-signing` ebenfalls `refs/heads/qas` zulassen.
 5. **CI-Benutzer / API-Token**: einen Benutzer für GitHub Actions anlegen (bzw. das eigene
    Konto), ihn in beiden Policies als **Submitter** eintragen und ein **API-Token**
    erzeugen.
@@ -195,42 +200,41 @@ SignPath sie verlangen, legt man sie nach der Doku an; der Workflow bleibt unver
 
 ### 5. GitHub einrichten
 
-Settings → Environments → **release** (gibt es schon; Pflicht-Reviewer und Tag-Regel `v*`
-wie in der README):
+Settings → Environments (vollständige Tabelle in [`RELEASE_QAS.md`](RELEASE_QAS.md)):
 
-- **Environment secret** `SIGNPATH_API_TOKEN` = API-Token aus SignPath.
-- **Environment variables**:
-  - `SIGNPATH_ORGANIZATION_ID` = Organisations-ID,
-  - `SIGNPATH_PROJECT_SLUG` = Projekt-Slug,
-  - `SIGNPATH_SIGNING_POLICY_SLUG` = zunächst `test-signing`,
-  - optional `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` (leer = Default-Konfiguration),
-  - optional `SIGNPATH_SIGN_UPSTREAM` = `true` (nur nach Zusage, siehe oben).
+- Environment **qas** (Test-Signing, Jobs `bundle-windows`/`bundle-macos`):
+  - **Environment secret** `SIGNPATH_API_TOKEN` = API-Token aus SignPath,
+  - **Environment variables**: `SIGNPATH_ORGANIZATION_ID` (Organisations-ID),
+    `SIGNPATH_PROJECT_SLUG` (Projekt-Slug), `SIGNPATH_SIGNING_POLICY_SLUG` = `test-signing`,
+    optional `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` (leer = Default-Konfiguration) und
+    `SIGNPATH_SIGN_UPSTREAM` = `true` (nur nach Zusage, siehe oben).
+- Environment **release** (Release-Signing, Job `promote-windows` nach der Abnahme):
+  dieselben Namen, aber `SIGNPATH_SIGNING_POLICY_SLUG` = `release-signing`.
+- Environment **production**: nur die Abnahme (Pflicht-Reviewer Bernhard), keine Secrets.
 
-Das alte Secret `WINDOWS_CERTIFICATE` bzw. `WINDOWS_CERTIFICATE_PASSWORD` wird nicht mehr
-verwendet und kann gelöscht werden.
+Ein Environment ohne SignPath-Einträge bündelt unsigniert und warnt. Das alte Secret
+`WINDOWS_CERTIFICATE` bzw. `WINDOWS_CERTIFICATE_PASSWORD` wird nicht mehr verwendet und
+kann gelöscht werden.
 
-### 6. Testlauf mit Test-Signing
+### 6. Testlauf mit Test-Signing (= QAS-Lauf)
 
-- „Run workflow“ für `release.yml`. Das Environment `release` lässt nur Tags `v*` zu,
-  deshalb für den Test unter „Deployment branches and tags“ vorübergehend den Branch
-  `main` erlauben (danach wieder entfernen) und in SignPath bei `test-signing` den Branch
-  zulassen.
+- Zunächst nur das Environment `qas` mit SignPath befüllen und einen QAS-Lauf starten
+  (Push auf `qas` oder „Run workflow“ auf `qas`).
 - Erwartung: Im Job `bundle-windows` laufen zwei Signaturaufträge, in SignPath sind zwei
   Signing Requests zu sehen. Die Tabelle „Signaturen im Installer“ zeigt für Installer,
   `code-pruefer.exe` und `uninstall.exe` eine Signatur mit dem Status `UnknownError` bzw.
   `NotTrusted` (Testzertifikat, nicht vertrauenswürdig). Das ist bei Test-Signing normal.
   Enthält der Slug „test“, verlangt der Workflow keine gültige Kette.
-- Den Installer aus dem Workflow-Artefakt `bundle-windows-x64` testweise installieren und
-  deinstallieren.
+- Den Installer aus dem Pre-Release testweise installieren und deinstallieren.
+- Zum reinen Testen die Abnahme ablehnen („Reject“).
 
 ### 7. Erster echter Release
 
-1. `SIGNPATH_SIGNING_POLICY_SLUG` auf `release-signing` umstellen.
-2. Version in `Cargo.toml`, `tauri.conf.json` und `package.json` erhöhen, committen, Tag
-   `v<version>` pushen.
-3. Die Freigabe für das Environment `release` erteilen. Danach in SignPath **jeden**
-   Signing Request freigeben (zwei, mit Fremdbinaries drei; jeder wartet bis zu einer
-   Stunde, dann bricht der Job ab und kann neu gestartet werden).
+1. Das Environment `release` mit SignPath (`release-signing`) befüllen.
+2. QAS-Lauf starten, testen, abnehmen („Approve and deploy“ in `production`).
+3. Danach in SignPath **jeden** Signing Request von `promote-windows` freigeben: zwei,
+   mit Fremdbinaries drei. Jeder wartet bis zu einer Stunde, dann bricht der Job ab und
+   kann mit „Re-run failed jobs“ neu gestartet werden.
 4. Der Workflow verlangt jetzt gültige Signaturen (`Valid`). Danach das Entwurfs-Release
    prüfen und veröffentlichen.
 
@@ -266,7 +270,7 @@ verwendet und kann gelöscht werden.
 
 | Meldung | Ursache / Abhilfe |
 |---|---|
-| „SignPath ist nur teilweise eingerichtet“ | Secret bzw. eine der drei Variablen fehlt im Environment `release`. |
+| „SignPath ist nur teilweise eingerichtet“ | Secret bzw. eine der drei Variablen fehlt im Environment `qas` bzw. `release`. |
 | „Build artifact … cannot be signed because of build system validation errors“ | Origin Verification: Trusted Build System nicht verknüpft, Ref nicht in der Policy erlaubt, oder das Repository passt nicht zur Projekt-URL. |
 | Zeitüberschreitung beim Warten | Signing Request in SignPath nicht (rechtzeitig) freigegeben; Job neu starten. |
 | „SignPath lieferte andere Dateien zurück“ / „kam ohne Signatur zurück“ | Die Artefaktkonfiguration passt nicht zu den gesammelten Dateinamen (z. B. Fremdbinaries gesammelt, aber `default.xml` aktiv). |
