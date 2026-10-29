@@ -18,7 +18,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use code_pruefer_lib::ai::llama::{self, ChatMessage, ChatRequest, LlamaClient, Llm};
+use code_pruefer_lib::ai::llama::{
+    self, ChatMessage, ChatRequest, ChatTemplate, LlamaClient, Llm, PidRecord,
+};
 use code_pruefer_lib::ai::pipeline::{
     self, ConfidenceLevel, GenerateRequest, SandboxExecutor, Settings,
 };
@@ -45,16 +47,18 @@ fn setup_images() {
 async fn llama_server_answers_with_json_schema() {
     let cancel = CancellationToken::new();
     let started = Instant::now();
-    let endpoint = llama::ensure_running(&model(), 4, &cancel, |m| eprintln!("{m}"))
-        .await
-        .expect("llama-server starten");
+    let endpoint = llama::ensure_running(&model(), 4, ChatTemplate::FromModel, &cancel, |m| {
+        eprintln!("{m}")
+    })
+    .await
+    .expect("llama-server starten");
     eprintln!(
         "Server bereit nach {:.1} s",
         started.elapsed().as_secs_f64()
     );
 
     // Reuse: same model, same endpoint.
-    let again = llama::ensure_running(&model(), 4, &cancel, |_| {})
+    let again = llama::ensure_running(&model(), 4, ChatTemplate::FromModel, &cancel, |_| {})
         .await
         .unwrap();
     assert_eq!(again.base_url, endpoint.base_url);
@@ -107,7 +111,7 @@ async fn llama_server_answers_with_json_schema() {
 
     // Cancelling an ongoing request.
     let cancel2 = CancellationToken::new();
-    let endpoint = llama::ensure_running(&model(), 4, &cancel2, |_| {})
+    let endpoint = llama::ensure_running(&model(), 4, ChatTemplate::FromModel, &cancel2, |_| {})
         .await
         .unwrap();
     let client = LlamaClient::new(endpoint, cancel2.clone()).unwrap();
@@ -142,7 +146,7 @@ async fn llama_server_answers_with_json_schema() {
     // Parallel slots: four requests at once (as the solutions), with the
     // answer starting inside a code block and a stop string.
     let cancel3 = CancellationToken::new();
-    let endpoint = llama::ensure_running(&model(), 4, &cancel3, |_| {})
+    let endpoint = llama::ensure_running(&model(), 4, ChatTemplate::FromModel, &cancel3, |_| {})
         .await
         .unwrap();
     let client = LlamaClient::new(endpoint, cancel3).unwrap();
@@ -171,6 +175,159 @@ async fn llama_server_answers_with_json_schema() {
         "identische Anfragen: ein Template-Aufruf"
     );
     llama::shutdown().await;
+}
+
+fn local() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+async fn props(endpoint: &llama::Endpoint) -> serde_json::Value {
+    local()
+        .get(format!("{}/props", endpoint.base_url))
+        .bearer_auth(&endpoint.api_key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// N4/N5/I1 (audit 2): built-in chat template for unverified models, API
+/// key only in the environment, alias identity, stale server cleanup.
+#[tokio::test]
+#[ignore = "benötigt llama-server (CODE_PRUEFER_LLAMA_SERVER) und ein GGUF-Modell (CODE_PRUEFER_TEST_MODEL)"]
+async fn llama_server_hardening() {
+    let state = std::env::temp_dir().join(format!("code-pruefer-llama-{}", std::process::id()));
+    std::fs::create_dir_all(&state).unwrap();
+    llama::init_state_dir(state.clone());
+    let pid_file = state.join(llama::PID_FILE);
+    let cancel = CancellationToken::new();
+    // A real model passes the import's metadata check.
+    let file = std::fs::File::open(model()).unwrap();
+    assert_eq!(
+        code_pruefer_lib::ai::gguf::check_header(std::io::BufReader::new(file)),
+        Ok(())
+    );
+
+    let from_model = llama::ensure_running(&model(), 1, ChatTemplate::FromModel, &cancel, |_| {})
+        .await
+        .expect("llama-server starten");
+    let file_template = props(&from_model).await["chat_template"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Pid file of the running server.
+    let record: PidRecord = serde_json::from_slice(&std::fs::read(&pid_file).unwrap()).unwrap();
+    assert_eq!(record.exe, llama::server_path().unwrap());
+
+    // The key is not on any command line (only in llama-server's env).
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+    );
+    let server = system
+        .process(sysinfo::Pid::from_u32(record.pid))
+        .expect("llama-server-Prozess");
+    let cmd: Vec<String> = server
+        .cmd()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(cmd.iter().any(|a| a == "--alias"), "{cmd:?}");
+    for p in system.processes().values() {
+        assert!(
+            !p.cmd()
+                .iter()
+                .any(|a| a.to_string_lossy().contains(&from_model.api_key)),
+            "API-Schlüssel in der Kommandozeile von {:?}",
+            p.name()
+        );
+    }
+    // The key in the environment works; without it: 401, also for /v1/models.
+    let resp = local()
+        .get(format!("{}/v1/models", from_model.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+    let models: serde_json::Value = local()
+        .get(format!("{}/v1/models", from_model.base_url))
+        .bearer_auth(&from_model.api_key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    eprintln!("/v1/models: {models}");
+    let alias = cmd[cmd.iter().position(|a| a == "--alias").unwrap() + 1].clone();
+    assert!(llama::is_our_server(&models, &alias));
+
+    // Unverified model: built-in ChatML, not the file's template.
+    let builtin = llama::ensure_running(&model(), 1, ChatTemplate::BuiltinChatml, &cancel, |_| {})
+        .await
+        .expect("llama-server mit eingebautem Template");
+    assert_ne!(builtin.base_url, from_model.base_url, "neu gestartet");
+    let template = props(&builtin).await["chat_template"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    eprintln!("Template der Datei: {file_template:?}\nEingebaut: {template:?}");
+    assert_ne!(template, file_template);
+    assert!(template.contains("<|im_start|>"), "{template}");
+    let client = LlamaClient::new(builtin.clone(), cancel.clone()).unwrap();
+    let r = client
+        .chat(&ChatRequest {
+            messages: vec![ChatMessage::user("Print 42 in Python.")],
+            temperature: 0.0,
+            max_tokens: 16,
+            json_schema: None,
+            seed: Some(1),
+            prefill: None,
+            stop: Vec::new(),
+        })
+        .await
+        .expect("Antwort mit eingebautem Template");
+    eprintln!("Antwort: {:?}", r.content);
+
+    llama::shutdown().await;
+    assert!(!pid_file.exists(), "Pid-Datei nach dem Beenden entfernt");
+
+    // A server left over from a crashed app (started like the app does,
+    // own process group) is killed on the next start via its pid file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let binary = llama::server_path().unwrap();
+        let mut orphan = std::process::Command::new(&binary)
+            .args([
+                "-m",
+                &model().display().to_string(),
+                "--host",
+                "127.0.0.1",
+                "--port",
+            ])
+            .arg(llama::free_port().unwrap().to_string())
+            .current_dir(binary.parent().unwrap())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let record = PidRecord {
+            pid: orphan.id(),
+            exe: binary.clone(),
+        };
+        std::fs::write(&pid_file, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(llama::kill_stale(&pid_file, &binary), Some(orphan.id()));
+        let status = orphan.wait().unwrap();
+        assert!(!status.success(), "{status:?}");
+        assert!(!pid_file.exists());
+    }
+    std::fs::remove_dir_all(&state).unwrap();
 }
 
 struct Sample {
@@ -212,9 +369,11 @@ const SAMPLES: &[Sample] = &[
 async fn pipeline_on_sample_tasks() {
     setup_images();
     let cancel = CancellationToken::new();
-    let endpoint = llama::ensure_running(&model(), 4, &cancel, |m| eprintln!("{m}"))
-        .await
-        .expect("llama-server starten");
+    let endpoint = llama::ensure_running(&model(), 4, ChatTemplate::FromModel, &cancel, |m| {
+        eprintln!("{m}")
+    })
+    .await
+    .expect("llama-server starten");
     let solutions: usize = std::env::var("CODE_PRUEFER_TEST_SOLUTIONS")
         .ok()
         .and_then(|s| s.parse().ok())

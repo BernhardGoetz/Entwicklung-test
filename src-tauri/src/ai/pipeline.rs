@@ -1529,9 +1529,13 @@ pub async fn run(
     exec.prepare(lang.id).await?;
 
     on_progress(AiProgress::new(Phase::Model, "KI-Modell wird geladen …"));
-    let endpoint = super::llama::ensure_running(&model.path, model.server_slots(), cancel, |m| {
-        on_progress(AiProgress::new(Phase::Model, m))
-    })
+    let endpoint = super::llama::ensure_running(
+        &model.path,
+        model.server_slots(),
+        model.chat_template(),
+        cancel,
+        |m| on_progress(AiProgress::new(Phase::Model, m)),
+    )
     .await?;
     let llm = super::llama::LlamaClient::new(endpoint, cancel.clone())?;
     let settings = Settings {

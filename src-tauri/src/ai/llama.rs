@@ -3,9 +3,18 @@
 //! Release builds ship the official llama.cpp binaries (version and SHA-256
 //! pinned in `scripts/fetch-llama-server.sh`) in `<resource_dir>/llama/`.
 //! The server listens on 127.0.0.1 on a free port and requires a random API
-//! key, so other local programs cannot use it. One server runs at a time
-//! (for one model); it is restarted when the model changes and killed on
-//! cancel and when the app exits.
+//! key (passed in the environment, not on the command line), so other local
+//! programs cannot use it. Before the first request the app checks that the
+//! answering server is its own: a random model alias (`--alias`) must come
+//! back from the authenticated `/v1/models`. One server runs at a time (for
+//! one model); it is restarted when the model changes and killed on cancel
+//! and when the app exits. If the app itself dies, a Windows job object
+//! kills the server with it; on macOS/Linux the next app start kills a
+//! leftover server found via its pid file (after checking its executable).
+//!
+//! Models without a verified catalog hash (imported, unpinned) run with
+//! llama.cpp's built-in ChatML template instead of the Jinja template in
+//! the file ([`ChatTemplate`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -44,12 +53,30 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const STDERR_LINES: usize = 40;
 /// Windows `STATUS_DLL_NOT_FOUND` (0xC0000135) as exit code.
 const STATUS_DLL_NOT_FOUND: i32 = 0xC000_0135_u32 as i32;
+/// Environment variable llama-server reads the API key from (b11700:
+/// `--api-key`, "env: LLAMA_API_KEY").
+pub const API_KEY_ENV: &str = "LLAMA_API_KEY";
+/// Pid file of the running server in the app data directory.
+pub const PID_FILE: &str = "llama-server.pid";
 
 static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Sets the app's resource directory (called once at app start).
 pub fn init_resource_dir(dir: PathBuf) {
     let _ = RESOURCE_DIR.set(dir);
+}
+
+/// Sets the directory for the pid file and kills a server left over from a
+/// crashed app (called once at app start).
+pub fn init_state_dir(dir: PathBuf) {
+    let pid_file = dir.join(PID_FILE);
+    if let Ok(binary) = server_path() {
+        if let Some(pid) = kill_stale(&pid_file, &binary) {
+            eprintln!("llama-server: übrig gebliebenen Prozess {pid} beendet");
+        }
+    }
+    let _ = STATE_DIR.set(dir);
 }
 
 pub fn server_binary_name() -> &'static str {
@@ -120,11 +147,27 @@ pub fn thread_count() -> usize {
         .clamp(1, 32)
 }
 
+/// Which chat template llama-server uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplate {
+    /// The Jinja template in the GGUF file (catalog models with verified
+    /// SHA-256: Qwen, ChatML).
+    FromModel,
+    /// llama.cpp's built-in ChatML template (`--chat-template chatml`); the
+    /// file's template is not even parsed. For models without a verified
+    /// hash, whose template could be anything.
+    BuiltinChatml,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerConfig {
     pub model: PathBuf,
     pub port: u16,
+    /// Not on the command line: [`API_KEY_ENV`] (see [`server_env`]).
     pub api_key: String,
+    /// Random model name; `/v1/models` must return it ([`is_our_server`]).
+    pub alias: String,
+    pub template: ChatTemplate,
     pub threads: usize,
     pub threads_batch: usize,
     /// Parallel slots (solutions generated at the same time).
@@ -137,7 +180,11 @@ pub struct ServerConfig {
 /// Command line of llama-server. Every flag was checked against
 /// `llama-server --help` of the pinned build (b11700): `--flash-attn
 /// on|off|auto`, `--cache-type-k/-v` (q8_0 allowed), `--threads-batch`,
-/// `--parallel`, `--kv-unified`.
+/// `--parallel`, `--kv-unified`, `--alias`, `--chat-template chatml`
+/// (built-in template; with jinja on, the name selects llama.cpp's own
+/// ChatML source, the model's template is not read: common/chat.cpp
+/// `common_chat_templates_init`). The API key is not an argument (visible
+/// to other processes) but [`API_KEY_ENV`].
 pub fn server_args(c: &ServerConfig) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-m".into(),
@@ -146,8 +193,8 @@ pub fn server_args(c: &ServerConfig) -> Vec<String> {
         "127.0.0.1".into(),
         "--port".into(),
         c.port.to_string(),
-        "--api-key".into(),
-        c.api_key.clone(),
+        "--alias".into(),
+        c.alias.clone(),
         "--ctx-size".into(),
         ctx_size(c.parallel).to_string(),
         "--threads".into(),
@@ -163,12 +210,14 @@ pub fn server_args(c: &ServerConfig) -> Vec<String> {
         "--kv-unified".into(),
         "--flash-attn".into(),
         "on".into(),
-        // Chat template from the GGUF file (Qwen: ChatML).
         "--jinja".into(),
         "--no-webui".into(),
         // Never download anything (e.g. via -hf); models come from us.
         "--offline".into(),
     ];
+    if c.template == ChatTemplate::BuiltinChatml {
+        args.extend(["--chat-template".into(), "chatml".into()]);
+    }
     // No GPU offload on Windows/Linux (CPU build); Metal on macOS is used
     // automatically by the official build.
     if !cfg!(target_os = "macos") {
@@ -181,6 +230,110 @@ pub fn server_args(c: &ServerConfig) -> Vec<String> {
         }
     }
     args
+}
+
+/// Environment changes for llama-server: the API key, and no inherited
+/// `LLAMA_*` variables (llama.cpp reads options such as `LLAMA_ARG_HOST`
+/// from the environment). Returns (variables to remove, variables to set).
+pub fn server_env(
+    c: &ServerConfig,
+    inherited: impl IntoIterator<Item = String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let remove = inherited
+        .into_iter()
+        .filter(|k| k.to_ascii_uppercase().starts_with("LLAMA_"))
+        .collect();
+    (remove, vec![(API_KEY_ENV.into(), c.api_key.clone())])
+}
+
+/// Whether the `/v1/models` answer names our random alias (OpenAI format
+/// `data[].id`, llama.cpp `models[].name`/`model`, plus `aliases`).
+pub fn is_our_server(models_json: &Value, alias: &str) -> bool {
+    let named = |m: &Value| {
+        ["id", "name", "model"]
+            .iter()
+            .any(|k| m.get(k).and_then(Value::as_str) == Some(alias))
+            || m.get("aliases")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(alias)))
+    };
+    ["data", "models"].iter().any(|list| {
+        models_json
+            .get(list)
+            .and_then(Value::as_array)
+            .is_some_and(|ms| ms.iter().any(named))
+    })
+}
+
+/// Contents of the pid file: process id and executable, so a reused pid
+/// of another program is never killed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PidRecord {
+    pub pid: u32,
+    pub exe: PathBuf,
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Kills the server recorded in `pid_file` if that process still runs
+/// *our* llama-server binary (`binary`), then removes the file. Returns the
+/// killed pid.
+pub fn kill_stale(pid_file: &Path, binary: &Path) -> Option<u32> {
+    let record: Option<PidRecord> = std::fs::read(pid_file)
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok());
+    let _ = std::fs::remove_file(pid_file);
+    let record = record?;
+    if !same_file(&record.exe, binary) {
+        return None;
+    }
+    let pid = sysinfo::Pid::from_u32(record.pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always),
+    );
+    let process = system.process(pid)?;
+    if !process.exe().is_some_and(|exe| same_file(exe, binary)) {
+        return None;
+    }
+    // Its own process group (see `start_server`): end the whole group.
+    #[cfg(unix)]
+    // SAFETY: plain syscall; the pid was just verified to be our server.
+    unsafe {
+        libc::kill(-(record.pid as libc::pid_t), libc::SIGKILL);
+    }
+    process.kill();
+    Some(record.pid)
+}
+
+fn pid_file() -> Option<PathBuf> {
+    STATE_DIR.get().map(|d| d.join(PID_FILE))
+}
+
+fn write_pid_file(pid: u32, binary: &Path) {
+    if let Some(path) = pid_file() {
+        let record = PidRecord {
+            pid,
+            exe: binary.to_path_buf(),
+        };
+        if let Ok(raw) = serde_json::to_vec(&record) {
+            let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
+            let _ = std::fs::write(path, raw);
+        }
+    }
+}
+
+fn remove_pid_file() {
+    if let Some(path) = pid_file() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// The server refused the quantized KV cache (head size not a multiple of
@@ -197,8 +350,17 @@ pub fn random_api_key() -> Result<String, AiError> {
     Ok(super::hex(&buf))
 }
 
+/// A random model alias (identity check of the server, [`is_our_server`]).
+pub fn random_alias() -> Result<String, AiError> {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf)
+        .map_err(|e| AiError::Start(format!("Zufallszahlen nicht verfügbar: {e}")))?;
+    Ok(format!("code-pruefer-{}", super::hex(&buf)))
+}
+
 /// A free TCP port on 127.0.0.1 (released again before llama-server binds
-/// it; the tiny race is acceptable, a failed bind shows up as a start error).
+/// it; a failed bind shows up as a start error, and a foreign program that
+/// grabs the port in between is detected by the alias check).
 pub fn free_port() -> Result<u16, AiError> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .and_then(|l| l.local_addr())
@@ -253,7 +415,19 @@ struct Running {
     child: tokio::process::Child,
     model: PathBuf,
     parallel: usize,
+    template: ChatTemplate,
     endpoint: Endpoint,
+    /// Kills the server with the app (Windows).
+    #[cfg(windows)]
+    _job: Option<crate::proc_guard::KillJob>,
+}
+
+/// A started server (child process and how to reach it).
+struct Started {
+    child: tokio::process::Child,
+    endpoint: Endpoint,
+    #[cfg(windows)]
+    job: Option<crate::proc_guard::KillJob>,
 }
 
 static SERVER: tokio::sync::Mutex<Option<Running>> = tokio::sync::Mutex::const_new(None);
@@ -272,6 +446,7 @@ fn local_http(timeout: Duration) -> Result<reqwest::Client, AiError> {
 pub async fn ensure_running(
     model: &Path,
     parallel: usize,
+    template: ChatTemplate,
     cancel: &CancellationToken,
     mut on_status: impl FnMut(String),
 ) -> Result<Endpoint, AiError> {
@@ -279,7 +454,7 @@ pub async fn ensure_running(
     let mut guard = SERVER.lock().await;
     if let Some(r) = guard.as_mut() {
         let alive = matches!(r.child.try_wait(), Ok(None));
-        if alive && r.model == model && r.parallel == parallel {
+        if alive && r.model == model && r.parallel == parallel && r.template == template {
             return Ok(r.endpoint.clone());
         }
     }
@@ -295,18 +470,24 @@ pub async fn ensure_running(
             model: model.to_path_buf(),
             port: free_port()?,
             api_key: random_api_key()?,
+            alias: random_alias()?,
+            template,
             threads: thread_count(),
             threads_batch: batch_thread_count(),
             parallel,
             kv_quant,
         };
         match start_server(&binary, &config, cancel, &mut on_status).await {
-            Ok((child, endpoint)) => {
+            Ok(started) => {
+                let endpoint = started.endpoint.clone();
                 *guard = Some(Running {
-                    child,
+                    child: started.child,
                     model: model.to_path_buf(),
                     parallel,
+                    template,
                     endpoint: endpoint.clone(),
+                    #[cfg(windows)]
+                    _job: started.job,
                 });
                 return Ok(endpoint);
             }
@@ -333,28 +514,50 @@ impl From<AiError> for StartFailure {
     }
 }
 
-/// Spawns llama-server and waits for `/health`.
+/// Spawns llama-server, waits for `/health` and checks that the answering
+/// server is ours (alias via authenticated `/v1/models`).
 async fn start_server(
     binary: &Path,
     config: &ServerConfig,
     cancel: &CancellationToken,
     on_status: &mut impl FnMut(String),
-) -> Result<(tokio::process::Child, Endpoint), StartFailure> {
+) -> Result<Started, StartFailure> {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.args(server_args(config))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    let (remove, set) = server_env(config, std::env::vars().map(|(k, _)| k));
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    cmd.envs(set);
     // Shared libraries (ggml-*.dll / .dylib) live next to the binary.
     if let Some(dir) = binary.parent() {
         cmd.current_dir(dir);
     }
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                                     // Own process group: a stale server is killed as a group
+                                     // (`kill_stale`), and a terminal's Ctrl+C reaches only the app, which
+                                     // then ends the server itself.
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd
         .spawn()
         .map_err(|e| AiError::Start(format!("{}: {e}", binary.display())))?;
+    // Windows: the job kills the server when the app ends in any way. If
+    // it cannot be created, the server still runs (and is ended on exit).
+    #[cfg(windows)]
+    let job = child.raw_handle().and_then(|handle| {
+        let job = crate::proc_guard::KillJob::new(None).ok()?;
+        job.assign(handle).ok()?;
+        Some(job)
+    });
+    if let Some(pid) = child.id() {
+        write_pid_file(pid, binary);
+    }
 
     let log = Arc::new(Mutex::new(VecDeque::<String>::new()));
     if let Some(stderr) = child.stderr.take() {
@@ -387,9 +590,11 @@ async fn start_server(
     loop {
         if cancel.is_cancelled() {
             let _ = child.kill().await;
+            remove_pid_file();
             return Err(AiError::Cancelled.into());
         }
         if let Ok(Some(status)) = child.try_wait() {
+            remove_pid_file();
             // Give the log reader a moment to collect the last lines.
             tokio::time::sleep(Duration::from_millis(100)).await;
             let tail = log_tail();
@@ -404,12 +609,23 @@ async fn start_server(
             .await
         {
             if resp.status().is_success() {
-                return Ok((child, endpoint));
+                if let Err(e) = verify_identity(&http, &endpoint, &config.alias, &mut child).await {
+                    let _ = child.kill().await;
+                    remove_pid_file();
+                    return Err(e.into());
+                }
+                return Ok(Started {
+                    child,
+                    endpoint,
+                    #[cfg(windows)]
+                    job,
+                });
             }
         }
         let waited = started.elapsed();
         if waited >= HEALTH_TIMEOUT {
             let _ = child.kill().await;
+            remove_pid_file();
             return Err(AiError::Start(format!(
                 "Das Modell wurde nach {} s noch nicht geladen.\n{}",
                 waited.as_secs(),
@@ -420,6 +636,39 @@ async fn start_server(
         on_status(format!("KI-Modell wird geladen … ({} s)", waited.as_secs()));
         tokio::time::sleep(HEALTH_INTERVAL).await;
     }
+}
+
+/// After `/health`: the server on the port must know our API key and
+/// report our random alias, and our child must still be running (a foreign
+/// program that took the port would get the key, but could not know the
+/// alias; then llama-server itself fails to bind and exits).
+async fn verify_identity(
+    http: &reqwest::Client,
+    endpoint: &Endpoint,
+    alias: &str,
+    child: &mut tokio::process::Child,
+) -> Result<(), AiError> {
+    let foreign = || {
+        AiError::Start(
+            "Auf dem Port der KI-Laufzeit antwortet ein anderes Programm. Bitte erneut \
+             versuchen; tritt das wiederholt auf, den Rechner neu starten."
+                .into(),
+        )
+    };
+    let resp = http
+        .get(format!("{}/v1/models", endpoint.base_url))
+        .bearer_auth(&endpoint.api_key)
+        .send()
+        .await
+        .map_err(|_| foreign())?;
+    if !resp.status().is_success() {
+        return Err(foreign());
+    }
+    let body: Value = resp.json().await.map_err(|_| foreign())?;
+    if !is_our_server(&body, alias) || !matches!(child.try_wait(), Ok(None)) {
+        return Err(foreign());
+    }
+    Ok(())
 }
 
 /// Starts llama-server for the selected model in the background, so the
@@ -435,17 +684,26 @@ pub async fn warm_up(cancel: &CancellationToken) -> Result<bool, AiError> {
             if matches!(r.child.try_wait(), Ok(None))
                 && r.model == model.path
                 && r.parallel == model.server_slots()
+                && r.template == model.chat_template()
             {
                 return Ok(false);
             }
         }
     }
-    ensure_running(&model.path, model.server_slots(), cancel, |_| {}).await?;
+    ensure_running(
+        &model.path,
+        model.server_slots(),
+        model.chat_template(),
+        cancel,
+        |_| {},
+    )
+    .await?;
     Ok(true)
 }
 
 async fn stop(mut r: Running) {
     let _ = r.child.kill().await;
+    remove_pid_file();
 }
 
 /// Stops the server, if any (cancel, model change, app exit).
@@ -755,17 +1013,23 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn server_args_bind_localhost_with_key() {
-        let args = server_args(&ServerConfig {
+    fn config(template: ChatTemplate) -> ServerConfig {
+        ServerConfig {
             model: "/m/model.gguf".into(),
             port: 4242,
             api_key: "k".repeat(64),
+            alias: "code-pruefer-abc".into(),
+            template,
             threads: 6,
             threads_batch: 12,
             parallel: 4,
             kv_quant: true,
-        });
+        }
+    }
+
+    #[test]
+    fn server_args_bind_localhost_with_key() {
+        let args = server_args(&config(ChatTemplate::FromModel));
         let pair = |flag: &str| {
             let i = args.iter().position(|a| a == flag).expect(flag);
             args[i + 1].clone()
@@ -773,7 +1037,12 @@ mod tests {
         assert_eq!(pair("-m"), "/m/model.gguf");
         assert_eq!(pair("--host"), "127.0.0.1");
         assert_eq!(pair("--port"), "4242");
-        assert_eq!(pair("--api-key").len(), 64);
+        assert_eq!(pair("--alias"), "code-pruefer-abc");
+        // The key is never on the command line.
+        assert!(!args
+            .iter()
+            .any(|a| a == "--api-key" || a.contains(&"k".repeat(64))));
+        assert!(!args.iter().any(|a| a == "--chat-template"));
         assert_eq!(pair("--ctx-size"), "16384");
         assert_eq!(pair("--threads"), "6");
         assert_eq!(pair("--threads-batch"), "12");
@@ -785,15 +1054,123 @@ mod tests {
             assert!(args.iter().any(|a| a == flag), "{flag}");
         }
         let plain = server_args(&ServerConfig {
-            model: "/m".into(),
-            port: 1,
-            api_key: "k".into(),
-            threads: 1,
-            threads_batch: 1,
-            parallel: 1,
             kv_quant: false,
+            ..config(ChatTemplate::FromModel)
         });
         assert!(!plain.iter().any(|a| a.starts_with("--cache-type")));
+    }
+
+    #[test]
+    fn unverified_models_get_the_builtin_template() {
+        let args = server_args(&config(ChatTemplate::BuiltinChatml));
+        let i = args.iter().position(|a| a == "--chat-template").unwrap();
+        assert_eq!(args[i + 1], "chatml");
+        assert!(!args.iter().any(|a| a == "--chat-template-file"));
+    }
+
+    #[test]
+    fn api_key_in_environment_and_foreign_llama_variables_removed() {
+        let (remove, set) = server_env(
+            &config(ChatTemplate::FromModel),
+            [
+                "PATH",
+                "LLAMA_ARG_HOST",
+                "llama_arg_port",
+                "LLAMA_API_KEY",
+                "HOME",
+            ]
+            .map(String::from),
+        );
+        assert_eq!(
+            remove,
+            ["LLAMA_ARG_HOST", "llama_arg_port", "LLAMA_API_KEY"]
+        );
+        assert_eq!(set, [(API_KEY_ENV.to_string(), "k".repeat(64))]);
+    }
+
+    #[test]
+    fn identity_check_needs_our_alias() {
+        // b11700 answers with both lists (tools/server: get_res_models).
+        let ours = json!({
+            "models": [{"name": "code-pruefer-abc", "model": "code-pruefer-abc"}],
+            "object": "list",
+            "data": [{"id": "code-pruefer-abc", "aliases": ["code-pruefer-abc"]}]
+        });
+        assert!(is_our_server(&ours, "code-pruefer-abc"));
+        assert!(is_our_server(
+            &json!({"data": [{"id": "x", "aliases": ["code-pruefer-abc"]}]}),
+            "code-pruefer-abc"
+        ));
+        assert!(!is_our_server(&ours, "code-pruefer-other"));
+        assert!(!is_our_server(&json!({"data": []}), "code-pruefer-abc"));
+        assert!(!is_our_server(
+            &json!("code-pruefer-abc"),
+            "code-pruefer-abc"
+        ));
+        let a = random_alias().unwrap();
+        assert!(a.starts_with("code-pruefer-") && a.len() == 13 + 32, "{a}");
+        assert_ne!(a, random_alias().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_server_is_killed_only_if_it_is_ours() {
+        let dir = std::env::temp_dir().join(format!("code-pruefer-pid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join(PID_FILE);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let exe = {
+            let mut system = sysinfo::System::new();
+            let p = sysinfo::Pid::from_u32(pid);
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[p]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always),
+            );
+            system
+                .process(p)
+                .and_then(|p| p.exe())
+                .unwrap()
+                .to_path_buf()
+        };
+        let write = |exe: &Path| {
+            let raw = serde_json::to_vec(&PidRecord {
+                pid,
+                exe: exe.to_path_buf(),
+            })
+            .unwrap();
+            std::fs::write(&pid_file, raw).unwrap();
+        };
+        // Recorded for another binary: the process is left alone.
+        write(Path::new("/anderes/llama-server"));
+        assert_eq!(kill_stale(&pid_file, &exe), None);
+        assert!(!pid_file.exists());
+        assert!(matches!(child.try_wait(), Ok(None)));
+        // Recorded binary is not what the pid runs now (pid reused).
+        write(&exe);
+        assert_eq!(
+            kill_stale(&pid_file, Path::new("/anderes/llama-server")),
+            None
+        );
+        assert!(matches!(child.try_wait(), Ok(None)));
+        // Ours: killed.
+        write(&exe);
+        assert_eq!(kill_stale(&pid_file, &exe), Some(pid));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(child.try_wait().unwrap().is_some());
+        // No pid file, garbage: nothing happens.
+        assert_eq!(kill_stale(&pid_file, &exe), None);
+        std::fs::write(&pid_file, "kaputt").unwrap();
+        assert_eq!(kill_stale(&pid_file, &exe), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

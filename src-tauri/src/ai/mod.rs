@@ -5,6 +5,7 @@
 //! Everything runs on this machine; the only network access is the model
 //! download from huggingface.co (`models`).
 
+pub mod gguf;
 pub mod llama;
 pub mod models;
 pub mod ocr_fix;

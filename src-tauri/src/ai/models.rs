@@ -610,9 +610,21 @@ pub struct SelectedModel {
     pub id: String,
     pub path: PathBuf,
     pub solutions: u32,
+    /// The file's SHA-256 matched the (pinned) catalog. Otherwise
+    /// (imported unknown model, unpinned catalog entry) llama-server uses
+    /// its built-in chat template instead of the file's.
+    pub verified: bool,
 }
 
 impl SelectedModel {
+    pub fn chat_template(&self) -> llama::ChatTemplate {
+        if self.verified {
+            llama::ChatTemplate::FromModel
+        } else {
+            llama::ChatTemplate::BuiltinChatml
+        }
+    }
+
     /// llama-server slots: one per solution plus one for the test inputs,
     /// which are generated at the same time. OCR correction uses the same
     /// number, so it reuses the running server.
@@ -633,7 +645,8 @@ pub fn selected_model() -> Result<SelectedModel, AiError> {
     let id = config.selected.clone().ok_or_else(not_ready)?;
     let dir = models_dir()?;
     if let Some(m) = catalog().iter().find(|m| m.id == id) {
-        let path = if catalog_installed(&dir, m) {
+        let verified = catalog_installed(&dir, m);
+        let path = if verified {
             dir.join(&m.files[0].name)
         } else {
             let parts = unverified_parts(&dir, &config, &m.id);
@@ -644,6 +657,7 @@ pub fn selected_model() -> Result<SelectedModel, AiError> {
             id,
             path,
             solutions: m.solutions,
+            verified,
         });
     }
     let imp = config
@@ -663,6 +677,7 @@ pub fn selected_model() -> Result<SelectedModel, AiError> {
         } else {
             IMPORTED_SOLUTIONS_SMALL
         },
+        verified: false,
     })
 }
 
@@ -1235,6 +1250,21 @@ async fn check_gguf_file(path: &Path) -> Result<(String, u64), AiError> {
     if !is_gguf_magic(&magic) {
         return Err(AiError::Other(format!(
             "„{name}“ ist keine GGUF-Datei (Dateianfang ist nicht „GGUF“)."
+        )));
+    }
+    // Metadata and tensor list within the ranges of real models, before
+    // llama.cpp's native parser ever sees the file.
+    let header_path = path.to_path_buf();
+    let header = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&header_path).map_err(|e| e.to_string())?;
+        super::gguf::check_header(std::io::BufReader::new(file))
+    })
+    .await
+    .map_err(|e| AiError::Other(e.to_string()))?;
+    if let Err(detail) = header {
+        return Err(AiError::Other(format!(
+            "„{name}“ hat ungewöhnliche Metadaten ({detail}) und wird nicht übernommen – \
+             vermutlich ist die Datei beschädigt oder manipuliert."
         )));
     }
     Ok((name, size))
@@ -1837,6 +1867,17 @@ mod tests {
             .block_on(import(&dir.join("fehlt.gguf"), true, &token, |_| {}))
             .unwrap_err();
         assert!(e.to_string().contains("nicht gefunden"), "{e}");
+        // GGUF magic, but metadata outside the plausible ranges.
+        let odd = dir.join("odd.gguf");
+        std::fs::write(&odd, b"GGUF\x01\x00\x00\x00rest").unwrap();
+        let e = rt
+            .block_on(import(&odd, true, &token, |_| {}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("ungewöhnliche Metadaten (GGUF-Version 1)"),
+            "{e}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1985,9 +2026,10 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         let p1 = "qwen2.5-coder-7b-instruct-q4_k_m-00001-of-00002.gguf";
         let p2 = "qwen2.5-coder-7b-instruct-q4_k_m-00002-of-00002.gguf";
-        std::fs::write(src.join(p1), b"GGUF part one").unwrap();
-        std::fs::write(src.join(p2), b"GGUF two").unwrap();
-        std::fs::write(src.join("other-q8_0.gguf"), b"GGUF other").unwrap();
+        let gguf = super::super::gguf::tests::minimal;
+        std::fs::write(src.join(p1), gguf("part one")).unwrap();
+        std::fs::write(src.join(p2), gguf("two")).unwrap();
+        std::fs::write(src.join("other-q8_0.gguf"), gguf("other")).unwrap();
         std::fs::write(src.join("fake-q4_k_m.gguf"), b"PK\x03\x04").unwrap();
         let token = CancellationToken::new();
         let run = |paths: &[&str], confirm: bool| {
@@ -2038,7 +2080,10 @@ mod tests {
         assert!(!r.incomplete && r.missing_parts.is_empty());
         let m = entry(&r.status);
         assert!(m.installed && !m.verified && m.selected);
-        assert_eq!(m.size_bytes, 13 + 8);
+        assert_eq!(
+            m.size_bytes,
+            (gguf("part one").len() + gguf("two").len()) as u64
+        );
         let sel = selected_model().unwrap();
         assert_eq!(sel.solutions, large.solutions);
         assert_eq!(

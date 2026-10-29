@@ -302,6 +302,11 @@ pub fn run() {
                 // llama-server and its libraries: <resource_dir>/llama.
                 ai::llama::init_resource_dir(dir);
             }
+            // Pid file of llama-server; ends a server left over from a
+            // crash (macOS/Linux; Windows uses a job object).
+            if let Ok(data) = app.path().app_data_dir() {
+                ai::llama::init_state_dir(data);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

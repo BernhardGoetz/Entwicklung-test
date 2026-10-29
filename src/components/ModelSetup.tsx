@@ -326,6 +326,14 @@ export function ModelSetup({ status, onStatus, onClose, returnFocus }: Props) {
               kann schlechte oder unsinnige Testfälle liefern und ist nicht geprüft.
             </p>
           )}
+          <p>
+            <strong>Sicherheitshinweis:</strong> Modelldateien werden von der KI-Laufzeit (llama.cpp,
+            nativer Code mit deinen Benutzerrechten) eingelesen. Eine manipulierte Datei kann Fehler in
+            diesem Programm ausnutzen oder eine bösartige Chat-Vorlage enthalten. Nur Dateien aus
+            vertrauenswürdiger Quelle importieren (z. B. direkt von huggingface.co heruntergeladen) – keine
+            Dateien unbekannter Herkunft aus Chats, von USB-Sticks oder Lernplattformen. Für ungeprüfte
+            Modelle verwendet der Code-Prüfer seine eingebaute Chat-Vorlage statt der aus der Datei.
+          </p>
           {pendingImport.warnings.length > 0 && (
             <ul>
               {pendingImport.warnings.map((w) => (
