@@ -12,6 +12,8 @@ name: Release
 #     mit eingebetteten Images und llama-server (KI-Laufzeit, Version und
 #     SHA-256 gepinnt in scripts/fetch-llama-server.sh;
 #     src-tauri/tauri.release.conf.json). KI-Modelle sind nicht enthalten.
+#     Windows wird über SignPath signiert, sobald SignPath im Environment
+#     "release" eingerichtet ist (docs/RELEASE_SIGNING.md), sonst unsigniert.
 #  4. ein Entwurfs-Release (draft) mit allen Installern, SHA256SUMS.txt und
 #     einer Build-Provenance-Attestierung (gh attestation verify …).
 # Der Job "version" pinnt außerdem den KI-Modellkatalog (Revision, Datei,
@@ -188,16 +190,20 @@ jobs:
 
   # Release-Jobs bauen ohne npm- und Rust-Cache (Schutz vor Cache-Poisoning);
   # nur ci.yml nutzt Caches.
-  bundle-windows:
-    needs: images
+  #
+  # Windows in zwei Jobs, damit die Signatur (SignPath, asynchron über
+  # GitHub-Artefakte, docs/RELEASE_SIGNING.md) die App nicht neu baut:
+  #  - build-windows kompiliert code-pruefer.exe (ohne Bündeln, ohne
+  #    Secrets) und legt sie mit der KI-Laufzeit als Artefakt
+  #    "windows-unsigned" ab (mit SHA256SUMS.txt),
+  #  - bundle-windows bündelt daraus mit `tauri bundle` den NSIS-Installer
+  #    und signiert dabei über SignPath (oder gar nicht, solange SignPath
+  #    nicht eingerichtet ist).
+  build-windows:
+    needs: version
     runs-on: windows-latest
     permissions:
       contents: read
-    # Für die optionalen Signatur-Secrets (siehe unten).
-    environment: release
-    env:
-      # Secrets sind in `if:` nicht direkt verfügbar.
-      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -207,6 +213,117 @@ jobs:
           node-version: 22
           package-manager-cache: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Gepinnter KI-Modellkatalog
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: model-catalog
+          path: src-tauri/src/ai
+
+      - name: KI-Modellkatalog prüfen
+        shell: bash
+        run: scripts/pin-models.sh --check
+
+      - run: npm ci
+
+      # --no-bundle: nur Frontend + cargo build --release (wie `tauri build`),
+      # gebündelt wird in bundle-windows.
+      - name: App bauen (unsigniert, ohne Installer)
+        run: npm run tauri -- build --no-bundle
+
+      - name: llama-server (KI-Laufzeit, Windows x64) holen und prüfen
+        shell: bash
+        run: scripts/fetch-llama-server.sh win-x64
+
+      # llama-server braucht die Visual-C++-Laufzeit (MSVCP140.dll,
+      # VCRUNTIME140.dll, VCRUNTIME140_1.dll), die nicht auf jedem Windows
+      # installiert ist. Sie wird app-lokal neben llama-server.exe gelegt
+      # (Redist-Ordner der Visual-Studio-Installation des Runners). Die DLLs
+      # sind von Microsoft signiert und werden nicht neu signiert.
+      - name: Visual-C++-Laufzeit für llama-server
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem -Path "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "Visual-C++-Redist-Ordner nicht gefunden" }
+          foreach ($dll in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
+            Copy-Item (Join-Path $crt.FullName $dll) src-tauri/resources/llama/
+          }
+          Get-ChildItem src-tauri/resources/llama
+
+      - name: Unsignierte Programmdateien sammeln
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p windows-unsigned/llama
+          cp src-tauri/target/release/code-pruefer.exe windows-unsigned/
+          cp src-tauri/resources/llama/* windows-unsigned/llama/
+          (cd windows-unsigned && sha256sum code-pruefer.exe llama/* > SHA256SUMS.txt)
+          {
+            echo "### Windows: unsignierte Programmdateien (SHA-256)"
+            echo
+            echo '```'
+            cat windows-unsigned/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-unsigned
+          path: windows-unsigned/
+          retention-days: 7
+          if-no-files-found: error
+
+  bundle-windows:
+    needs: [images, build-windows]
+    runs-on: windows-latest
+    permissions:
+      contents: read # Checkout
+      # SignPath (Pipeline-Connector) liest mit dem GITHUB_TOKEN dieses Jobs
+      # die Job-Daten und lädt das zu signierende Artefakt herunter
+      # (Eingabe github-token der Action, Standard: github.token).
+      actions: read # Artefakt-Download durch SignPath
+    # SignPath-Secret und -Variablen liegen im Environment "release".
+    environment: release
+    outputs:
+      signed: ${{ steps.mode.outputs.enabled }}
+    env:
+      # Secrets sind in `if:` nicht direkt verfügbar.
+      HAS_SIGNPATH_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+      SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+      # Fremdbinaries (llama.cpp-Laufzeit, NSIS-Plugins) nur signieren, wenn
+      # die SignPath Foundation das ausdrücklich erlaubt hat.
+      SIGNPATH_SIGN_UPSTREAM: ${{ vars.SIGNPATH_SIGN_UPSTREAM == 'true' }}
+      SIGNPATH_SIGNED_DIR: ${{ github.workspace }}/signpath/signed
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      # `tauri bundle` liest die Projektdaten über `cargo metadata`.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: npm ci
+
+      - name: Unsignierte Programmdateien aus build-windows
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-unsigned
+          path: windows-unsigned
+
+      - name: Programmdateien prüfen und einsetzen
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd windows-unsigned && sha256sum -c SHA256SUMS.txt)
+          mkdir -p src-tauri/target/release src-tauri/resources/llama
+          cp windows-unsigned/code-pruefer.exe src-tauri/target/release/
+          cp windows-unsigned/llama/* src-tauri/resources/llama/
 
       - name: Image-Archive (amd64) in den Ressourcenordner
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -225,70 +342,269 @@ jobs:
         shell: bash
         run: jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
 
-      - name: Gepinnter KI-Modellkatalog
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: model-catalog
-          path: src-tauri/src/ai
-
-      - name: KI-Modellkatalog prüfen
+      # Signatur nur, wenn Secret SIGNPATH_API_TOKEN und die Variablen
+      # SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG und
+      # SIGNPATH_SIGNING_POLICY_SLUG im Environment "release" gesetzt sind.
+      # Ohne alle vier: unsignierter Installer mit Warnung; nur ein Teil
+      # gesetzt: Abbruch (Tippfehler sollen nicht still unsigniert enden).
+      - name: Signatur-Modus bestimmen
+        id: mode
         shell: bash
-        run: scripts/pin-models.sh --check
-
-      - name: llama-server (KI-Laufzeit, Windows x64) holen und prüfen
-        shell: bash
-        run: scripts/fetch-llama-server.sh win-x64
-
-      # llama-server braucht die Visual-C++-Laufzeit (MSVCP140.dll,
-      # VCRUNTIME140.dll, VCRUNTIME140_1.dll), die nicht auf jedem Windows
-      # installiert ist. Sie wird app-lokal neben llama-server.exe gelegt
-      # (Redist-Ordner der Visual-Studio-Installation des Runners).
-      - name: Visual-C++-Laufzeit für llama-server
-        shell: pwsh
         run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
-          $crt = Get-ChildItem -Path "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $crt) { throw "Visual-C++-Redist-Ordner nicht gefunden" }
-          foreach ($dll in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
-            Copy-Item (Join-Path $crt.FullName $dll) src-tauri/resources/llama/
-          }
-          Get-ChildItem src-tauri/resources/llama
+          set -euo pipefail
+          set_count=0
+          for v in "$HAS_SIGNPATH_TOKEN" "${SIGNPATH_ORGANIZATION_ID:+true}" \
+            "${SIGNPATH_PROJECT_SLUG:+true}" "${SIGNPATH_SIGNING_POLICY_SLUG:+true}"; do
+            if [ "$v" = "true" ]; then set_count=$((set_count + 1)); fi
+          done
+          if [ "$set_count" -eq 0 ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SignPath ist nicht eingerichtet – der Windows-Installer wird UNSIGNIERT gebaut (docs/RELEASE_SIGNING.md)."
+            {
+              echo "### ⚠️ Windows-Installer unsigniert"
+              echo
+              echo "SignPath ist im Environment \`release\` nicht eingerichtet (Secret \`SIGNPATH_API_TOKEN\`,"
+              echo "Variablen \`SIGNPATH_ORGANIZATION_ID\`, \`SIGNPATH_PROJECT_SLUG\`, \`SIGNPATH_SIGNING_POLICY_SLUG\`)."
+              echo "SmartScreen warnt, Smart App Control blockiert den Installer. Anleitung: docs/RELEASE_SIGNING.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$set_count" -ne 4 ]; then
+            echo "::error::SignPath ist nur teilweise eingerichtet (Secret SIGNPATH_API_TOKEN und Variablen SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG im Environment release prüfen)."
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          # signCommand mit absolutem Skriptpfad (Tauri ruft ihn auch aus
+          # makensis heraus auf, mit anderem Arbeitsverzeichnis).
+          node -e '
+            const path = require("node:path");
+            const script = path.join(process.env.GITHUB_WORKSPACE, "scripts", "signpath-stage.mjs");
+            const conf = { bundle: { windows: { signCommand: { cmd: "node", args: [script, "%1"] } } } };
+            require("node:fs").writeFileSync("src-tauri/tauri.sign.conf.json", JSON.stringify(conf, null, 2));
+          '
+          cat src-tauri/tauri.sign.conf.json
+          {
+            echo "### Windows-Signatur: SignPath"
+            echo
+            echo "Signing Policy: \`$SIGNPATH_SIGNING_POLICY_SLUG\`, Fremdbinaries signieren: \`$SIGNPATH_SIGN_UPSTREAM\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - run: npm ci
+      # --no-binary-patching: Tauri würde sonst code-pruefer.exe bei jedem
+      # Bündeln verändern (Bundle-Typ für den Updater, den die App nicht
+      # nutzt) und damit eine vorhandene Signatur zerstören; so bleibt die
+      # Exe bitgleich mit "windows-unsigned".
+      - name: Installer bauen (unsigniert)
+        if: steps.mode.outputs.enabled != 'true'
+        shell: bash
+        run: npm run tauri -- bundle --bundles nsis --no-binary-patching --config src-tauri/tauri.release.conf.json
 
-      # OPTIONAL – wird übersprungen, solange das Secret WINDOWS_CERTIFICATE
-      # (base64 .pfx, Code-Signing-Zertifikat) fehlt; dazu
-      # WINDOWS_CERTIFICATE_PASSWORD. Importiert das Zertifikat und schreibt
-      # ein Konfigurations-Overlay mit dessen Fingerabdruck, mit dem Tauri
-      # exe und Installer per signtool signiert. Ohne Secret: unsigniert.
-      - name: Code-Signing vorbereiten (optional)
-        if: env.HAS_WINDOWS_CERT == 'true'
+      # Signieren in Runden (scripts/signpath-stage.mjs): Jede Runde bündelt
+      # neu; Tauri ruft dabei für jede zu signierende Datei das Skript auf,
+      # das bereits signierte Fassungen einsetzt und den Rest sammelt. Das
+      # Gesammelte geht als Artefakt an SignPath. Ohne Fremdbinaries:
+      #   Runde 1: code-pruefer.exe + Uninstaller, Runde 2: Installer.
+      # Mit Fremdbinaries (SIGNPATH_SIGN_UPSTREAM=true):
+      #   Runde 1: code-pruefer.exe, llama-Laufzeit, NSIS-Plugins,
+      #   Runde 2: Uninstaller (enthält die Plugins), Runde 3: Installer.
+      # Jeder Signaturauftrag wartet bis zu einer Stunde (bei Release-
+      # Signing muss er in SignPath manuell freigegeben werden).
+      - name: "Runde 1: bündeln und sammeln"
+        id: r1
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        env:
+          SIGNPATH_STAGE_DIR: ${{ github.workspace }}/signpath/stage-1
+        run: |
+          set -euo pipefail
+          npm run tauri -- bundle --bundles nsis --no-binary-patching \
+            --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.sign.conf.json
+          scripts/signpath-round.sh "$SIGNPATH_STAGE_DIR"
+
+      - name: "Runde 1: Artefakt für SignPath"
+        id: u1
+        if: steps.r1.outputs.pending == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signpath-unsigned-1
+          path: signpath/stage-1/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: "Runde 1: bei SignPath signieren"
+        if: steps.r1.outputs.pending == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.u1.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signpath/signed-1
+
+      - name: "Runde 1: Signaturen übernehmen"
+        if: steps.r1.outputs.pending == 'true'
+        shell: bash
+        run: node scripts/signpath-stage.mjs --import signpath/signed-1 signpath/stage-1
+
+      - name: "Runde 2: bündeln und sammeln"
+        id: r2
+        if: steps.r1.outputs.pending == 'true' && steps.r1.outputs.installer != 'true'
+        shell: bash
+        env:
+          SIGNPATH_STAGE_DIR: ${{ github.workspace }}/signpath/stage-2
+        run: |
+          set -euo pipefail
+          npm run tauri -- bundle --bundles nsis --no-binary-patching \
+            --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.sign.conf.json
+          scripts/signpath-round.sh "$SIGNPATH_STAGE_DIR"
+
+      - name: "Runde 2: Artefakt für SignPath"
+        id: u2
+        if: steps.r2.outputs.pending == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signpath-unsigned-2
+          path: signpath/stage-2/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: "Runde 2: bei SignPath signieren"
+        if: steps.r2.outputs.pending == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.u2.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signpath/signed-2
+
+      - name: "Runde 2: Signaturen übernehmen"
+        if: steps.r2.outputs.pending == 'true'
+        shell: bash
+        run: node scripts/signpath-stage.mjs --import signpath/signed-2 signpath/stage-2
+
+      - name: "Runde 3: bündeln und sammeln"
+        id: r3
+        if: steps.r2.outputs.pending == 'true' && steps.r2.outputs.installer != 'true'
+        shell: bash
+        env:
+          SIGNPATH_STAGE_DIR: ${{ github.workspace }}/signpath/stage-3
+        run: |
+          set -euo pipefail
+          npm run tauri -- bundle --bundles nsis --no-binary-patching \
+            --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.sign.conf.json
+          # Letzte Runde: hier darf nur noch der Installer offen sein.
+          scripts/signpath-round.sh "$SIGNPATH_STAGE_DIR" --last
+
+      - name: "Runde 3: Artefakt für SignPath"
+        id: u3
+        if: steps.r3.outputs.pending == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signpath-unsigned-3
+          path: signpath/stage-3/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: "Runde 3: bei SignPath signieren"
+        if: steps.r3.outputs.pending == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.u3.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signpath/signed-3
+
+      - name: "Runde 3: Signaturen übernehmen"
+        if: steps.r3.outputs.pending == 'true'
+        shell: bash
+        run: node scripts/signpath-stage.mjs --import signpath/signed-3 signpath/stage-3
+
+      # Der Installer ist die letzte signierte Datei; Tauri hat ihn nach dem
+      # Sammeln nicht mehr angefasst, also passt sein SHA-256 zur Stage.
+      - name: Signierten Installer einsetzen
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if [ "${#installers[@]}" -ne 1 ]; then
+            echo "::error::Erwartet genau einen Installer, gefunden: ${#installers[@]}"
+            exit 1
+          fi
+          node scripts/signpath-stage.mjs --apply "${installers[0]}"
+
+      # Prüft den Installer und jede PE-Datei darin (mit 7-Zip entpackt:
+      # Programmordner, $PLUGINSDIR, uninstall.exe). Mit SignPath schlägt der
+      # Job fehl, wenn Installer, code-pruefer.exe oder uninstall.exe nicht
+      # signiert sind, eine Datei eine ungültige Signatur hat oder eine
+      # unbekannte PE-Datei unsigniert ist. Fremdbinaries (llama-Laufzeit,
+      # NSIS-Plugins) dürfen nur ohne SIGNPATH_SIGN_UPSTREAM unsigniert sein
+      # (Warnung). Mit einer Test-Signing-Policy (Slug enthält "test") ist
+      # das Zertifikat nicht vertrauenswürdig; dann genügt eine vorhandene
+      # Signatur.
+      - name: Signaturen prüfen
         shell: pwsh
         env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          SIGNING_ENABLED: ${{ steps.mode.outputs.enabled }}
         run: |
-          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
-          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
-          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
-          Remove-Item $pfx
-          $config = @{ bundle = @{ windows = @{
-            certificateThumbprint = $cert.Thumbprint
-            digestAlgorithm = "sha256"
-            timestampUrl = "http://timestamp.digicert.com"
-          } } }
-          $config | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 src-tauri/tauri.sign.conf.json
-
-      - name: Installer bauen (NSIS, deutsch, mit Images und KI-Laufzeit)
-        shell: bash
-        run: |
-          sign=()
-          if [ -f src-tauri/tauri.sign.conf.json ]; then
-            sign=(--config src-tauri/tauri.sign.conf.json)
-          fi
-          npm run tauri -- build --bundles nsis --config src-tauri/tauri.release.conf.json "${sign[@]}"
+          $ErrorActionPreference = "Stop"
+          $enabled = $env:SIGNING_ENABLED -eq "true"
+          $upstreamSigned = $env:SIGNPATH_SIGN_UPSTREAM -eq "true"
+          $trusted = $enabled -and ($env:SIGNPATH_SIGNING_POLICY_SLUG -notmatch "test")
+          $installer = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if ($installer.Count -ne 1) { throw "Erwartet genau einen Installer" }
+          $payload = Join-Path $env:RUNNER_TEMP "payload"
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe" }
+          & $sevenZip x -y "-o$payload" $installer[0].FullName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip konnte den Installer nicht entpacken" }
+          if (-not (Test-Path (Join-Path $payload "code-pruefer.exe"))) { throw "code-pruefer.exe nicht im Installer gefunden" }
+          $files = @($installer[0]) + @(Get-ChildItem -Path $payload -Recurse -File -Include *.exe, *.dll)
+          $errors = @(); $warnings = @(); $rows = @()
+          foreach ($f in $files) {
+            $rel = if ($f.FullName.StartsWith($payload)) { $f.FullName.Substring($payload.Length + 1) } else { $f.Name }
+            $sig = Get-AuthenticodeSignature -LiteralPath $f.FullName
+            $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "" }
+            $rows += "| ``$rel`` | $($sig.Status) | $subject |"
+            $microsoft = $sig.Status -eq "Valid" -and $subject -match "O=Microsoft Corporation"
+            $own = $f.FullName -eq $installer[0].FullName -or $rel -in @("code-pruefer.exe", "uninstall.exe")
+            $upstream = $rel -like "llama\*" -or $rel -like '$PLUGINSDIR\*'
+            if ($microsoft) { continue }
+            if (-not $sig.SignerCertificate) {
+              if (-not $enabled) { continue }
+              if ($upstream -and -not $upstreamSigned) { $warnings += $rel; continue }
+              $errors += "$rel ist nicht signiert"
+              continue
+            }
+            if ($sig.Status -ne "Valid" -and ($trusted -or (-not $own -and -not $upstream))) {
+              $errors += "$rel`: Signatur $($sig.Status) ($($sig.StatusMessage))"
+            }
+          }
+          $summary = @("### Windows: Signaturen im Installer", "", "| Datei | Status | Signiert von |", "|---|---|---|") + $rows
+          if ($warnings.Count -gt 0) {
+            $summary += @("", "Unsigniert (Fremdbinaries, SIGNPATH_SIGN_UPSTREAM ist nicht true): $($warnings.Count) Dateien.")
+            Write-Output "::warning::$($warnings.Count) Fremdbinaries (llama-Laufzeit, NSIS-Plugins) sind unsigniert; Smart App Control kann sie blockieren (docs/RELEASE_SIGNING.md)."
+          }
+          if (-not $enabled) { $summary += @("", "**Signatur nicht eingerichtet – alles unsigniert.**") }
+          $summary | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Output "::error::$_" }
+            throw "$($errors.Count) Signaturfehler"
+          }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -435,6 +751,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.version.outputs.version }}
           REGISTRY: ${{ needs.version.outputs.registry }}
+          WINDOWS_SIGNED: ${{ needs.bundle-windows.outputs.signed }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -443,10 +760,15 @@ jobs:
             echo "::error::Keine Installer gefunden."
             exit 1
           fi
+          if [ "$WINDOWS_SIGNED" = "true" ]; then
+            windows_note="signiert über SignPath (Herausgeber: SignPath Foundation)"
+          else
+            windows_note="unsigniert"
+          fi
           cat > notes.md <<EOF
-          Code-Prüfer ${VERSION} (Entwurf, unsigniert)
+          Code-Prüfer ${VERSION} (Entwurf)
 
-          - Windows x64: \`*_x64-setup.exe\`
+          - Windows x64: \`*_x64-setup.exe\` (${windows_note})
           - macOS Apple Silicon: \`*_aarch64.dmg\`, macOS Intel: \`*_x64.dmg\`
           - Prüfsummen: \`SHA256SUMS.txt\` (\`sha256sum -c SHA256SUMS.txt\`); Herkunft:
             \`gh attestation verify <Datei> --repo ${GH_REPO}\`

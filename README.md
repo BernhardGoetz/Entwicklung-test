@@ -184,8 +184,8 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
   Windows/macOS). Gegenmaßnahme: Engine aktuell halten.
 - Installer und App sind (noch) nicht signiert; SmartScreen/Gatekeeper warnen, und die
   Echtheit lässt sich nur über `SHA256SUMS.txt` und die Attestierung prüfen.
-  Windows-Signatur ist vorbereitet (Secrets `WINDOWS_CERTIFICATE`,
-  `WINDOWS_CERTIFICATE_PASSWORD` im Environment `release`), ebenso macOS (siehe unten).
+  Die Windows-Signatur über die SignPath Foundation ist vorbereitet (siehe
+  „Code-Signing“), die macOS-Signatur ebenfalls (siehe unten).
 - `image-digests.json` liegt neben den Archiven im Programmordner. Wer dort schreiben
   kann, kann beides austauschen; die Prüfung schützt vor beschädigten und einzeln
   ausgetauschten Archiven sowie vor fremden Images unter dem gepinnten Tag, nicht vor
@@ -199,10 +199,11 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
 
 1. **Environment `release`** anlegen (Settings → Environments → New environment):
    „Required reviewers“ = Bernhard, „Deployment branches and tags“ = „Selected branches and
-   tags“ mit der Tag-Regel `v*`. Die Apple-Secrets (`APPLE_CERTIFICATE`, …) und optional
-   `WINDOWS_CERTIFICATE`/`WINDOWS_CERTIFICATE_PASSWORD` dort als **Environment-Secrets**
-   hinterlegen, nicht als Repository-Secrets. Die Jobs `bundle-windows` und
-   `bundle-macos` warten dann auf die Freigabe.
+   tags“ mit der Tag-Regel `v*`. Die Apple-Secrets (`APPLE_CERTIFICATE`, …) und das
+   SignPath-Secret `SIGNPATH_API_TOKEN` samt Variablen (siehe
+   [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md)) dort als **Environment-Secrets**
+   bzw. **Environment-Variablen** hinterlegen, nicht im Repository. Die Jobs
+   `bundle-windows` und `bundle-macos` warten dann auf die Freigabe.
 2. **Tag-Schutz:** Settings → Rules → Rulesets → New tag ruleset, Ziel `v*`, „Restrict
    creations“, „Restrict updates“ und „Restrict deletions“, Bypass nur für Bernhard.
 3. **GHCR-Pakete öffentlich:** `code-pruefer-python` und `code-pruefer-java` unter
@@ -471,7 +472,11 @@ Integrationstest für das Laden aus einem Archiv:
   macOS-Signatur/Notarisierung ist vorbereitet, läuft aber nur, wenn das Secret
   `APPLE_CERTIFICATE` (plus `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
   `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`) im Environment `release` gesetzt ist;
-  die Windows-Signatur entsprechend mit `WINDOWS_CERTIFICATE` (siehe „Sicherheit“).
+  die Windows-Signatur über SignPath, sobald `SIGNPATH_API_TOKEN` und die
+  SignPath-Variablen im Environment `release` gesetzt sind (sonst unsigniert mit Warnung;
+  [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md)). Windows wird dafür in zwei Jobs
+  gebaut: `build-windows` kompiliert die App, `bundle-windows` bündelt sie mit
+  `tauri bundle` und signiert dabei in Runden (`scripts/signpath-stage.mjs`).
 - `.github/workflows/images.yml` baut die Images bei Änderungen nur noch als `:edge` /
   `:sha-…`; Versions-Tags kommen ausschließlich aus dem Release-Workflow.
 - GHCR-Namen müssen klein geschrieben sein (der Workflow wandelt den Owner um).
@@ -533,6 +538,12 @@ src-tauri/tauri.release.conf.json
                          Release-Overlay: bündelt resources/images/*.tar.gz,
                          resources/images/image-digests.json und resources/llama/*
 images/                  Dockerfiles der Runner-Images
+scripts/signpath-stage.mjs, scripts/signpath-round.sh
+                         Windows-Signatur über SignPath in Runden (release.yml)
+.signpath/               SignPath-Artefaktkonfigurationen (zum Einfügen in SignPath)
+docs/CODE_SIGNING_POLICY.md, docs/RELEASE_SIGNING.md
+                         Code-Signing-Policy (englisch) und Einrichtung (deutsch)
+LICENSE                  MIT-Lizenz
 scripts/export-image-archives.sh
                          Image-Archive und image-digests.json erzeugen
 scripts/fetch-llama-server.sh
@@ -553,13 +564,35 @@ unter `images/`.
   Texterkennung“); keine Speicherung von Aufgaben/Testfällen.
 - Vergleich nur über stdout (Zeilen, Wörter oder Zahlen mit Toleranz).
 - Builds sind nicht signiert (Windows SmartScreen / macOS Gatekeeper warnen; Signatur ist
-  vorbereitet), kein Auto-Update der App (die Images lassen sich über „Images aktualisieren“ neu laden).
+  vorbereitet, Windows über die SignPath Foundation), kein Auto-Update der App (die Images lassen sich über „Images aktualisieren“ neu laden).
 - Mit eingebetteten Images ist der Installer deutlich größer (Java-Image ≈ 200 MB).
 - Benötigt eine Container-Engine (Docker Desktop oder Podman); der Windows-Installer kann
   sie über winget nachinstallieren.
 
 Geplant für spätere Phasen: weitere Sprachen (C/C++/C#/JavaScript), signierter
-Aufgabenkatalog, Code-Signing, Updater.
+Aufgabenkatalog, macOS-Signatur, Updater.
+
+## Code-Signing
+
+Windows-Releases sollen über das Open-Source-Programm der SignPath Foundation signiert
+werden:
+
+> Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by
+> [SignPath Foundation](https://signpath.org/).
+
+Kurzfassung der [Code-Signing-Policy](docs/CODE_SIGNING_POLICY.md) (englisch, verbindlich):
+Signiert werden nur Windows-Builds, die GitHub Actions in diesem Repository aus einem
+Versions-Tag `v*` baut, und zwar `code-pruefer.exe`, `uninstall.exe` und der Installer.
+Autor, Committer, Reviewer und Approver ist Bernhard Götz. Jeder Signaturauftrag wird
+von Hand freigegeben. Datenschutz: Die App arbeitet lokal, ohne Telemetrie. Netzwerk nutzt
+sie nur für den optionalen Modell-Download von huggingface.co und für das Laden der
+Runner-Images von ghcr.io (über Docker/Podman). Einrichtung und offene Punkte (z. B.
+Fremdbinaries wie llama.cpp): [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md).
+
+## Lizenz
+
+[MIT](LICENSE) © 2026 Bernhard Götz. Mitgelieferte Drittsoftware: siehe
+[`THIRD_PARTY_NOTICES.txt`](THIRD_PARTY_NOTICES.txt).
 
 ## Recherche: lokale KI und Texterkennung
 
