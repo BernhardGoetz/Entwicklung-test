@@ -143,12 +143,22 @@ pub enum AttemptError {
     Timeout(Duration),
     /// No connection (endpoint missing, refused, error answer).
     Unreachable(String),
+    /// The endpoint is served by a process that is not the engine (Windows
+    /// named pipe of another user, see [`super::pipe_owner`]); German text.
+    Untrusted(String),
 }
 
 /// German reason for [`RunnerError::NoEngine`]. A timeout wins over other
 /// failures: it shows that an engine exists but is too slow. Pure,
 /// unit-tested.
 pub fn failure_reason(errors: &[(String, AttemptError)]) -> String {
+    // A refused (possibly hijacked) endpoint is the most important news.
+    if let Some((_, AttemptError::Untrusted(why))) = errors
+        .iter()
+        .find(|(_, e)| matches!(e, AttemptError::Untrusted(_)))
+    {
+        return why.clone();
+    }
     if let Some((host, AttemptError::Timeout(t))) = errors
         .iter()
         .find(|(_, e)| matches!(e, AttemptError::Timeout(_)))
@@ -196,7 +206,17 @@ where
 }
 
 /// One connection attempt: client for `host` plus a ping within `timeout`.
+/// On Windows, a named pipe is only used if its server process belongs to
+/// this user or to an installed program ([`super::pipe_owner`]).
 async fn try_host(host: String, timeout: Duration) -> Result<Docker, AttemptError> {
+    #[cfg(windows)]
+    {
+        let h = host.clone();
+        tokio::task::spawn_blocking(move || super::pipe_owner::verify(&h))
+            .await
+            .map_err(|e| AttemptError::Unreachable(e.to_string()))?
+            .map_err(AttemptError::Untrusted)?;
+    }
     let docker =
         Docker::connect_with_host(&host).map_err(|e| AttemptError::Unreachable(e.to_string()))?;
     match tokio::time::timeout(timeout, docker.ping()).await {
@@ -1024,6 +1044,19 @@ mod tests {
         );
         assert_eq!(CONNECT_POLICY.ping_timeout, Duration::from_secs(10));
         const { assert!(CONNECT_POLICY.attempts >= 2) };
+    }
+
+    #[test]
+    fn refused_pipe_wins_in_reason() {
+        let reason = failure_reason(&[
+            ("a".into(), AttemptError::Timeout(Duration::from_secs(10))),
+            (
+                "npipe:////./pipe/docker_engine".into(),
+                AttemptError::Untrusted("abgelehnt: fremder Prozess".into()),
+            ),
+            ("b".into(), AttemptError::Unreachable("x".into())),
+        ]);
+        assert_eq!(reason, "abgelehnt: fremder Prozess");
     }
 
     #[test]

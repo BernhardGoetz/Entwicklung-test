@@ -184,6 +184,15 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
 - **Die App selbst und die Container-Engine sind vertrauenswürdig.** Wer die Engine
   steuern kann (Docker-Socket, Named Pipe, `DOCKER_HOST`), hat faktisch
   Administratorrechte – das gilt unabhängig vom Code-Prüfer.
+- **Named Pipes unter Windows** (`docker_engine`, `podman-machine-default`) gibt es nur
+  einmal pro Rechner, für alle angemeldeten Benutzer. Damit kein anderer Benutzer eine
+  solche Pipe vor der Engine anlegen und Code oder Ergebnisse abgreifen kann, fragt die
+  App vor jeder Verbindung den Prozess hinter der Pipe ab
+  (`GetNamedPipeServerProcessId`). Sie verbindet sich nur, wenn er unter dem eigenen
+  Benutzerkonto läuft oder aus einem Ordner stammt, in den nur Administratoren schreiben
+  (`Programme`, `Windows`); sonst erscheint eine Fehlermeldung
+  (`src-tauri/src/runner/pipe_owner.rs`). **[ungeprüft auf echtem Windows: entwickelt und
+  per Cross-Compile geprüft; die Regeln sind Unit-getestet]**
 - **Lieferkette:** Runner-Images und Installer entstehen ausschließlich im
   Release-Workflow auf dem Branch `qas` (QAS-Lauf, danach manuelle Abnahme). Basis-Images
   und GitHub-Actions sind per Digest bzw. Commit-SHA gepinnt (Updates über Dependabot,

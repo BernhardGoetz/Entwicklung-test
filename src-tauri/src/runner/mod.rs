@@ -4,6 +4,7 @@ pub mod compare;
 pub mod docker;
 pub mod images;
 pub mod languages;
+pub mod pipe_owner;
 
 use serde::{Deserialize, Serialize};
 
