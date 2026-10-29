@@ -5,6 +5,7 @@ pub mod app_update;
 pub mod docker_detect;
 pub mod docs;
 pub mod engine;
+pub mod proc_guard;
 pub mod runner;
 
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, RunEvent};
@@ -94,15 +95,16 @@ async fn update_images(app: AppHandle) -> Result<images::ImagesReport, RunnerErr
 }
 
 /// Imports a task sheet (image, PDF, DOCX) chosen in the file dialog and
-/// returns its text for review. Parsing and OCR block, so they run on a
-/// blocking thread.
+/// returns its text for review. Parsing and OCR run in a limited worker
+/// process (docs/worker.rs); waiting for it blocks, so on a blocking thread.
 #[tauri::command]
 async fn import_task_document(
     app: AppHandle,
     path: String,
 ) -> Result<docs::ImportResult, docs::DocsError> {
     tauri::async_runtime::spawn_blocking(move || {
-        docs::import_file(std::path::Path::new(&path), |p| {
+        let worker = docs::worker::WorkerConfig::current_exe()?;
+        docs::import_file_isolated(&worker, std::path::Path::new(&path), |p| {
             let _ = app.emit(DOCS_EVENT, p);
         })
     })

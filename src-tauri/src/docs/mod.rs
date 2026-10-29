@@ -8,11 +8,13 @@ pub mod docx;
 pub mod layout;
 pub mod ocr;
 pub mod pdf;
+pub mod pdf_guard;
+pub mod worker;
 
 use std::path::Path;
 
 use base64::Engine as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::runner::compare::normalize_newlines;
 use crate::runner::Progress;
@@ -56,7 +58,7 @@ impl Serialize for DocsError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Source {
     Docx,
@@ -82,7 +84,7 @@ impl Kind {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportResult {
     pub file_name: String,
@@ -176,11 +178,12 @@ fn phase(message: impl Into<String>) -> Progress {
     }
 }
 
-/// Reads and imports the file at `path`.
-pub fn import_file(
+/// Reads the file at `path` (type and size checked first); returns its
+/// name and content.
+pub fn read_file(
     path: &Path,
-    mut on_progress: impl FnMut(Progress),
-) -> Result<ImportResult, DocsError> {
+    on_progress: &mut impl FnMut(Progress),
+) -> Result<(String, Vec<u8>), DocsError> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -198,7 +201,33 @@ pub fn import_file(
             (bytes.len() as u64).div_ceil(1024 * 1024),
         ));
     }
+    Ok((file_name, bytes))
+}
+
+/// Reads and imports the file at `path` in this process (tests; the app
+/// uses [`import_file_isolated`]).
+pub fn import_file(
+    path: &Path,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<ImportResult, DocsError> {
+    let (file_name, bytes) = read_file(path, &mut on_progress)?;
     import_bytes(&file_name, &bytes, on_progress)
+}
+
+/// Reads the file at `path` and imports it in the worker process (see
+/// [`worker`]): a hostile file can at most end the worker, never the app.
+pub fn import_file_isolated(
+    config: &worker::WorkerConfig,
+    path: &Path,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<ImportResult, DocsError> {
+    let (file_name, bytes) = read_file(path, &mut on_progress)?;
+    worker::import(config, &file_name, &bytes, on_progress)
+}
+
+/// Whether `file_name` names a PDF (for messages).
+pub(crate) fn is_pdf_name(file_name: &str) -> bool {
+    matches!(kind_from_extension(file_name), Ok(Kind::Pdf))
 }
 
 /// Imports a document held in memory; `file_name` determines the type.

@@ -2,8 +2,14 @@
 //!
 //! Pages without a usable text layer (scans) are detected here; their OCR
 //! happens in [`super::ocr`].
+//!
+//! Both crates do not limit their work on hostile files (decompression
+//! bombs, self-referencing XObjects); [`load`] therefore runs the checks of
+//! [`super::pdf_guard`] first, and the whole import runs in the
+//! memory- and time-limited worker process ([`super::worker`]).
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pdf_extract::{Document, PlainTextOutput};
 
@@ -35,9 +41,28 @@ fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     })
 }
 
+/// Debug self-test of the worker only: skips the [`super::pdf_guard`]
+/// checks, so tests can show that the worker's limits alone contain the
+/// audit PoCs.
+static SKIP_GUARD: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn skip_guard_for_self_test() {
+    if cfg!(debug_assertions) {
+        SKIP_GUARD.store(true, Ordering::SeqCst);
+    }
+}
+
+fn guard_enabled() -> bool {
+    !(cfg!(debug_assertions) && SKIP_GUARD.load(Ordering::SeqCst))
+}
+
 /// Loads (and, with an empty password, decrypts) the document and checks
-/// the page limit before any text is extracted.
+/// the page limit and [`super::pdf_guard`] before any text is extracted.
 pub fn load(bytes: &[u8]) -> Result<Document, DocsError> {
+    let limits = super::pdf_guard::LIMITS;
+    if guard_enabled() {
+        super::pdf_guard::check_raw(bytes, &limits)?;
+    }
     let mut doc = guarded(|| Document::load_mem(bytes))
         .map_err(damaged)?
         .map_err(damaged)?;
@@ -59,6 +84,9 @@ pub fn load(bytes: &[u8]) -> Result<Document, DocsError> {
     }
     if pages > MAX_PAGES {
         return Err(DocsError::TooManyPages(pages));
+    }
+    if guard_enabled() {
+        guarded(|| super::pdf_guard::check_document(&doc, &limits)).map_err(damaged)??;
     }
     Ok(doc)
 }
@@ -189,6 +217,19 @@ pub(crate) mod tests {
         let full = pdf(&[TASK]);
         let e = extract(&full[..full.len() / 2]).unwrap_err().to_string();
         assert!(e.contains("PDF-Datei"), "{e}");
+    }
+
+    #[test]
+    fn hostile_pdfs_are_rejected_before_extraction() {
+        use crate::docs::pdf_guard::tests::{bomb_pdf, recursive_pdf};
+        let e = extract(&recursive_pdf()).unwrap_err().to_string();
+        assert!(
+            e.starts_with("Das PDF konnte nicht sicher gelesen werden"),
+            "{e}"
+        );
+        // 200 MiB of spaces in a 200 KB file (the real limit is 128 MiB).
+        let e = extract(&bomb_pdf(200)).unwrap_err().to_string();
+        assert!(e.contains("extrem stark komprimierte Daten"), "{e}");
     }
 
     #[test]
