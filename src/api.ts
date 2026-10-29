@@ -1,6 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 
 export type DockerStatus =
   | { state: "notInstalled" }
@@ -160,19 +159,20 @@ export interface ImportResult {
   preview: string | null;
 }
 
-/** Same list as EXTENSIONS in src-tauri/src/docs/mod.rs. */
-export const DOC_EXTENSIONS = ["png", "jpg", "jpeg", "pdf", "docx"];
+/**
+ * Files chosen in the system dialog, which the backend opens (picker.rs):
+ * the webview only gets a token for the import commands and the file names.
+ */
+export interface PickedFiles {
+  token: string;
+  fileNames: string[];
+}
 
-/** Opens the file dialog; resolves with the chosen path or null. */
+/** Opens the file dialog for a task sheet; resolves with the choice or null. */
 export const pickTaskDocument = () =>
-  open({
-    title: "Aufgabenblatt öffnen",
-    multiple: false,
-    directory: false,
-    filters: [{ name: "Aufgabenblatt (Bild, PDF, Word)", extensions: DOC_EXTENSIONS }],
-  });
-export const importTaskDocument = (path: string) =>
-  invoke<ImportResult>("import_task_document", { path });
+  invoke<PickedFiles | null>("pick_files", { kind: "taskDocument", catalogId: null });
+export const importTaskDocument = (token: string) =>
+  invoke<ImportResult>("import_task_document", { token });
 export const onDocsProgress = (cb: (p: Progress) => void): Promise<UnlistenFn> =>
   listen<Progress>("docs-progress", (e) => cb(e.payload));
 
@@ -310,9 +310,9 @@ export interface AiProgress {
 export const aiStatus = () => invoke<AiStatus>("ai_status");
 /** Downloads a catalog model from huggingface.co (resumable; cancel with cancelAi). */
 export const downloadModel = (id: string) => invoke<AiStatus>("download_model", { id });
-/** Without catalogId: exactly one file (unknown models). With catalogId: the file(s) for that catalog entry. */
-export const importModel = (paths: string[], catalogId: string | null, confirm: boolean) =>
-  invoke<ImportOutcome>("import_model", { paths, catalogId, confirm });
+/** Imports the files of a pickModelFile/pickModelFiles token (the catalog entry is bound to the token). */
+export const importModel = (token: string, confirm: boolean) =>
+  invoke<ImportOutcome>("import_model", { token, confirm });
 export const deleteModel = (id: string) => invoke<AiStatus>("delete_model", { id });
 export const selectModel = (id: string) => invoke<AiStatus>("select_model", { id });
 export const generateTests = (request: GenerateRequest) =>
@@ -361,23 +361,13 @@ export const onAiProgress = (cb: (p: AiProgress) => void): Promise<UnlistenFn> =
 export const onModelsProgress = (cb: (p: ModelsProgress) => void): Promise<UnlistenFn> =>
   listen<ModelsProgress>("models-progress", (e) => cb(e.payload));
 
-/** Opens the file dialog for a .gguf model; resolves with the path or null. */
+/** Opens the file dialog for one .gguf model ("Anderes Modell importieren"). */
 export const pickModelFile = () =>
-  open({
-    title: "KI-Modell importieren",
-    multiple: false,
-    directory: false,
-    filters: [{ name: "KI-Modell (GGUF)", extensions: ["gguf"] }],
-  });
+  invoke<PickedFiles | null>("pick_files", { kind: "model", catalogId: null });
 
-/** Several files at once (all parts of a split model). */
-export const pickModelFiles = (title: string) =>
-  open({
-    title,
-    multiple: true,
-    directory: false,
-    filters: [{ name: "KI-Modell (GGUF)", extensions: ["gguf"] }],
-  });
+/** Several files at once for a catalog entry (all parts of a split model). */
+export const pickModelFiles = (catalogId: string) =>
+  invoke<PickedFiles | null>("pick_files", { kind: "modelParts", catalogId });
 
 /** "1,5 GB" (binary units like the backend). */
 export function formatGb(bytes: number): string {

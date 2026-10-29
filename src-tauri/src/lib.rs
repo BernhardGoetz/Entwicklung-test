@@ -5,10 +5,12 @@ pub mod app_update;
 pub mod docker_detect;
 pub mod docs;
 pub mod engine;
+pub mod picker;
 pub mod proc_guard;
 pub mod runner;
 
-use tauri::{ipc::Channel, AppHandle, Emitter, Manager, RunEvent};
+use tauri::{ipc::Channel, AppHandle, Emitter, Manager, RunEvent, WebviewWindow};
+use tauri_plugin_dialog::DialogExt;
 
 use runner::{docker, images, languages, RunReport, RunRequest, RunnerError};
 
@@ -94,17 +96,85 @@ async fn update_images(app: AppHandle) -> Result<images::ImagesReport, RunnerErr
     .await)
 }
 
-/// Imports a task sheet (image, PDF, DOCX) chosen in the file dialog and
+/// Opens the system file dialog (from the backend; the webview has no
+/// dialog permission) and returns a token for the chosen files plus their
+/// names, `None` if cancelled. `catalog_id` names the catalog entry for
+/// [`picker::PickKind::ModelParts`]. See `picker.rs`.
+#[tauri::command]
+async fn pick_files(
+    app: AppHandle,
+    window: WebviewWindow,
+    kind: picker::PickKind,
+    catalog_id: Option<String>,
+) -> Result<Option<picker::Picked>, String> {
+    let catalog_id = match kind {
+        picker::PickKind::ModelParts => {
+            let id = catalog_id.ok_or("Kein Katalogeintrag angegeben.")?;
+            Some(
+                ai::models::catalog()
+                    .iter()
+                    .find(|m| m.id == id)
+                    .ok_or_else(|| format!("Unbekanntes Modell: {id}"))?
+                    .clone(),
+            )
+        }
+        _ => None,
+    };
+    let (title, filter, extensions) =
+        picker::dialog_spec(kind, catalog_id.as_ref().map(|m| m.name.as_str()));
+    let dialog = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title(title)
+        .add_filter(filter, &extensions);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if kind == picker::PickKind::ModelParts {
+        dialog.pick_files(move |files| {
+            let _ = tx.send(files);
+        });
+    } else {
+        dialog.pick_file(move |file| {
+            let _ = tx.send(file.map(|f| vec![f]));
+        });
+    }
+    let Some(files) = rx.await.map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let paths = files
+        .into_iter()
+        .map(|f| f.into_path().map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    picker::remember(picker::Selection {
+        kind,
+        catalog_id: catalog_id.map(|m| m.id),
+        paths,
+    })
+    .map(Some)
+}
+
+/// Imports the task sheet (image, PDF, DOCX) chosen with `pick_files` and
 /// returns its text for review. Parsing and OCR run in a limited worker
 /// process (docs/worker.rs); waiting for it blocks, so on a blocking thread.
 #[tauri::command]
 async fn import_task_document(
     app: AppHandle,
-    path: String,
+    token: String,
 ) -> Result<docs::ImportResult, docs::DocsError> {
+    let selection = picker::selection(&token, &[picker::PickKind::TaskDocument])
+        .map_err(docs::DocsError::Invalid)?;
+    let [path] = selection.paths.as_slice() else {
+        return Err(docs::DocsError::Invalid(
+            "Bitte genau eine Datei wählen.".into(),
+        ));
+    };
+    let path = path.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let worker = docs::worker::WorkerConfig::current_exe()?;
-        docs::import_file_isolated(&worker, std::path::Path::new(&path), |p| {
+        docs::import_file_isolated(&worker, &path, |p| {
             let _ = app.emit(DOCS_EVENT, p);
         })
     })
@@ -132,34 +202,41 @@ async fn download_model(app: AppHandle, id: String) -> Result<ai::models::AiStat
     .await
 }
 
-/// Imports local .gguf files (offline PCs). Without `catalog_id`: one file,
-/// unknown files (no catalog hash) are only taken with `confirm`. With
-/// `catalog_id`: the file(s) for that catalog entry (all parts of a split
-/// model); without catalog hashes only with `confirm` and marked unverified.
+/// Imports local .gguf files (offline PCs) chosen with `pick_files`.
+/// [`picker::PickKind::Model`]: one file, unknown files (no catalog hash)
+/// are only taken with `confirm`. [`picker::PickKind::ModelParts`]: the
+/// file(s) for the catalog entry they were picked for (all parts of a
+/// split model); without catalog hashes only with `confirm` and marked
+/// unverified.
 #[tauri::command]
 async fn import_model(
     app: AppHandle,
-    paths: Vec<String>,
-    catalog_id: Option<String>,
+    token: String,
     confirm: bool,
 ) -> Result<ai::models::ImportOutcome, ai::AiError> {
+    let selection = picker::selection(
+        &token,
+        &[picker::PickKind::Model, picker::PickKind::ModelParts],
+    )
+    .map_err(ai::AiError::Other)?;
     let op = ai::Operation::start();
     let emit = |p| {
         let _ = app.emit(MODELS_EVENT, p);
     };
-    match catalog_id {
-        Some(id) => {
-            let paths: Vec<std::path::PathBuf> = paths.iter().map(Into::into).collect();
-            ai::models::import_for(&id, &paths, confirm, &op.token, emit).await
+    match (
+        selection.kind,
+        selection.catalog_id,
+        selection.paths.as_slice(),
+    ) {
+        (picker::PickKind::ModelParts, Some(id), paths) => {
+            ai::models::import_for(&id, paths, confirm, &op.token, emit).await
         }
-        None => match paths.as_slice() {
-            [path] => {
-                ai::models::import(std::path::Path::new(path), confirm, &op.token, emit).await
-            }
-            _ => Err(ai::AiError::Other(
-                "Bitte genau eine .gguf-Datei wählen.".into(),
-            )),
-        },
+        (picker::PickKind::Model, None, [path]) => {
+            ai::models::import(path, confirm, &op.token, emit).await
+        }
+        _ => Err(ai::AiError::Other(
+            "Bitte genau eine .gguf-Datei wählen.".into(),
+        )),
     }
 }
 
@@ -318,6 +395,7 @@ pub fn run() {
             run_tests,
             prepare_images,
             update_images,
+            pick_files,
             import_task_document,
             ai_status,
             download_model,
@@ -379,28 +457,34 @@ mod tests {
         assert_eq!(allowed, used);
     }
 
-    /// The file dialog may only open files, and its filter matches the
-    /// extensions the backend accepts.
+    /// The webview has no dialog permission and no dialog plugin import:
+    /// files are chosen in the backend (`pick_files`, picker.rs), the
+    /// webview only gets tokens.
     #[test]
-    fn dialog_capability_and_extensions_match_frontend() {
+    fn webview_has_no_dialog_permission() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let raw = std::fs::read_to_string(root.join("capabilities/default.json")).unwrap();
         let cap: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let dialog: Vec<&str> = cap["permissions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|p| p.as_str())
-            .filter(|p| p.starts_with("dialog:"))
-            .collect();
-        assert_eq!(dialog, vec!["dialog:allow-open"]);
-
+        let perms = cap["permissions"].as_array().unwrap();
+        assert!(
+            !perms.iter().any(|p| {
+                let id = p
+                    .as_str()
+                    .or_else(|| p["identifier"].as_str())
+                    .unwrap_or("");
+                id.starts_with("dialog:") || id.starts_with("fs:")
+            }),
+            "{perms:?}"
+        );
+        for file in [
+            "../src/api.ts",
+            "../src/components/TaskStatement.tsx",
+            "../src/components/ModelSetup.tsx",
+        ] {
+            let src = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(!src.contains("plugin-dialog"), "{file}");
+        }
         let api = std::fs::read_to_string(root.join("../src/api.ts")).unwrap();
-        let line = api
-            .lines()
-            .find(|l| l.contains("DOC_EXTENSIONS = ["))
-            .expect("DOC_EXTENSIONS in api.ts");
-        let used: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
-        assert_eq!(used, crate::docs::EXTENSIONS);
+        assert!(api.contains("\"import_task_document\", { token }"));
     }
 }

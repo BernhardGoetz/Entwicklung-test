@@ -11,6 +11,7 @@ import {
   pickModelFiles,
   selectModel,
   type AiStatus,
+  type PickedFiles,
   type ModelInfo,
   type ModelsProgress,
 } from "../api";
@@ -43,7 +44,7 @@ function modelState(m: ModelInfo): string {
 
 /** Import waiting for "Trotzdem importieren". */
 interface PendingImport {
-  paths: string[];
+  picked: PickedFiles;
   /** Catalog entry whose button was used (null: "Anderes Modell importieren"). */
   catalogId: string | null;
   unverified: boolean;
@@ -118,14 +119,14 @@ export function ModelSetup({ status, onStatus, onClose, returnFocus }: Props) {
       setNote(`${m.name} ist eingerichtet. Ab jetzt läuft die KI ohne Internet.`);
     });
 
-  const runImport = (paths: string[], catalogId: string | null, confirm: boolean) =>
-    act(paths.length > 1 ? `${paths.length} Dateien werden geprüft und kopiert …` : "Datei wird geprüft und kopiert …", async () => {
+  const runImport = (picked: PickedFiles, catalogId: string | null, confirm: boolean) =>
+    act(picked.fileNames.length > 1 ? `${picked.fileNames.length} Dateien werden geprüft und kopiert …` : "Datei wird geprüft und kopiert …", async () => {
       setPendingImport(null);
-      const r = await importModel(paths, catalogId, confirm);
+      const r = await importModel(picked.token, confirm);
       onStatus(r.status);
       if (r.needsConfirmation) {
         setPendingImport({
-          paths,
+          picked,
           catalogId,
           unverified: r.unverified,
           warnings: r.warnings,
@@ -147,8 +148,8 @@ export function ModelSetup({ status, onStatus, onClose, returnFocus }: Props) {
   const pickImport = async () => {
     setError(null);
     try {
-      const path = await pickModelFile();
-      if (path) await runImport([path], null, false);
+      const picked = await pickModelFile();
+      if (picked) await runImport(picked, null, false);
     } catch (e) {
       setError(String(e));
     }
@@ -157,9 +158,8 @@ export function ModelSetup({ status, onStatus, onClose, returnFocus }: Props) {
   const pickImportFor = async (m: ModelInfo) => {
     setError(null);
     try {
-      const picked = await pickModelFiles(`${m.name} importieren (alle Teile auswählen)`);
-      const paths = picked === null ? [] : Array.isArray(picked) ? picked : [picked];
-      if (paths.length > 0) await runImport(paths, m.id, false);
+      const picked = await pickModelFiles(m.id);
+      if (picked && picked.fileNames.length > 0) await runImport(picked, m.id, false);
     } catch (e) {
       setError(String(e));
     }
@@ -316,7 +316,7 @@ export function ModelSetup({ status, onStatus, onClose, returnFocus }: Props) {
           {pendingImport.unverified ? (
             <p>
               Für „{nameOf(pendingImport.catalogId)}“ ist in dieser Version keine Prüfsumme hinterlegt –
-              {pendingImport.paths.length > 1 ? " die Dateien können" : " die Datei kann"} deshalb nicht
+              {pendingImport.picked.fileNames.length > 1 ? " die Dateien können" : " die Datei kann"} deshalb nicht
               geprüft werden. Sie werden diesem Modell zugeordnet und als „nicht geprüft“ markiert. Nur
               Dateien aus dem genannten Hugging-Face-Repository verwenden.
             </p>
@@ -350,7 +350,7 @@ export function ModelSetup({ status, onStatus, onClose, returnFocus }: Props) {
           <div className="row">
             <button
               className="danger"
-              onClick={() => void runImport(pendingImport.paths, pendingImport.catalogId, true)}
+              onClick={() => void runImport(pendingImport.picked, pendingImport.catalogId, true)}
             >
               Trotzdem importieren
             </button>

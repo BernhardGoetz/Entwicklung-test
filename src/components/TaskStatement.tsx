@@ -6,6 +6,7 @@ import {
   progressText,
   type AiStatus,
   type ImportResult,
+  type PickedFiles,
 } from "../api";
 import { OcrFixPanel } from "./OcrFixPanel";
 
@@ -59,18 +60,18 @@ export function TaskStatement({
 
   const upload = async () => {
     setError(null);
-    let path: string | null;
+    let picked: PickedFiles | null;
     try {
-      path = await pickTaskDocument();
+      picked = await pickTaskDocument();
     } catch (e) {
       setError(String(e));
       return;
     }
-    if (!path) return;
+    if (!picked) return;
     setBusy("Datei wird gelesen …");
     const unlisten = onDocsProgress((p) => setBusy(progressText(p)));
     try {
-      const r = await importTaskDocument(path);
+      const r = await importTaskDocument(picked.token);
       setPreviewLarge(false);
       onImported(r);
     } catch (e) {

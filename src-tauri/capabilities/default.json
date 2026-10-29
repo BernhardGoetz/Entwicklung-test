@@ -1,11 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Rechte des Hauptfensters: nur die Download-Seiten von Docker Desktop und Podman und die Release-Seite (portable Version, Updates) dürfen im Browser geöffnet werden; Dateiauswahl nur zum Öffnen (die Datei liest das Backend)",
+  "description": "Rechte des Hauptfensters: nur die Download-Seiten von Docker Desktop und Podman und die Release-Seite (portable Version, Updates) dürfen im Browser geöffnet werden. Keine Dateiauswahl: den Dialog öffnet das Backend (pick_files), die Webview bekommt nur ein Token",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "dialog:allow-open",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

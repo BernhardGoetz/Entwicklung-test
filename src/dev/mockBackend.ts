@@ -187,8 +187,10 @@ export function installMock(): void {
           return AI;
         case "warm_up_ai":
           return true;
-        case "plugin:dialog|open":
-          return "/home/schueler/Aufgabe-3.png";
+        case "pick_files":
+          return a.kind === "taskDocument"
+            ? { token: "mock-token", fileNames: ["Aufgabe-3.png"] }
+            : { token: "mock-token", fileNames: ["modell-q4_k_m.gguf"] };
         case "import_task_document":
           await sleep(200);
           return IMPORTED;
