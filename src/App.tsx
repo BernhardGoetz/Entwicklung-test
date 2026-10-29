@@ -36,6 +36,9 @@ import { TaskStatement } from "./components/TaskStatement";
 import { AiPanel } from "./components/AiPanel";
 import { ModelSetup } from "./components/ModelSetup";
 import { MAX_TESTS, TestCaseEditor, newTestCase } from "./components/TestCaseEditor";
+import { TabBar, TabPanel, type TabDef } from "./components/Tabs";
+import { ThemeToggle } from "./components/ThemeToggle";
+import { readStored, useTheme, writeStored } from "./theme";
 
 function reportText(r: ImagesReport, what: string): string | null {
   const parts: string[] = [];
@@ -44,7 +47,20 @@ function reportText(r: ImagesReport, what: string): string | null {
   return parts.length > 0 ? parts.join(" ") : null;
 }
 
+type TabKey = "task" | "tests" | "result";
+const TAB_KEY = "code-pruefer.tab";
+const isTab = (v: string | null): v is TabKey => v === "task" || v === "tests" || v === "result";
+
 export default function App() {
+  const { pref: themePref, setPref: setThemePref, theme } = useTheme();
+  const [tab, setTab] = useState<TabKey>(() => {
+    const v = readStored(TAB_KEY);
+    return isTab(v) ? v : "task";
+  });
+  const selectTab = useCallback((t: TabKey) => {
+    setTab(t);
+    writeStored(TAB_KEY, t);
+  }, []);
   const [docker, setDocker] = useState<DockerStatus | null>(null);
   const [engine, setEngineChoice] = useState<EngineChoice | null>(null);
   const [starting, setStarting] = useState<string | null>(null);
@@ -267,6 +283,7 @@ export default function App() {
   const onRun = async () => {
     if (compareMode === null) return;
     setRunning(true);
+    selectTab("result");
     setError(null);
     setReport(null);
     setProgress(null);
@@ -291,26 +308,115 @@ export default function App() {
     }
   };
 
+  // Tab badges: small counts/status next to the labels.
+  const resultTab: Pick<TabDef<TabKey>, "badge" | "badgeText" | "tone"> = (() => {
+    if (running) return { badge: "…", badgeText: "Prüfung läuft", tone: "busy" };
+    if (error) return { badge: "!", badgeText: "Fehler", tone: "fail" };
+    if (!report) return {};
+    if (!report.compileOk) return { badge: "✗", badgeText: "Kompilierfehler", tone: "fail" };
+    const ok = report.passed === report.total && report.total > 0;
+    return {
+      badge: `${ok ? "✓" : "✗"} ${report.passed}/${report.total}`,
+      badgeText: `${report.passed} von ${report.total} bestanden`,
+      tone: ok ? "ok" : "fail",
+    };
+  })();
+  const tabs: TabDef<TabKey>[] = [
+    {
+      id: "task",
+      label: "Aufgabe",
+      ...(fixing
+        ? { badge: "…", badgeText: "KI-Korrektur läuft", tone: "busy" as const }
+        : task.trim() === ""
+          ? {}
+          : taskConfirmed
+            ? { badge: "✓", badgeText: "Text geprüft", tone: "ok" as const }
+            : { badge: "●", badgeText: "Text noch nicht als geprüft markiert", tone: "warn" as const }),
+    },
+    {
+      id: "tests",
+      label: "Testfälle",
+      badge: generating ? `${tests.length} · KI …` : String(tests.length),
+      badgeText: `${tests.length} ${tests.length === 1 ? "Testfall" : "Testfälle"}${generating ? ", KI arbeitet" : ""}`,
+      tone: generating ? "busy" : "neutral",
+    },
+    { id: "result", label: "Ergebnis", ...resultTab },
+  ];
+
+  // Short status next to "Prüfen" (the full text is in the title).
+  const runStatus = running
+    ? progressText(progress)
+    : imagesBusy !== null
+      ? imagesBusy
+      : docker?.state === "notInstalled"
+        ? "Zum Prüfen wird Docker oder Podman benötigt."
+        : docker?.state === "notRunning"
+          ? "Die Container-Engine wird beim Prüfen automatisch gestartet."
+          : null;
+
+  const modelReady = ai?.modelReady ?? false;
+
   return (
     <div className="app">
-      <header>
-        <h1>Code-Prüfer</h1>
-        <span className="muted">Programmieraufgaben lokal und sicher testen</span>
+      <header className="appbar">
+        <div className="brand">
+          <span className="brand-name">Code-Prüfer</span>
+          <span className="brand-tag muted">Programmieraufgaben lokal und sicher testen</span>
+        </div>
+        <DockerBanner
+          status={docker}
+          engine={engine}
+          starting={starting}
+          startError={startError}
+          busy={running || generating}
+          images={{ busy: imagesBusy, note: imagesNote }}
+          onUpdateImages={onUpdateImages}
+          onRetry={refreshDocker}
+          onStart={() => void doStart()}
+          onEngineChange={(e) => void onEngineChange(e)}
+          trailing={
+            <>
+              <ThemeToggle value={themePref} onChange={setThemePref} />
+              <button
+                onClick={() => setSetupOpen(true)}
+                disabled={generating}
+                className={modelReady ? undefined : "attention"}
+              >
+                {modelReady ? "KI-Modell …" : "KI-Modell einrichten …"}
+              </button>
+            </>
+          }
+        />
       </header>
-      <DockerBanner
-        status={docker}
-        engine={engine}
-        starting={starting}
-        startError={startError}
-        busy={running || generating}
-        images={{ busy: imagesBusy, note: imagesNote }}
-        onUpdateImages={onUpdateImages}
-        onRetry={refreshDocker}
-        onStart={() => void doStart()}
-        onEngineChange={(e) => void onEngineChange(e)}
-      />
       <main>
-        <div className="col">
+        <CodeEditor
+          language={language}
+          code={code}
+          theme={theme}
+          onChange={(c) => setCodeByLang((m) => ({ ...m, [languageId]: c }))}
+          toolbarStart={
+            <LanguageSelect
+              languages={languages}
+              value={languageId}
+              onChange={setLanguageId}
+              disabled={running || generating}
+            />
+          }
+          toolbarEnd={
+            <>
+              {runStatus !== null && (
+                <span className={running ? "run-status busy" : "run-status"} title={runStatus} aria-live="polite">
+                  {runStatus}
+                </span>
+              )}
+              <button className="primary" onClick={() => void onRun()} disabled={!canRun}>
+                {running ? "Prüfe …" : "Prüfen"}
+              </button>
+            </>
+          }
+        />
+        <TabBar tabs={tabs} active={tab} onChange={selectTab} label="Bereiche" />
+        <TabPanel id="task" active={tab === "task"}>
           <TaskStatement
             value={task}
             onChange={setTask}
@@ -323,65 +429,58 @@ export default function App() {
             onOpenSetup={() => setSetupOpen(true)}
             onFixingChange={setFixing}
           />
-          <div className="toolbar">
-            <LanguageSelect
-              languages={languages}
-              value={languageId}
-              onChange={setLanguageId}
-              disabled={running || generating}
+        </TabPanel>
+        <TabPanel id="tests" active={tab === "tests"}>
+          <div className="tests-layout">
+            <TestCaseEditor
+              tests={tests}
+              onChange={setTests}
+              compareMode={compareMode}
+              onCompareModeChange={setCompareMode}
+              compareModeKey={compareModeKey}
+              forbidTrailingNewline={forbidTrailingNewline}
+              onForbidTrailingNewlineChange={setForbidTrailingNewline}
             />
+            <aside className="tests-aside">
+              <AiPanel
+                status={ai}
+                blockedReason={aiBlocked}
+                taskText={task}
+                language={languageId}
+                compareMode={compareMode}
+                onResult={onAiResult}
+                onApplyMode={(m) => {
+                  setCompareMode(m);
+                  setCompareModeKey((k) => k + 1);
+                }}
+                onOpenSetup={() => setSetupOpen(true)}
+                onRunningChange={setGenerating}
+                onFinished={(failed) => {
+                  selectTab("tests");
+                  // Engine errors, or the backend started the engine: show the real state.
+                  if (failed || docker?.state !== "ok") refreshDocker();
+                }}
+              />
+              {aiNote && <p className="note warn small">{aiNote}</p>}
+            </aside>
           </div>
-          <CodeEditor
-            language={language}
-            code={code}
-            onChange={(c) => setCodeByLang((m) => ({ ...m, [languageId]: c }))}
-          />
-        </div>
-        <div className="col">
-          <AiPanel
-            status={ai}
-            blockedReason={aiBlocked}
-            taskText={task}
-            language={languageId}
-            compareMode={compareMode}
-            onResult={onAiResult}
-            onApplyMode={(m) => {
-              setCompareMode(m);
-              setCompareModeKey((k) => k + 1);
-            }}
-            onOpenSetup={() => setSetupOpen(true)}
-            onRunningChange={setGenerating}
-            onFinished={(failed) => {
-              // Engine errors, or the backend started the engine: show the real state.
-              if (failed || docker?.state !== "ok") refreshDocker();
-            }}
-          />
-          {aiNote && <div className="hint small">{aiNote}</div>}
-          <TestCaseEditor
-            tests={tests}
-            onChange={setTests}
-            compareMode={compareMode}
-            onCompareModeChange={setCompareMode}
-            compareModeKey={compareModeKey}
-            forbidTrailingNewline={forbidTrailingNewline}
-            onForbidTrailingNewlineChange={setForbidTrailingNewline}
-          />
-          <div className="toolbar">
-            <button className="primary" onClick={onRun} disabled={!canRun}>
-              {running ? "Prüfe …" : "Prüfen"}
-            </button>
-            {running && <span className="muted">{progressText(progress)}</span>}
-            {!running && imagesBusy !== null && <span className="muted">{imagesBusy}</span>}
-            {!running && docker?.state === "notInstalled" && (
-              <span className="muted small">Zum Prüfen wird Docker oder Podman benötigt.</span>
+        </TabPanel>
+        <TabPanel id="result" active={tab === "result"}>
+          <section className="card" aria-labelledby="result-heading">
+            <h2 id="result-heading" className="sr-only">
+              Ergebnis
+            </h2>
+            {running && <p className="note busy">{progressText(progress)}</p>}
+            {error && <div className="banner error">{error}</div>}
+            {report && !running && <ResultsPanel report={report} />}
+            {!report && !running && !error && (
+              <p className="empty muted">
+                Noch keine Prüfung. Code eingeben, Testfälle anlegen und „Prüfen“ drücken – das Ergebnis
+                erscheint hier.
+              </p>
             )}
-            {!running && docker?.state === "notRunning" && (
-              <span className="muted small">Die Container-Engine wird beim Prüfen automatisch gestartet.</span>
-            )}
-          </div>
-          {error && <div className="banner warn">{error}</div>}
-          {report && <ResultsPanel report={report} />}
-        </div>
+          </section>
+        </TabPanel>
       </main>
       {setupOpen && <ModelSetup status={ai} onStatus={setAi} onClose={() => setSetupOpen(false)} />}
     </div>

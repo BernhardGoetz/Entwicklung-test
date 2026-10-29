@@ -10,7 +10,7 @@ interface Props {
 export function LanguageSelect({ languages, value, onChange, disabled }: Props) {
   return (
     <label className="inline">
-      Sprache:{" "}
+      <span className="muted">Sprache</span>
       <select value={value} onChange={(e) => onChange(e.target.value)} disabled={disabled}>
         {languages.map((l) => (
           <option key={l.id} value={l.id}>

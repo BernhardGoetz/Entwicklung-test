@@ -35,47 +35,48 @@ function StepOutputs({ out }: { out: StepOutput }) {
 
 function TestRow({ t }: { t: TestResult }) {
   return (
-    <div className={`result ${t.status}`}>
-      <div className="row">
-        <span className={`badge ${t.status}`}>{LABEL[t.status]}</span>
-        <strong>{t.name}</strong>
+    <li className={`result ${t.status}`}>
+      <div className="result-head">
+        <span className={`status ${t.status}`}>{LABEL[t.status]}</span>
+        <strong className="result-name">{t.name}</strong>
         {t.output && <span className="muted small">{t.output.durationMs} ms</span>}
       </div>
       {t.message && <p className="small">{t.message}</p>}
       {t.onlyTrailingWhitespaceDiffers && (
-        <p className="hint small">Unterschied nur am Zeilenende (Leerzeichen/Zeilenumbruch)</p>
+        <p className="note warn small">Unterschied nur am Zeilenende (Leerzeichen/Zeilenumbruch)</p>
       )}
       <DiffView diff={t.diff} />
       {t.output && <StepOutputs out={t.output} />}
-    </div>
+    </li>
   );
 }
 
 export function ResultsPanel({ report }: { report: RunReport }) {
   const allPassed = report.compileOk && report.passed === report.total && report.total > 0;
   return (
-    <section className="card">
-      <h2>Ergebnis</h2>
+    <div className="results">
       {!report.compileOk ? (
         <div className="result failed">
-          <div className="row">
-            <span className="badge failed">Kompilierfehler</span>
+          <div className="result-head">
+            <span className="status failed">Kompilierfehler</span>
             {report.compile?.timedOut && <span>Zeitlimit beim Kompilieren überschritten.</span>}
           </div>
-          {report.hint && <p className="hint">{report.hint}</p>}
+          {report.hint && <p className="note warn">{report.hint}</p>}
           {report.compile && <StepOutputs out={report.compile} />}
         </div>
       ) : (
         <>
-          <p className={allPassed ? "summary ok" : "summary"}>
+          <p className={allPassed ? "summary ok" : "summary fail"}>
             {report.passed} von {report.total} Tests bestanden
           </p>
-          {report.tests.map((t) => (
-            <TestRow key={t.index} t={t} />
-          ))}
+          <ol className="result-list">
+            {report.tests.map((t) => (
+              <TestRow key={t.index} t={t} />
+            ))}
+          </ol>
         </>
       )}
       <p className="muted small">Image: {report.image}</p>
-    </section>
+    </div>
   );
 }

@@ -407,7 +407,15 @@ npm run tauri build                # Installer (unsigniert) bauen
 
 # Windows-Installer unter Linux cross-kompilieren (benötigt mingw-w64 und nsis)
 npm run tauri build -- --target x86_64-pc-windows-gnu --bundles nsis
+
+# Nur die Oberfläche im Browser, Backend simuliert (src/dev/mockBackend.ts,
+# nicht im Produktions-Build): http://localhost:1420/ (?engine=missing|stopped)
+VITE_MOCK=1 npm run dev
 ```
+
+Gestaltung (Tokens, Farben hell/dunkel, Bausteine, Layout):
+[`docs/design/DESIGN.md`](docs/design/DESIGN.md), Vorschau in
+`docs/design/design-preview.html`.
 
 ### Runner-Images lokal bauen
 
@@ -488,7 +496,10 @@ Ordner der exe.
 ### Projektstruktur
 
 ```
-src/                     React-Frontend (Monaco-Editor, Testfälle, Ergebnisse)
+src/                     React-Frontend (Monaco-Editor, Tabs Aufgabe/Testfälle/Ergebnis)
+src/styles.css           Design-Tokens als CSS-Variablen (hell/dunkel) und Komponenten
+src/dev/mockBackend.ts   Simuliertes Backend für VITE_MOCK=1 npm run dev (nur Entwicklung)
+docs/design/             DESIGN.md, design-tokens.json, design-preview.html
 src-tauri/src/
   lib.rs                 Tauri-Commands: docker_status, get_engine, set_engine,
                          start_engine, list_languages, run_tests,

@@ -179,7 +179,7 @@ export function OcrFixPanel({ text, original, onTextChange, ai, aiBusy, onOpenSe
         </div>
       )}
       {cancelled && <p className="muted">Abgebrochen.</p>}
-      {error && <div className="banner warn">{error}</div>}
+      {error && <div className="banner error">{error}</div>}
       {suggestions && (
         <div className="fix-list">
           {suggestions.fixes.length === 0 ? (

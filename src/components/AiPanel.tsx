@@ -128,16 +128,17 @@ export function AiPanel({
     suggestion !== null && !modeApplied && !sameMode(suggestion, compareMode) && result?.confidence.level !== "red";
 
   return (
-    <section className="card">
+    <section className="card ai-panel" aria-labelledby="ai-heading">
       <div className="card-header">
-        <h2>Testfälle mit KI</h2>
-        <button onClick={onOpenSetup} disabled={running} className={modelReady ? undefined : "attention"}>
-          {modelReady ? "KI-Modell …" : "KI-Modell einrichten …"}
-        </button>
+        <h2 id="ai-heading">Testfälle mit KI</h2>
+        {!modelReady && (
+          <button onClick={onOpenSetup} disabled={running} className="attention">
+            KI-Modell einrichten …
+          </button>
+        )}
       </div>
-      <div className="toolbar">
+      <div className="toolbar wrap">
         <button
-          className="primary"
           onClick={() => void generate()}
           disabled={running || blockedReason !== null}
           title={blockedReason ?? "Erzeugt Testfälle aus der Aufgabenstellung (lokal, ohne Internet)"}
@@ -163,11 +164,11 @@ export function AiPanel({
         </p>
       )}
       {cancelled && <p className="muted small">Abgebrochen.</p>}
-      {error && <div className="banner warn small">{error}</div>}
+      {error && <div className="banner error small">{error}</div>}
       {result && (
         <div className="ai-result">
           <div className="row">
-            <span className={`badge conf-${result.confidence.level}`}>
+            <span className={`status conf-${result.confidence.level}`}>
               Konfidenz: {LEVEL_TEXT[result.confidence.level]}
             </span>
             <span className="small muted">{LEVEL_HINT[result.confidence.level]}</span>

@@ -82,9 +82,9 @@ export function TaskStatement({
   };
 
   return (
-    <section className="card">
+    <section className="card" aria-labelledby="task-heading">
       <div className="card-header">
-        <h2>Aufgabenstellung</h2>
+        <h2 id="task-heading">Aufgabenstellung</h2>
         <button
           onClick={() => void upload()}
           disabled={busy !== null || fixing}
@@ -93,8 +93,8 @@ export function TaskStatement({
           Aufgabe hochladen …
         </button>
       </div>
-      {busy !== null && <p className="muted small">{busy}</p>}
-      {error && <div className="hint small">{error}</div>}
+      {busy !== null && <p className="note busy small">{busy}</p>}
+      {error && <p className="note error small">{error}</p>}
       {imported && (
         <div className="import-info small">
           <span>
@@ -115,6 +115,15 @@ export function TaskStatement({
         </div>
       )}
       <div className={imported?.preview ? "task-body with-preview" : "task-body"}>
+        <textarea
+          className="task"
+          aria-labelledby="task-heading"
+          placeholder="Aufgabenstellung hier einfügen oder ein Aufgabenblatt hochladen (Bild, PDF oder Word) …"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          rows={imported ? 14 : 8}
+          spellCheck={false}
+        />
         {imported?.preview && (
           <img
             className={previewLarge ? "task-preview large" : "task-preview"}
@@ -124,14 +133,6 @@ export function TaskStatement({
             onClick={() => setPreviewLarge((v) => !v)}
           />
         )}
-        <textarea
-          className="task"
-          placeholder="Aufgabenstellung hier einfügen oder ein Aufgabenblatt hochladen (Bild, PDF oder Word) …"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          rows={imported ? 12 : 5}
-          spellCheck={false}
-        />
       </div>
       {imported?.ocrUsed && (
         <OcrFixPanel

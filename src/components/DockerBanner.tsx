@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ENGINE_NAMES, type DockerStatus, type Engine, type EngineChoice } from "../api";
 
@@ -31,11 +32,12 @@ function EngineSwitch({
 }) {
   if (!engine) return null;
   return (
-    <label className="engine-switch" title="Wird beim Start der App automatisch gestartet">
-      Container-Engine:
+    <label className="inline engine-switch" title="Wird beim Start der App automatisch gestartet">
+      <span className="hide-narrow muted">Engine</span>
       <select
         value={engine.engine}
         disabled={disabled}
+        aria-label="Container-Engine"
         onChange={(e) => onChange(e.target.value as Engine)}
       >
         {(Object.keys(ENGINE_NAMES) as Engine[]).map((id) => (
@@ -66,8 +68,16 @@ interface Props {
   onRetry: () => void;
   onStart: () => void;
   onEngineChange: (e: Engine) => void;
+  /** Further header actions (theme, AI model), shown after the engine actions. */
+  trailing?: ReactNode;
 }
 
+type Tone = "ok" | "warn" | "error" | "busy" | "neutral";
+
+/**
+ * Engine state for the header: a compact status (dot + text), the engine
+ * actions and – full width below – notices that need more room.
+ */
 export function DockerBanner({
   status,
   images,
@@ -79,78 +89,104 @@ export function DockerBanner({
   onRetry,
   onStart,
   onEngineChange,
+  trailing,
 }: Props) {
   const name = engine ? ENGINE_NAMES[engine.engine] : "Docker/Podman";
   const engineSwitch = (
     <EngineSwitch engine={engine} onChange={onEngineChange} disabled={busy || starting !== null} />
   );
 
+  let tone: Tone;
+  let text: ReactNode;
+  let actions: ReactNode = null;
+  const notices: ReactNode[] = [];
+
   if (starting !== null) {
-    return (
-      <div className="banner info banner-row">
-        <span>⏳ {starting} Bitte warten – das kann bis zu zwei Minuten dauern.</span>
-      </div>
+    tone = "busy";
+    text = (
+      <>
+        {starting} <span className="muted hide-narrow">Bitte warten – das kann bis zu zwei Minuten dauern.</span>
+      </>
     );
-  }
-  if (status === null) {
-    return <div className="banner info">Suche Container-Engine …</div>;
-  }
-  if (status.state === "ok") {
-    return (
-      <div className="banner ok">
-        <div className="banner-row">
-          <span>
-            ✓ {status.product} {status.version} läuft – Code wird lokal in isolierten Containern
-            ausgeführt.
-          </span>
-          <span className="banner-actions">
-            <button
-              onClick={onUpdateImages}
-              disabled={busy || images.busy !== null}
-              title="Lädt die Runner-Images dieser Version neu von ghcr.io (Internet nötig)"
-            >
-              Images aktualisieren
-            </button>
-            {engineSwitch}
-          </span>
-        </div>
-        {status.warning && <p className="images-status images-error">⚠ {status.warning}</p>}
-        {images.busy !== null && <p className="images-status">⏳ {images.busy}</p>}
-        {images.busy === null && images.note && (
-          <p className={images.note.error ? "images-status images-error" : "images-status"}>
-            {images.note.text}
-          </p>
-        )}
-      </div>
+  } else if (status === null) {
+    tone = "neutral";
+    text = "Suche Container-Engine …";
+  } else if (status.state === "ok") {
+    tone = "ok";
+    text = (
+      <>
+        {status.product} {status.version} läuft
+        <span className="muted hide-md"> · Code wird lokal in isolierten Containern ausgeführt</span>
+      </>
     );
-  }
-  return (
-    <div className="banner warn">
-      {startError && (
-        <p>
+    actions = (
+      <button
+        onClick={onUpdateImages}
+        disabled={busy || images.busy !== null}
+        title="Lädt die Runner-Images dieser Version neu von ghcr.io (Internet nötig)"
+      >
+        Images aktualisieren
+      </button>
+    );
+    if (status.warning) notices.push(<p key="w" className="note warn">{status.warning}</p>);
+    if (images.busy !== null) notices.push(<p key="ib" className="note busy">{images.busy}</p>);
+    else if (images.note)
+      notices.push(
+        <p key="in" className={images.note.error ? "note warn" : "note ok"}>
+          {images.note.text}
+        </p>,
+      );
+  } else {
+    if (startError)
+      notices.push(
+        <p key="se" className="note error">
           <strong>Start fehlgeschlagen:</strong> {startError}
-        </p>
-      )}
-      {status.state === "notRunning" ? (
-        <p>
-          <strong>{name} ist installiert, aber nicht gestartet.</strong> Die App startet die
-          gewählte Engine automatisch; alternativ {name} selbst starten und dann erneut prüfen.
-        </p>
-      ) : (
-        <p>
-          <strong>Keine Container-Engine gefunden.</strong> Der Code-Prüfer benötigt{" "}
-          <ExtLink href={DOWNLOAD.docker}>Docker Desktop</ExtLink> oder{" "}
-          <ExtLink href={DOWNLOAD.podman}>Podman</ExtLink>. Docker Desktop ist kostenlos für
-          private Nutzung/Bildung – bitte Lizenzbedingungen selbst prüfen.
-        </p>
-      )}
-      <div className="banner-row">
-        <span className="banner-actions">
-          {status.state === "notRunning" && <button onClick={onStart}>{name} starten</button>}
-          <button onClick={onRetry}>Erneut prüfen</button>
-        </span>
-        {engineSwitch}
+        </p>,
+      );
+    if (status.state === "notRunning") {
+      tone = "warn";
+      text = `${name} ist nicht gestartet`;
+      notices.push(
+        <p key="nr" className="note warn">
+          <strong>{name} ist installiert, aber nicht gestartet.</strong> Die App startet die gewählte
+          Engine automatisch; alternativ {name} selbst starten und dann erneut prüfen.
+        </p>,
+      );
+    } else {
+      tone = "error";
+      text = "Keine Container-Engine gefunden";
+      notices.push(
+        <p key="ni" className="note error">
+          Der Code-Prüfer benötigt <ExtLink href={DOWNLOAD.docker}>Docker Desktop</ExtLink> oder{" "}
+          <ExtLink href={DOWNLOAD.podman}>Podman</ExtLink>. Docker Desktop ist kostenlos für private
+          Nutzung/Bildung – bitte Lizenzbedingungen selbst prüfen.
+        </p>,
+      );
+    }
+    actions = (
+      <>
+        {status.state === "notRunning" && <button onClick={onStart}>{name} starten</button>}
+        <button onClick={onRetry}>Erneut prüfen</button>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <div
+        className="engine-status"
+        role="status"
+        title={status?.state === "ok" ? "Code wird lokal in isolierten Containern ausgeführt." : undefined}
+      >
+        <span className={`dot tone-${tone}`} aria-hidden="true" />
+        <span className="engine-text">{text}</span>
       </div>
-    </div>
+      <div className="appbar-actions">
+        {actions}
+        {engineSwitch}
+        {trailing}
+      </div>
+      {notices.length > 0 && <div className="appbar-notices">{notices}</div>}
+    </>
   );
 }

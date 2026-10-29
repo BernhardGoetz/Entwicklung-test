@@ -47,9 +47,14 @@ export function TestCaseEditor({
   const [hintDismissedAt, setHintDismissedAt] = useState(0);
 
   return (
-    <section className="card">
+    <section className="card tests-main" aria-labelledby="tests-heading">
       <div className="card-header">
-        <h2>Testfälle</h2>
+        <h2 id="tests-heading">Testfälle</h2>
+        <span className="muted small">
+          {tests.length} von höchstens {MAX_TESTS}
+        </span>
+      </div>
+      <div className="compare-settings">
         <div className="compare-mode small">
           <CompareModeSelect key={compareModeKey} value={compareMode} onChange={onCompareModeChange} />
           <label
@@ -66,7 +71,7 @@ export function TestCaseEditor({
         </div>
       </div>
       {aiWithNewline > hintDismissedAt && (
-        <div className="hint small">
+        <div className="note warn small">
           Die erwarteten Ausgaben der KI-Testfälle stammen aus der ausgeführten Musterlösung – und die
           endet selbst mit einem Zeilenumbruch ({aiWithNewline}{" "}
           {aiWithNewline === 1 ? "Testfall" : "Testfälle"}). Mit „Zeilenumbruch am Ende verbieten“
@@ -78,7 +83,7 @@ export function TestCaseEditor({
       {tests.length === 0 && <p className="muted">Noch keine Testfälle angelegt.</p>}
       {tests.map((t) => (
         <div key={t.id} className="testcase">
-          <div className="row">
+          <div className="testcase-head">
             {t.origin === "ai" && (
               <span className="badge ai" title="Von der KI erzeugt – bitte prüfen">
                 KI
@@ -91,7 +96,7 @@ export function TestCaseEditor({
               aria-label="Name des Testfalls"
             />
             <button
-              className="danger"
+              className="danger ghost"
               onClick={() => onChange(tests.filter((x) => x.id !== t.id))}
               title="Testfall entfernen"
             >
@@ -130,6 +135,7 @@ export function TestCaseEditor({
         </div>
       ))}
       <button
+        className="add-test"
         onClick={() => onChange([...tests, newTestCase(tests.length + 1)])}
         disabled={tests.length >= MAX_TESTS}
         title={tests.length >= MAX_TESTS ? `Höchstens ${MAX_TESTS} Testfälle pro Prüfung` : undefined}
