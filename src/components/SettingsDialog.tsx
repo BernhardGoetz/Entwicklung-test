@@ -1,9 +1,10 @@
 import type { RefObject } from "react";
-import type { AiStatus, Engine } from "../api";
+import type { AiStatus, Engine, UpdateInfo, UpdateInterval } from "../api";
 import type { ThemePref } from "../theme";
 import { EngineSettings, type EngineState } from "./DockerBanner";
 import { Modal } from "./Modal";
 import { ThemeToggle } from "./ThemeToggle";
+import { UpdateSettings, type CheckNote } from "./UpdateSettings";
 
 interface Props {
   onClose: () => void;
@@ -21,6 +22,11 @@ interface Props {
   /** AI generation running: the model cannot be changed. */
   aiBusy: boolean;
   onOpenModelSetup: () => void;
+  update: UpdateInfo | null;
+  updateChecking: boolean;
+  updateNote: CheckNote | null;
+  onUpdateIntervalChange: (i: UpdateInterval) => void;
+  onCheckUpdate: () => void;
 }
 
 function modelText(ai: AiStatus | null): string {
@@ -29,7 +35,7 @@ function modelText(ai: AiStatus | null): string {
   return m ? `Ausgewählt: ${m.name}` : "kein Modell eingerichtet";
 }
 
-/** „Einstellungen“ behind the gear: appearance, container engine, AI model. */
+/** „Einstellungen“ behind the gear: appearance, container engine, AI model, updates. */
 export function SettingsDialog(p: Props) {
   const modelReady = p.ai?.modelReady ?? false;
   return (
@@ -72,6 +78,16 @@ export function SettingsDialog(p: Props) {
             KI-Modell verwalten …
           </button>
         </div>
+      </section>
+      <section className="settings-section" aria-labelledby="set-updates">
+        <h3 id="set-updates">Updates</h3>
+        <UpdateSettings
+          info={p.update}
+          checking={p.updateChecking}
+          note={p.updateNote}
+          onIntervalChange={p.onUpdateIntervalChange}
+          onCheck={p.onCheckUpdate}
+        />
       </section>
     </Modal>
   );

@@ -27,7 +27,8 @@ Eine Docker-kompatible Container-Engine wird benötigt:
 
 ### Windows-Installer
 
-Der Installer (`Code-Prüfer_<version>_x64-setup.exe`) ist deutschsprachig und fragt auf
+Der Installer (`Code-Pruefer_<version>_x64-setup.exe` im Release, lokal gebaut
+`Code-Prüfer_<version>_x64-setup.exe`) ist deutschsprachig und fragt auf
 der Seite **„Container-Engine“**, ob Docker Desktop (Standard) oder Podman verwendet
 werden soll. Ist die gewählte Engine nicht installiert, bietet er an, sie über `winget`
 zu installieren (`Docker.DockerDesktop` bzw. `RedHat.Podman` aus der Quelle `winget`;
@@ -50,6 +51,20 @@ Die DMGs (`*_aarch64.dmg` für Apple Silicon, `*_x64.dmg` für Intel) sind noch 
 signiert/notarisiert. Gatekeeper blockiert deshalb den ersten Start: im Finder
 Rechtsklick auf „Code-Prüfer“ → **Öffnen** → „Öffnen“ bestätigen. Alternativ im
 Terminal: `xattr -dr com.apple.quarantine "/Applications/Code-Prüfer.app"`.
+
+### Updates
+
+Installierte Versionen (Windows-Installer, macOS) suchen beim Start und danach höchstens
+einmal täglich (einstellbar: täglich, wöchentlich, nie) nach einer neuen Version auf
+GitHub. Angeboten werden nur **veröffentlichte** Releases, nie QAS-Pre-Releases oder
+Entwürfe. Der Dialog „Update verfügbar“ zeigt Version und Versionshinweise; „Jetzt
+aktualisieren“ lädt das Update, prüft seine Signatur, installiert es (Windows: Installer
+ohne Rückfragen) und startet neu, „Später“ fragt bei der nächsten fälligen Suche wieder.
+Während einer Prüfung oder KI-Aufgabe wartet der Dialog. Einstellungen → **Updates**:
+Abstand, letzte Suche, „Jetzt nach Updates suchen“. Die portable Windows-Version
+aktualisiert sich nicht selbst (Link zur Release-Seite); Builds ohne Update-Schlüssel
+zeigen „Updates in dieser Version nicht verfügbar“. Funktionsweise, Schlüssel und
+Einrichtung: [`docs/UPDATER.md`](docs/UPDATER.md).
 
 ### Engine-Auswahl und automatischer Start
 
@@ -216,7 +231,11 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
 4. **GHCR-Pakete öffentlich:** `code-pruefer-python` und `code-pruefer-java` unter
    GitHub → Packages → Package settings → „Change visibility“ auf **public** stellen
    (sonst funktionieren Download und „Images aktualisieren“ nicht).
-5. Optional: Settings → Actions → General → „Workflow permissions“ auf „Read repository
+5. **App-Updater:** Schlüssel lokal erzeugen, Repository-Variable `TAURI_UPDATER_PUBKEY`
+   und im Environment `release` die Secrets `TAURI_SIGNING_PRIVATE_KEY` /
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` setzen ([`docs/UPDATER.md`](docs/UPDATER.md)).
+   Ohne sie entstehen Releases ohne Updater (Warnung).
+6. Optional: Settings → Actions → General → „Workflow permissions“ auf „Read repository
    contents and packages permissions“ stellen (die Workflows fordern ihre Rechte selbst an).
 
 ## Aufgabenblatt hochladen
@@ -420,6 +439,7 @@ npm run tauri build -- --target x86_64-pc-windows-gnu --bundles nsis
 
 # Nur die Oberfläche im Browser, Backend simuliert (src/dev/mockBackend.ts,
 # nicht im Produktions-Build): http://localhost:1420/ (?engine=missing|stopped)
+# Updates simulieren: ?update=available|none|error|progress|notConfigured|portable
 VITE_MOCK=1 npm run dev
 ```
 
@@ -541,6 +561,7 @@ src-tauri/src/
                          prepare.rs (Bildvorbereitung: Kontrast, Hochskalieren)
   docker_detect.rs       Erkennung: nicht installiert / nicht gestartet / ok
   engine.rs              Engine-Auswahl (Datei/Registry), Start, Podman-Pipe
+  app_update.rs          App-Updater (tauri-plugin-updater): Intervall, Suche, Installation
   runner/mod.rs          Ablauf einer Prüfung, Bewertung der Testfälle
   runner/docker.rs       Engine-Verbindung, Image-Pull/-Load, gehärteter Container
   runner/images.rs       Image-Auflösung: vorhanden → Archiv → GHCR → :dev
@@ -553,12 +574,15 @@ src-tauri/tauri.release.conf.json
 images/                  Dockerfiles der Runner-Images
 scripts/signpath-stage.mjs, scripts/signpath-round.sh
                          Windows-Signatur über SignPath in Runden (release.yml)
+scripts/updater.mjs      App-Updater: Konfigurations-Overlay (öffentlicher Schlüssel),
+                         Signaturprüfung, latest.json (release.yml)
 scripts/check-version-unreleased.sh, scripts/release-notes.sh
                          Release-Workflow: Version frei?, Release-Notizen
 .signpath/               SignPath-Artefaktkonfigurationen (zum Einfügen in SignPath)
 docs/CODE_SIGNING_POLICY.md, docs/RELEASE_SIGNING.md
                          Code-Signing-Policy (englisch) und Einrichtung (deutsch)
 docs/RELEASE_QAS.md      Release-Ablauf mit QAS-Stufe und Abnahme
+docs/UPDATER.md          App-Updater: Ablauf, Schlüssel, Einrichtung, Test
 LICENSE                  MIT-Lizenz
 scripts/export-image-archives.sh
                          Image-Archive und image-digests.json erzeugen
@@ -602,8 +626,9 @@ Release-Branch `qas` baut, und zwar `code-pruefer.exe`, `uninstall.exe` und der
 Installer. Mit dem Release-Zertifikat wird erst nach der QAS-Abnahme signiert.
 Autor, Committer, Reviewer und Approver ist Bernhard Götz. Jeder Signaturauftrag wird
 von Hand freigegeben. Datenschutz: Die App arbeitet lokal, ohne Telemetrie. Netzwerk nutzt
-sie nur für den optionalen Modell-Download von huggingface.co und für das Laden der
-Runner-Images von ghcr.io (über Docker/Podman). Einrichtung und offene Punkte (z. B.
+sie nur für den optionalen Modell-Download von huggingface.co, für das Laden der
+Runner-Images von ghcr.io (über Docker/Podman) und für die Update-Suche auf github.com
+(abschaltbar, [`docs/UPDATER.md`](docs/UPDATER.md)). Einrichtung und offene Punkte (z. B.
 Fremdbinaries wie llama.cpp): [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md).
 
 ## Lizenz

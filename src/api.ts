@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -386,3 +386,46 @@ export function formatGb(bytes: number): string {
 
 /** Message of a rejected command ("Abgebrochen." on cancel). */
 export const CANCELLED = "Abgebrochen.";
+
+// --- App-Updates (docs/UPDATER.md) ---
+
+export type UpdateInterval = "daily" | "weekly" | "never";
+/** notConfigured: built without updater key; portable: Windows zip (no installer). */
+export type UpdateAvailability = "available" | "notConfigured" | "portable";
+
+export interface UpdateInfo {
+  currentVersion: string;
+  availability: UpdateAvailability;
+  interval: UpdateInterval;
+  /** Milliseconds since the epoch of the last successful check. */
+  lastCheck: number | null;
+  releasesUrl: string;
+}
+
+export interface UpdateOffer {
+  version: string;
+  currentVersion: string;
+  /** Plain text (rendered as text, never as HTML). */
+  notes: string | null;
+  date: string | null;
+}
+
+export type InstallProgress =
+  | { kind: "download"; downloaded: number; total: number | null }
+  | { kind: "installing" };
+
+export const updateInfo = () => invoke<UpdateInfo>("update_info");
+export const setUpdateInterval = (interval: UpdateInterval) =>
+  invoke<UpdateInfo>("set_update_interval", { interval });
+/** manual=false: only when due, errors are swallowed by the backend. */
+export const checkForUpdate = (manual: boolean) => invoke<UpdateOffer | null>("check_for_update", { manual });
+/** Downloads, verifies and installs; the app restarts (Windows: the installer restarts it). */
+export function installUpdate(onProgress: (p: InstallProgress) => void): Promise<void> {
+  const channel = new Channel<InstallProgress>();
+  channel.onmessage = onProgress;
+  return invoke<void>("install_update", { onProgress: channel });
+}
+
+export function formatMb(bytes: number): string {
+  return `${(bytes / 1024 ** 2).toFixed(1).replace(".", ",")} MB`;
+}
