@@ -8,7 +8,7 @@
 //!
 //! The public key is not in `tauri.conf.json`: release builds add it through
 //! the overlay `src-tauri/tauri.updater.conf.json` (written by
-//! `scripts/updater-config.mjs` from the GitHub variable
+//! `node scripts/updater.mjs config` from the GitHub variable
 //! `TAURI_UPDATER_PUBKEY`). Without it the plugin is not registered at all
 //! (its configuration requires a key, a missing one would abort the start)
 //! and the settings show „Updates in dieser Version nicht verfügbar“.

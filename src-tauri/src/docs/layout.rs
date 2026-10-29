@@ -41,6 +41,10 @@ const WIDE_GAP_CHARS: f64 = 2.5;
 const INDENT_CLUSTER_CHARS: f64 = 0.6;
 /// At most this many empty lines are inserted for a vertical gap.
 const MAX_BLANK_LINES: usize = 2;
+/// Most spaces for one indentation or gap: boxes with a tiny character
+/// width (or far apart) must not blow up the text before it is cut at
+/// 1 MB.
+pub const MAX_RUN_SPACES: usize = 200;
 
 struct Line<'a> {
     words: Vec<&'a WordBox>,
@@ -200,13 +204,13 @@ pub fn reconstruct_text(words: &[WordBox]) -> String {
                 .min(MAX_BLANK_LINES);
             out.push_str(&"\n".repeat(1 + blanks));
         }
-        out.push_str(&" ".repeat(indents[i]));
+        out.push_str(&" ".repeat(indents[i].min(MAX_RUN_SPACES)));
         let mut prev: Option<&WordBox> = None;
         for w in &line.words {
             if let Some(p) = prev {
                 let gap = (w.x - p.right()) / char_width;
                 let spaces = if gap > WIDE_GAP_CHARS {
-                    gap.round() as usize
+                    (gap.round() as usize).min(MAX_RUN_SPACES)
                 } else {
                     1
                 };
@@ -226,6 +230,45 @@ mod tests {
     /// Monospaced test font: 10 units per character, lines 20 units high.
     const CW: f64 = 10.0;
     const LH: f64 = 20.0;
+
+    #[test]
+    fn spaces_are_bounded() {
+        // Two words a page apart with a tiny character width, and a word
+        // far to the right of the leftmost line.
+        let words = vec![
+            WordBox {
+                text: "ab".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 0.002,
+                height: 20.0,
+            },
+            WordBox {
+                text: "cd".into(),
+                x: 1.0e9,
+                y: 0.0,
+                width: 0.002,
+                height: 20.0,
+            },
+            WordBox {
+                text: "x".into(),
+                x: 0.0,
+                y: 40.0,
+                width: 0.001,
+                height: 20.0,
+            },
+            WordBox {
+                text: "y".into(),
+                x: 5.0e8,
+                y: 80.0,
+                width: 0.001,
+                height: 20.0,
+            },
+        ];
+        let text = reconstruct_text(&words);
+        assert!(text.len() < 1000, "{} Bytes", text.len());
+        assert!(text.contains("ab") && text.contains("cd") && text.contains('y'));
+    }
 
     fn word(text: &str, col: f64, row: f64) -> WordBox {
         WordBox {

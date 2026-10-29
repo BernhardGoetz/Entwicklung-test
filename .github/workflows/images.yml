@@ -14,6 +14,12 @@ on:
 
 permissions: {}
 
+# Ein Lauf je Branch bzw. Pull Request; ein neuer Push bricht den laufenden
+# Lauf eines Pull Requests ab, auf Branches läuft er zu Ende.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest

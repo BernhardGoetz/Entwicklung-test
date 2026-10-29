@@ -457,6 +457,30 @@ mod tests {
         assert_eq!(allowed, used);
     }
 
+    /// CSP: scripts only from the app, no plugins/objects, no <base>, no
+    /// form submissions, not embeddable.
+    #[test]
+    fn content_security_policy_is_strict() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read_to_string(root.join("tauri.conf.json")).unwrap();
+        let conf: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let csp = conf["app"]["security"]["csp"].as_str().unwrap();
+        for directive in [
+            "default-src 'self'",
+            "script-src 'self'",
+            "base-uri 'none'",
+            "form-action 'none'",
+            "object-src 'none'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(
+                csp.split(';').any(|d| d.trim() == directive),
+                "{directive}: {csp}"
+            );
+        }
+        assert!(!csp.contains("unsafe-eval"), "{csp}");
+    }
+
     /// The webview has no dialog permission and no dialog plugin import:
     /// files are chosen in the backend (`pick_files`, picker.rs), the
     /// webview only gets tokens.

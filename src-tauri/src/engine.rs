@@ -273,10 +273,19 @@ async fn refresh_podman_pipe(machine: Option<&str>) {
 // Locating the engines
 
 /// Finds `name` (without `.exe`) on PATH.
+/// macOS `open` (starts Docker Desktop), always by absolute path.
+pub const MACOS_OPEN: &str = "/usr/bin/open";
+
+/// First `name` in an absolute `PATH` entry; relative entries (`.`, empty)
+/// are skipped, so a program in the working directory is never started.
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    find_in(name, &std::env::var_os("PATH")?)
+}
+
+fn find_in(name: &str, paths: &std::ffi::OsStr) -> Option<PathBuf> {
     let exe = if cfg!(windows) { ".exe" } else { "" };
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
+    std::env::split_paths(paths)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(format!("{name}{exe}")))
         .find(|p| p.is_file())
 }
@@ -550,8 +559,9 @@ async fn launch(
 async fn launch_docker() -> Result<(), String> {
     let app = docker_desktop_path().ok_or_else(|| not_installed(Engine::Docker))?;
     if cfg!(target_os = "macos") {
+        // Absolute path: never an `open` found via PATH.
         let out = run_cmd(
-            Path::new("open"),
+            Path::new(MACOS_OPEN),
             &["-a".to_string(), app.display().to_string()],
             Duration::from_secs(30),
         )
@@ -651,6 +661,36 @@ fn spawn_detached(app: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn path_lookup_skips_relative_entries() {
+        let dir = std::env::temp_dir().join(format!("cp-path-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin").join("podman"), "").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        // A relative entry that would resolve to the planted file.
+        let rel = pathdiff(&dir.join("bin"), &cwd);
+        let paths = std::env::join_paths([rel.clone(), PathBuf::from("/nonexistent")]).unwrap();
+        assert_eq!(find_in("podman", &paths), None, "{rel:?}");
+        let paths = std::env::join_paths([dir.join("bin")]).unwrap();
+        assert_eq!(
+            find_in("podman", &paths),
+            Some(dir.join("bin").join("podman"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(Path::new(MACOS_OPEN).is_absolute());
+    }
+
+    /// `target` relative to `base` (both absolute), via "..".
+    #[cfg(unix)]
+    fn pathdiff(target: &Path, base: &Path) -> PathBuf {
+        let mut rel = PathBuf::new();
+        for _ in base.components().skip(1) {
+            rel.push("..");
+        }
+        rel.join(target.strip_prefix("/").unwrap())
+    }
 
     #[test]
     fn parse_is_lenient() {
