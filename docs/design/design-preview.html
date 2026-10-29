@@ -207,17 +207,20 @@ main {
 .brand { display: flex; align-items: baseline; gap: var(--space-3); min-width: 0; }
 .brand-name { font-size: var(--text-lg); font-weight: var(--weight-semibold); white-space: nowrap; }
 .brand-tag { font-size: var(--text-sm); white-space: nowrap; }
+.appbar { flex-wrap: nowrap; }
 .engine-status {
-  display: flex; align-items: center; gap: var(--space-2); min-width: 0; flex: 1 1 240px;
+  display: flex; align-items: center; gap: var(--space-2); min-width: 0; flex: 1 1 auto;
   font-size: var(--text-sm);
 }
-.engine-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.appbar-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); margin-left: auto; }
-.appbar-notices {
-  flex-basis: 100%; display: flex; flex-direction: column; gap: var(--space-1);
-  font-size: var(--text-sm); padding-top: var(--space-1);
+.engine-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.engine-status button { flex: none; }
+.appbar .icon-button { margin-left: auto; flex: none; }
+/* Engine notices that need attention: one compact line each, under the header */
+.engine-notices {
+  display: flex; flex-direction: column; gap: var(--space-1);
+  padding: var(--space-2) var(--page-gutter); font-size: var(--text-sm);
+  border-bottom: 1px solid var(--color-border-muted);
 }
-.engine-switch { font-size: var(--text-sm); }
 
 /* Code area: always full width */
 .code { display: flex; flex-direction: column; min-width: 0; }
@@ -398,6 +401,15 @@ button.primary:hover:not(:disabled) { background: var(--color-accent-emphasis-ho
 button.danger { color: var(--color-danger); }
 button.danger:hover:not(:disabled) { background: var(--color-danger-subtle); border-color: var(--color-danger); }
 button.ghost { background: transparent; border-color: transparent; }
+button.compact { height: var(--control-height-sm); font-size: var(--text-xs); }
+/* Icon-only button (gear): square, no fill until hover; name via aria-label + title */
+button.icon-button {
+  width: var(--control-height); padding: 0; background: transparent; border-color: transparent;
+  color: var(--color-text-muted);
+}
+button.icon-button:hover:not(:disabled) { background: var(--color-surface-hover); color: var(--color-text); }
+button.icon-button:active:not(:disabled) { background: var(--color-surface-active); }
+button.icon-button[aria-expanded="true"] { color: var(--color-text); }
 button.attention { color: var(--color-accent); border-color: var(--color-accent); }
 button.attention:hover:not(:disabled) { background: var(--color-accent-subtle); }
 .note button, .hint button, .row.small button, .fix-actions button { height: var(--control-height-sm); font-size: var(--text-xs); }
@@ -478,15 +490,36 @@ details[open] > summary { margin-bottom: var(--space-1); }
 .ws-mark { color: var(--color-text-muted); user-select: none; -webkit-user-select: none; }
 .ws-real { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: pre; }
 
-/* ---------- Modal (KI-Modell) ---------- */
+/* ---------- Modal (Einstellungen, KI-Modell) ---------- */
 .modal-backdrop {
   position: fixed; inset: 0; z-index: 20; background: var(--color-backdrop);
-  display: flex; align-items: flex-start; justify-content: center; padding: var(--space-12) var(--space-4); overflow: auto;
+  display: flex; align-items: flex-start; justify-content: center; padding: var(--space-12) var(--space-4);
 }
 .modal {
-  width: min(760px, 100%); padding: var(--space-6); background: var(--color-overlay);
+  width: min(760px, 100%); max-height: 100%; display: flex; flex-direction: column; min-height: 0;
+  background: var(--color-overlay);
   border: 1px solid var(--color-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-overlay);
 }
+.modal:focus { outline: none; }
+.modal-header {
+  display: flex; justify-content: space-between; align-items: center; gap: var(--space-3);
+  padding: var(--space-4) var(--space-6); border-bottom: 1px solid var(--color-border-muted); flex: none;
+}
+.modal-body {
+  display: flex; flex-direction: column; gap: var(--space-3); min-height: 0; overflow-y: auto;
+  padding: var(--space-4) var(--space-6) var(--space-6); overscroll-behavior: contain;
+}
+/* Einstellungen */
+.modal.settings { width: min(600px, 100%); }
+.settings .modal-body { gap: 0; padding-top: 0; }
+.settings-section { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-4) 0; border-top: 1px solid var(--color-border-muted); }
+.settings-section:first-child { border-top: none; }
+.settings-section h3 { margin: 0 0 var(--space-1); font-size: var(--text-md); font-weight: var(--weight-semibold); }
+.setting-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-4); flex-wrap: wrap; font-size: var(--text-sm); }
+.setting-row select { min-width: 200px; }
+.setting-status { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm); }
+.setting-hint { font-size: var(--text-xs); }
+.settings-section .note { font-size: var(--text-sm); }
 .model-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
 .model { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3) 0; border-top: 1px solid var(--color-border-muted); }
 .model.selected { box-shadow: inset 2px 0 0 var(--color-success); padding-left: var(--space-3); }
@@ -496,13 +529,22 @@ details[open] > summary { margin-bottom: var(--space-1); }
 
 /* ---------- Responsive ---------- */
 @media (max-width: 1499px) {
-  .brand-tag, .hide-md { display: none; }
+  .hide-md { display: none; }
+}
+@media (max-width: 1099px) {
+  .brand-tag { display: none; }
 }
 @media (max-width: 1099px) {
   .hide-narrow {
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
     overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
   }
+}
+@media (max-width: 799px) {
+  /* Dialogs become a full-width sheet from the top */
+  .modal-backdrop { padding: var(--space-6) 0 0; align-items: flex-end; }
+  .modal, .modal.settings { width: 100%; border-radius: var(--radius-lg) var(--radius-lg) 0 0; border-bottom: none; }
+  .modal-header, .modal-body { padding-left: var(--space-4); padding-right: var(--space-4); }
 }
 @media (max-width: 899px) {
   :root { --page-gutter: var(--space-4); }
@@ -598,7 +640,8 @@ details[open] > summary { margin-bottom: var(--space-1); }
 <h2>Hell</h2>
 <div class="appbar" style="padding:0 0 var(--space-3)"><div class="brand"><span class="brand-name">Code-Prüfer</span></div>
 <div class="engine-status"><span class="dot tone-ok"></span><span class="engine-text">Docker Desktop 28.3 läuft</span></div>
-<div class="appbar-actions"><button>Images aktualisieren</button><fieldset class="segmented"><legend class="sr-only">Farbschema</legend><label class="checked"><input type="radio" name="t-light" checked><span>System</span></label><label><input type="radio" name="t-light"><span>Hell</span></label><label><input type="radio" name="t-light"><span>Dunkel</span></label></fieldset><button class="attention">KI-Modell einrichten …</button></div></div>
+<button class="icon-button" aria-label="Einstellungen" title="Einstellungen"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+<h3>Dialog „Einstellungen“</h3><div class="modal settings" style="width:100%"><div class="modal-header"><h2>Einstellungen</h2><button>Schließen</button></div><div class="modal-body"><section class="settings-section"><h3>Darstellung</h3><div class="setting-row"><span>Farbschema</span><fieldset class="segmented"><legend class="sr-only">Farbschema</legend><label class="checked"><input type="radio" name="t-light" checked><span>System</span></label><label><input type="radio" name="t-light"><span>Hell</span></label><label><input type="radio" name="t-light"><span>Dunkel</span></label></fieldset></div></section><section class="settings-section"><h3>Container-Engine</h3><div class="setting-row"><span>Engine</span><select><option>Docker Desktop</option></select></div><div class="setting-status"><span class="dot tone-ok"></span><span>Docker Desktop 28.3 läuft</span></div><div class="row"><button>Images aktualisieren</button></div></section><section class="settings-section"><h3>KI-Modell</h3><div class="setting-status"><span class="dot"></span><span>kein Modell eingerichtet</span></div><div class="row"><button class="attention">KI-Modell verwalten …</button></div></section></div></div>
 <h3>Farbrollen</h3><div class="swatches"><div class="sw"><i style="background:var(--color-bg)"></i><code>bg</code></div><div class="sw"><i style="background:var(--color-surface)"></i><code>surface</code></div><div class="sw"><i style="background:var(--color-surface-hover)"></i><code>surface-hover</code></div><div class="sw"><i style="background:var(--color-surface-active)"></i><code>surface-active</code></div><div class="sw"><i style="background:var(--color-overlay)"></i><code>overlay</code></div><div class="sw"><i style="background:var(--color-border)"></i><code>border</code></div><div class="sw"><i style="background:var(--color-border-muted)"></i><code>border-muted</code></div><div class="sw"><i style="background:var(--color-border-control)"></i><code>border-control</code></div><div class="sw"><i style="background:var(--color-text)"></i><code>text</code></div><div class="sw"><i style="background:var(--color-text-muted)"></i><code>text-muted</code></div><div class="sw"><i style="background:var(--color-text-on-accent)"></i><code>text-on-accent</code></div><div class="sw"><i style="background:var(--color-accent)"></i><code>accent</code></div><div class="sw"><i style="background:var(--color-accent-hover)"></i><code>accent-hover</code></div><div class="sw"><i style="background:var(--color-accent-subtle)"></i><code>accent-subtle</code></div><div class="sw"><i style="background:var(--color-accent-emphasis)"></i><code>accent-emphasis</code></div><div class="sw"><i style="background:var(--color-accent-emphasis-hover)"></i><code>accent-emphasis-hover</code></div><div class="sw"><i style="background:var(--color-preview-paper)"></i><code>preview-paper</code></div><div class="sw"><i style="background:var(--color-focus-ring)"></i><code>focus-ring</code></div><div class="sw"><i style="background:var(--color-success)"></i><code>success</code></div><div class="sw"><i style="background:var(--color-danger)"></i><code>danger</code></div><div class="sw"><i style="background:var(--color-warning)"></i><code>warning</code></div><div class="sw"><i style="background:var(--color-danger-subtle)"></i><code>danger-subtle</code></div><div class="sw"><i style="background:var(--color-success-subtle)"></i><code>success-subtle</code></div><div class="sw"><i style="background:var(--color-diff-del-bg)"></i><code>diff-del-bg</code></div><div class="sw"><i style="background:var(--color-diff-add-bg)"></i><code>diff-add-bg</code></div><div class="sw"><i style="background:var(--color-diff-del-mark)"></i><code>diff-del-mark</code></div><div class="sw"><i style="background:var(--color-diff-add-mark)"></i><code>diff-add-mark</code></div><div class="sw"><i style="background:var(--color-neutral-dot)"></i><code>neutral-dot</code></div><div class="sw"><i style="background:var(--color-backdrop)"></i><code>backdrop</code></div></div>
 <h3>Typografie</h3><div class="scale"><div style="font-size:var(--text-xs)">xs · 12px – Programmieraufgaben lokal prüfen</div><div style="font-size:var(--text-sm)">sm · 13px – Programmieraufgaben lokal prüfen</div><div style="font-size:var(--text-md)">md · 14px – Programmieraufgaben lokal prüfen</div><div style="font-size:var(--text-lg)">lg · 16px – Programmieraufgaben lokal prüfen</div><div style="font-size:var(--text-xl)">xl · 18px – Programmieraufgaben lokal prüfen</div><div style="font-family:var(--font-mono)">Monospace: print("Hallo, Welt!")  0O 1lI</div></div>
 <h3>Abstände</h3><div class="scale"><div class="row small"><code style="width:72px">space-0-5</code><span class="space-bar" style="width:var(--space-0-5)"></span>2</div><div class="row small"><code style="width:72px">space-1</code><span class="space-bar" style="width:var(--space-1)"></span>4</div><div class="row small"><code style="width:72px">space-2</code><span class="space-bar" style="width:var(--space-2)"></span>8</div><div class="row small"><code style="width:72px">space-3</code><span class="space-bar" style="width:var(--space-3)"></span>12</div><div class="row small"><code style="width:72px">space-4</code><span class="space-bar" style="width:var(--space-4)"></span>16</div><div class="row small"><code style="width:72px">space-6</code><span class="space-bar" style="width:var(--space-6)"></span>24</div><div class="row small"><code style="width:72px">space-8</code><span class="space-bar" style="width:var(--space-8)"></span>32</div><div class="row small"><code style="width:72px">space-12</code><span class="space-bar" style="width:var(--space-12)"></span>48</div></div>
@@ -628,7 +671,8 @@ Hallo,Ben!<span class="ws-mark">⏎</span></pre></details></div></div>
 <h2>Dunkel</h2>
 <div class="appbar" style="padding:0 0 var(--space-3)"><div class="brand"><span class="brand-name">Code-Prüfer</span></div>
 <div class="engine-status"><span class="dot tone-ok"></span><span class="engine-text">Docker Desktop 28.3 läuft</span></div>
-<div class="appbar-actions"><button>Images aktualisieren</button><fieldset class="segmented"><legend class="sr-only">Farbschema</legend><label class="checked"><input type="radio" name="t-dark" checked><span>System</span></label><label><input type="radio" name="t-dark"><span>Hell</span></label><label><input type="radio" name="t-dark"><span>Dunkel</span></label></fieldset><button class="attention">KI-Modell einrichten …</button></div></div>
+<button class="icon-button" aria-label="Einstellungen" title="Einstellungen"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+<h3>Dialog „Einstellungen“</h3><div class="modal settings" style="width:100%"><div class="modal-header"><h2>Einstellungen</h2><button>Schließen</button></div><div class="modal-body"><section class="settings-section"><h3>Darstellung</h3><div class="setting-row"><span>Farbschema</span><fieldset class="segmented"><legend class="sr-only">Farbschema</legend><label class="checked"><input type="radio" name="t-dark" checked><span>System</span></label><label><input type="radio" name="t-dark"><span>Hell</span></label><label><input type="radio" name="t-dark"><span>Dunkel</span></label></fieldset></div></section><section class="settings-section"><h3>Container-Engine</h3><div class="setting-row"><span>Engine</span><select><option>Docker Desktop</option></select></div><div class="setting-status"><span class="dot tone-ok"></span><span>Docker Desktop 28.3 läuft</span></div><div class="row"><button>Images aktualisieren</button></div></section><section class="settings-section"><h3>KI-Modell</h3><div class="setting-status"><span class="dot"></span><span>kein Modell eingerichtet</span></div><div class="row"><button class="attention">KI-Modell verwalten …</button></div></section></div></div>
 <h3>Farbrollen</h3><div class="swatches"><div class="sw"><i style="background:var(--color-bg)"></i><code>bg</code></div><div class="sw"><i style="background:var(--color-surface)"></i><code>surface</code></div><div class="sw"><i style="background:var(--color-surface-hover)"></i><code>surface-hover</code></div><div class="sw"><i style="background:var(--color-surface-active)"></i><code>surface-active</code></div><div class="sw"><i style="background:var(--color-overlay)"></i><code>overlay</code></div><div class="sw"><i style="background:var(--color-border)"></i><code>border</code></div><div class="sw"><i style="background:var(--color-border-muted)"></i><code>border-muted</code></div><div class="sw"><i style="background:var(--color-border-control)"></i><code>border-control</code></div><div class="sw"><i style="background:var(--color-text)"></i><code>text</code></div><div class="sw"><i style="background:var(--color-text-muted)"></i><code>text-muted</code></div><div class="sw"><i style="background:var(--color-text-on-accent)"></i><code>text-on-accent</code></div><div class="sw"><i style="background:var(--color-accent)"></i><code>accent</code></div><div class="sw"><i style="background:var(--color-accent-hover)"></i><code>accent-hover</code></div><div class="sw"><i style="background:var(--color-accent-subtle)"></i><code>accent-subtle</code></div><div class="sw"><i style="background:var(--color-accent-emphasis)"></i><code>accent-emphasis</code></div><div class="sw"><i style="background:var(--color-accent-emphasis-hover)"></i><code>accent-emphasis-hover</code></div><div class="sw"><i style="background:var(--color-preview-paper)"></i><code>preview-paper</code></div><div class="sw"><i style="background:var(--color-focus-ring)"></i><code>focus-ring</code></div><div class="sw"><i style="background:var(--color-success)"></i><code>success</code></div><div class="sw"><i style="background:var(--color-danger)"></i><code>danger</code></div><div class="sw"><i style="background:var(--color-warning)"></i><code>warning</code></div><div class="sw"><i style="background:var(--color-danger-subtle)"></i><code>danger-subtle</code></div><div class="sw"><i style="background:var(--color-success-subtle)"></i><code>success-subtle</code></div><div class="sw"><i style="background:var(--color-diff-del-bg)"></i><code>diff-del-bg</code></div><div class="sw"><i style="background:var(--color-diff-add-bg)"></i><code>diff-add-bg</code></div><div class="sw"><i style="background:var(--color-diff-del-mark)"></i><code>diff-del-mark</code></div><div class="sw"><i style="background:var(--color-diff-add-mark)"></i><code>diff-add-mark</code></div><div class="sw"><i style="background:var(--color-neutral-dot)"></i><code>neutral-dot</code></div><div class="sw"><i style="background:var(--color-backdrop)"></i><code>backdrop</code></div></div>
 <h3>Typografie</h3><div class="scale"><div style="font-size:var(--text-xs)">xs · 12px – Programmieraufgaben lokal prüfen</div><div style="font-size:var(--text-sm)">sm · 13px – Programmieraufgaben lokal prüfen</div><div style="font-size:var(--text-md)">md · 14px – Programmieraufgaben lokal prüfen</div><div style="font-size:var(--text-lg)">lg · 16px – Programmieraufgaben lokal prüfen</div><div style="font-size:var(--text-xl)">xl · 18px – Programmieraufgaben lokal prüfen</div><div style="font-family:var(--font-mono)">Monospace: print("Hallo, Welt!")  0O 1lI</div></div>
 <h3>Abstände</h3><div class="scale"><div class="row small"><code style="width:72px">space-0-5</code><span class="space-bar" style="width:var(--space-0-5)"></span>2</div><div class="row small"><code style="width:72px">space-1</code><span class="space-bar" style="width:var(--space-1)"></span>4</div><div class="row small"><code style="width:72px">space-2</code><span class="space-bar" style="width:var(--space-2)"></span>8</div><div class="row small"><code style="width:72px">space-3</code><span class="space-bar" style="width:var(--space-3)"></span>12</div><div class="row small"><code style="width:72px">space-4</code><span class="space-bar" style="width:var(--space-4)"></span>16</div><div class="row small"><code style="width:72px">space-6</code><span class="space-bar" style="width:var(--space-6)"></span>24</div><div class="row small"><code style="width:72px">space-8</code><span class="space-bar" style="width:var(--space-8)"></span>32</div><div class="row small"><code style="width:72px">space-12</code><span class="space-bar" style="width:var(--space-12)"></span>48</div></div>

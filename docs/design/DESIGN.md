@@ -64,7 +64,7 @@ Zahlen in Tab-Badges mit `tabular-nums`.
 
 - `--radius-sm` 4 px: Code-Markierungen, Tab-Fokus.
 - `--radius-md` **6 px**: Buttons, Eingaben, Editor-Rahmen, Ausgaben.
-- `--radius-lg` 8 px: nur das Modal.
+- `--radius-lg` 8 px: nur Dialoge (Einstellungen, KI-Modell).
 - `--radius-full`: Statuspunkte, Tab-Zähler, Badges.
 - Bedienelemente 32 px hoch (`--control-height`), kompakt 26 px.
 - Statuspunkt 8 px (`--dot-size`).
@@ -105,7 +105,7 @@ Diff-Tönungen (≥ 12:1). Rahmen von Eingabefeldern erreichen ≥ 3:1
 ### Farbschema
 
 - Standard: **System** (`prefers-color-scheme`).
-- Umschalter in der Kopfzeile: *System · Hell · Dunkel*; gespeichert in
+- Umschalter in *Einstellungen → Darstellung*: *System · Hell · Dunkel*; gespeichert in
   `localStorage` (`code-pruefer.theme`, Zugriff mit try/catch – ohne Speicher
   gilt die Wahl bis zum Schließen).
 - Technik: Tokens hell auf `:root`; dunkel unter
@@ -126,7 +126,14 @@ Diff-Tönungen (≥ 12:1). Rahmen von Eingabefeldern erreichen ≥ 3:1
 - **Gefahr** (`button.danger`): sekundär mit roter Schrift; Hover rote
   Tönung + roter Rahmen. Mit `ghost` ohne Fläche (z. B. „Entfernen“).
 - **Aufmerksamkeit** (`button.attention`): Akzent-Rahmen + Akzentschrift,
-  nur für „KI-Modell einrichten …“ solange kein Modell da ist.
+  nur für „KI-Modell einrichten …“ / „KI-Modell verwalten …“ solange kein
+  Modell da ist.
+- **Icon** (`button.icon-button`): 32 × 32 px, ohne Fläche, Symbol 18 px in
+  `--color-text-muted` (Hover: `surface-hover`, Text). Nur das Zahnrad;
+  Name über `aria-label` und gleichlautenden Tooltip (`title`).
+- **Kompakt** (`button.compact`, `.note button`): 26 px hoch, 12 px – für
+  Aktionen innerhalb einer Statuszeile („Docker Desktop starten“,
+  „Erneut prüfen“).
 - Deaktiviert: 50 % Deckkraft, Cursor `not-allowed`; Grund steht im Tooltip
   bzw. daneben als gedämpfter Text.
 
@@ -171,15 +178,53 @@ empfohlen) mit Akzentrahmen; `passed`/`timeout`/`failed` mit 6-px-Punkt.
   unsichtbar im DOM und werden beim Kopieren mitgenommen.
 - Ausgaben (`pre.output`): `surface`, leise Haarlinie, max. 240 px hoch.
 
-### Modal (KI-Modell)
+### Kopfzeile
+Nur drei Dinge: **App-Name** (Untertitel ab 1100 px), **Engine-Status**
+(Punkt + kurzer Text, z. B. „Docker Desktop 28.3.2 läuft“; ist die Engine
+gestoppt, direkt daneben kompakt „<Engine> starten“) und rechts das
+**Zahnrad** (`aria-label`/Tooltip „Einstellungen“, `aria-haspopup="dialog"`).
+Alles Weitere – Farbschema, Engine-Auswahl, „Images aktualisieren“,
+KI-Modell – liegt in den Einstellungen. Die Kopfzeile bricht nie um.
+
+### Hinweise unter der Kopfzeile
+Was Aufmerksamkeit braucht, wird **nicht** in den Einstellungen versteckt:
+Engine fehlt (mit Download-Links, „Erneut prüfen“, „Engine wählen …“),
+Engine gestoppt bzw. Start fehlgeschlagen, Engine wird gestartet,
+`DOCKER_HOST`-Warnung (tcp/http) und fehlgeschlagene Image-Vorbereitung.
+Je Hinweis eine `.note`-Zeile in 13 px über volle Breite, darunter eine
+leise Haarlinie; ohne Hinweis entfällt die Zeile ganz.
+
+### Dialoge (Einstellungen, KI-Modell)
 Einzige erhöhte Fläche: `overlay`, Haarlinie, Radius 8 px,
 `--shadow-overlay`, Hintergrund abgedunkelt (`--color-backdrop`).
+- Gemeinsame Komponente `Modal` (`src/components/Modal.tsx`):
+  `role="dialog"`, `aria-modal`, Titel als `aria-labelledby`; beim Öffnen
+  hat der Dialog selbst den Fokus, Tab/Umschalt+Tab bleiben im Dialog,
+  **Esc** und „Schließen“ schließen ihn (nicht während eines Downloads im
+  KI-Dialog), danach kehrt der Fokus zum auslösenden Element zurück (sonst
+  zum Zahnrad).
+- Kopf (Titel + „Schließen“) steht fest, der Inhalt (`.modal-body`) scrollt
+  im Dialog; die Seite dahinter scrollt nicht mit.
+- Breite: Einstellungen 600 px, KI-Modell 760 px, oben 48 px Abstand.
+  Unter 800 px Fensterbreite: Sheet über die volle Breite, unten
+  angedockt, nur oben gerundet.
+- Nie zwei Dialoge übereinander: „KI-Modell verwalten …“ schließt die
+  Einstellungen und öffnet den KI-Dialog.
+
+**Einstellungen** – Abschnitte mit Überschrift (14 px, 600), getrennt
+durch leise Haarlinien; Zeile = Beschriftung links, Bedienelement rechts:
+1. *Darstellung*: Farbschema System · Hell · Dunkel (Segment-Umschalter).
+2. *Container-Engine*: Auswahl Docker Desktop/Podman (gesperrt während
+   Prüfung/KI), Statuszeile, „<Engine> starten“ / „Erneut prüfen“ bei
+   Bedarf, „Images aktualisieren“ mit Fortschritt/Ergebnis, Download-Links.
+3. *KI-Modell*: Punkt + gewähltes Modell bzw. „kein Modell eingerichtet“,
+   „KI-Modell verwalten …“.
 
 ## 7. Layout
 
 ```
-┌ Kopfzeile: Code-Prüfer · ● Engine-Status ……… [Images] [Engine ▾] [System|Hell|Dunkel] [KI-Modell …]
-│  (Hinweise zur Engine volle Breite darunter, nur bei Bedarf)
+┌ Kopfzeile: Code-Prüfer · ● Engine-Status [Engine starten]* ………………………… [⚙]
+│  (Hinweise zur Engine volle Breite darunter, nur bei Bedarf)   * nur wenn gestoppt
 ├ Werkzeugleiste (klebt oben): Sprache ▾ · Datei hochladen … · main.py ……… Status · [Prüfen]
 ├ Monaco-Editor – volle Breite, Höhe ≈ 50 % des Fensters (min. 200 px)
 ├ ═ Ziehgriff (Maus; Tastatur ↑/↓, Pos1/Ende, Enter = Standardhöhe; Doppelklick = Standard)
@@ -198,12 +243,11 @@ Einzige erhöhte Fläche: `overlay`, Haarlinie, Radius 8 px,
 
 | Breite | Verhalten |
 |---|---|
-| < 800 px | Testfall: Eingabe und erwartete Ausgabe untereinander |
+| < 800 px | Testfall: Eingabe und erwartete Ausgabe untereinander; Dialoge als Sheet (volle Breite) |
 | < 900 px | Seitenrand 16 px; Aufgabe-Text und Vorschau untereinander |
-| < 1100 px | Beschriftungen wie „Engine“ und Dateiname nur für Screenreader |
+| < 1100 px | Untertitel ausgeblendet; Dateiname nur für Screenreader |
 | < 1200 px | Testfälle einspaltig, KI-Bereich oberhalb der Liste |
 | ≥ 1200 px | Testfälle \| KI-Bereich (360 px, klebt) nebeneinander |
-| < 1500 px | Untertitel und Engine-Erklärung ausgeblendet (Erklärung im Tooltip) |
 | ≥ 1600 px | Seitenrand 32 px, KI-Bereich 400 px |
 
 Aufgabe-Tab: Text \| Vorschau des Blatts (3 : 2), ab < 900 px untereinander.

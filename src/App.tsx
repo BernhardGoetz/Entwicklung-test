@@ -29,7 +29,7 @@ import {
   type TestCase,
 } from "./api";
 import { CodeEditor } from "./components/CodeEditor";
-import { DockerBanner } from "./components/DockerBanner";
+import { EngineNotices, EngineStatus, type EngineState } from "./components/DockerBanner";
 import { LanguageSelect } from "./components/LanguageSelect";
 import { ResultsPanel } from "./components/ResultsPanel";
 import { TaskStatement } from "./components/TaskStatement";
@@ -37,7 +37,7 @@ import { AiPanel } from "./components/AiPanel";
 import { ModelSetup } from "./components/ModelSetup";
 import { MAX_TESTS, TestCaseEditor, newTestCase } from "./components/TestCaseEditor";
 import { TabBar, TabPanel, type TabDef } from "./components/Tabs";
-import { ThemeToggle } from "./components/ThemeToggle";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { readStored, useTheme, writeStored } from "./theme";
 
 function reportText(r: ImagesReport, what: string): string | null {
@@ -87,6 +87,9 @@ export default function App() {
   // Local AI: model status, setup dialog, generation running.
   const [ai, setAi] = useState<AiStatus | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
+  // „Einstellungen“ (gear): theme, container engine, AI model.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const gearRef = useRef<HTMLButtonElement>(null);
   const [generating, setGenerating] = useState(false);
   // "Erkennungsfehler mit KI korrigieren" is running (same model).
   const [fixing, setFixing] = useState(false);
@@ -354,7 +357,13 @@ export default function App() {
           ? "Die Container-Engine wird beim Prüfen automatisch gestartet."
           : null;
 
-  const modelReady = ai?.modelReady ?? false;
+  const engineState: EngineState = {
+    status: docker,
+    engine,
+    starting,
+    startError,
+    images: { busy: imagesBusy, note: imagesNote },
+  };
 
   return (
     <div className="app">
@@ -363,31 +372,19 @@ export default function App() {
           <span className="brand-name">Code-Prüfer</span>
           <span className="brand-tag muted">Programmieraufgaben lokal und sicher testen</span>
         </div>
-        <DockerBanner
-          status={docker}
-          engine={engine}
-          starting={starting}
-          startError={startError}
-          busy={running || generating}
-          images={{ busy: imagesBusy, note: imagesNote }}
-          onUpdateImages={onUpdateImages}
-          onRetry={refreshDocker}
-          onStart={() => void doStart()}
-          onEngineChange={(e) => void onEngineChange(e)}
-          trailing={
-            <>
-              <ThemeToggle value={themePref} onChange={setThemePref} />
-              <button
-                onClick={() => setSetupOpen(true)}
-                disabled={generating}
-                className={modelReady ? undefined : "attention"}
-              >
-                {modelReady ? "KI-Modell …" : "KI-Modell einrichten …"}
-              </button>
-            </>
-          }
-        />
+        <EngineStatus state={engineState} onStart={() => void doStart()} />
+        <button
+          ref={gearRef}
+          className="icon-button"
+          aria-label="Einstellungen"
+          aria-haspopup="dialog"
+          title="Einstellungen (Farbschema, Container-Engine, KI-Modell)"
+          onClick={() => setSettingsOpen(true)}
+        >
+          <GearIcon />
+        </button>
       </header>
+      <EngineNotices state={engineState} onRetry={refreshDocker} onOpenSettings={() => setSettingsOpen(true)} />
       <main>
         <CodeEditor
           language={language}
@@ -482,7 +479,40 @@ export default function App() {
           </section>
         </TabPanel>
       </main>
-      {setupOpen && <ModelSetup status={ai} onStatus={setAi} onClose={() => setSetupOpen(false)} />}
+      {settingsOpen && (
+        <SettingsDialog
+          onClose={() => setSettingsOpen(false)}
+          returnFocus={gearRef}
+          themePref={themePref}
+          onThemeChange={setThemePref}
+          engine={engineState}
+          busy={running || generating}
+          onEngineChange={(e) => void onEngineChange(e)}
+          onStart={() => void doStart()}
+          onRetry={refreshDocker}
+          onUpdateImages={onUpdateImages}
+          ai={ai}
+          aiBusy={generating}
+          onOpenModelSetup={() => {
+            // Replace the settings (no stacked dialogs); focus returns to the gear.
+            setSettingsOpen(false);
+            setSetupOpen(true);
+          }}
+        />
+      )}
+      {setupOpen && (
+        <ModelSetup status={ai} onStatus={setAi} onClose={() => setSetupOpen(false)} returnFocus={gearRef} />
+      )}
     </div>
+  );
+}
+
+/** Gear icon (outline, 18 px, currentColor). */
+function GearIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+      <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
   );
 }

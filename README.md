@@ -58,7 +58,7 @@ Die gewählte Engine wird so ermittelt (erste Quelle gewinnt):
 1. `engine.json` im App-Konfigurationsordner (Windows:
    `%APPDATA%\de.bernhardgoetz.codepruefer\engine.json`, Inhalt z. B.
    `{"engine": "podman"}`) – wird geschrieben, wenn man die Engine in der App umstellt
-   (Auswahlfeld „Container-Engine“ im Statusbalken);
+   (Zahnrad oben rechts → „Einstellungen“ → „Container-Engine“);
 2. Registry `HKCU\Software\Code-Pruefer`, Wert `Engine` (`docker` | `podman`) – wird
    vom Installer geschrieben;
 3. Standard: Docker.
@@ -87,7 +87,7 @@ zuerst probiert. Mit der Umgebungsvariable `DOCKER_HOST` (z. B.
 `unix:///pfad/zum/podman.sock` oder `npipe:////./pipe/podman-machine-default`) lässt
 sich der Endpunkt explizit festlegen; sie hat Vorrang vor der Engine-Auswahl. Ein
 `tcp://`- oder `http://`-Endpunkt ist immer unverschlüsselt und ohne Anmeldung (die App
-unterstützt kein TLS); dafür zeigt der Statusbalken eine Warnung.
+unterstützt kein TLS); dafür zeigt das Hauptfenster unter der Kopfzeile eine Warnung.
 
 ### Runner-Images (Python, Java)
 
@@ -95,7 +95,8 @@ Release-Installer enthalten die Runner-Images als komprimierte Archive
 (`images/code-pruefer-<sprache>-<arch>.tar.gz` im Ressourcenordner der App). Sobald die
 Engine läuft, lädt die App fehlende Images automatisch in die **gewählte** Engine
 (Docker und Podman verwenden dasselbe Image-Format, aber getrennte Image-Speicher) – ganz
-ohne Internet und ohne manuelles `docker build`. Fortschritt wird im Statusbalken angezeigt.
+ohne Internet und ohne manuelles `docker build`. Fortschritt wird neben „Prüfen“ und in den
+Einstellungen angezeigt.
 
 Reihenfolge, wenn eine Sprache verwendet wird (`src-tauri/src/runner/images.rs`):
 
@@ -134,7 +135,7 @@ Verhalten: Vertrauen über den Tag, Download per Tag.
 Die Architektur des Archivs richtet sich nach der Engine (`amd64` / `arm64`, ersatzweise
 nach dem Rechner: `x86_64` → `amd64`, `aarch64` → `arm64`).
 
-**„Images aktualisieren“** (Button im Statusbalken) lädt die gepinnten Images dieser
+**„Images aktualisieren“** (Zahnrad → „Einstellungen“ → „Container-Engine“) lädt die gepinnten Images dieser
 App-Version erneut von GHCR. Schlägt das fehl (offline, Registry nicht erreichbar), bleiben
 die vorhandenen Images nutzbar.
 
@@ -352,7 +353,8 @@ auch bei Weiterleitungen; feste Revision, SHA-256 und Größe aus dem Katalog,
 `src-tauri/src/ai/catalog.json`). llama-server lauscht nur auf `127.0.0.1` mit zufälligem
 API-Schlüssel und startet mit `--offline`. Aufgabentexte und Code verlassen den Rechner nie.
 
-**Modell einrichten:** Unter „KI-Modell …“ beim empfohlenen Eintrag „Herunterladen“, danach
+**Modell einrichten:** Unter Zahnrad → „Einstellungen“ → „KI-Modell verwalten …“ (oder
+„KI-Modell einrichten …“ im Tab „Testfälle“) beim empfohlenen Eintrag „Herunterladen“, danach
 „Auswählen“. Revision, Dateiname, Größe und SHA-256 trägt der Release-Workflow aus der
 Hugging-Face-API ein (`scripts/pin-models.sh`) und nennt sie in den Release-Notizen; im
 Repository ist der Katalog nicht gepinnt, Entwickler-Builds haben deshalb keinen
@@ -360,7 +362,7 @@ Download-Knopf.
 
 **Modell offline einrichten** (unter „Weitere Optionen (ohne Internet)“): Die `.gguf`-Datei (Links und Prüfsummen in `catalog.json`)
 auf einem Rechner mit Internet herunterladen, z. B. per USB-Stick übertragen und unter
-„KI-Modell …“ beim passenden Eintrag mit „Datei importieren …“ einlesen (erwartet:
+„KI-Modell verwalten …“ beim passenden Eintrag mit „Datei importieren …“ einlesen (erwartet:
 `*q5_k_m*.gguf` für 1.5B, `*q4_k_m*.gguf` für 7B; ist die Datei auf Hugging Face in Teile
 `…-00001-of-0000N.gguf` aufgeteilt, alle Teile zusammen auswählen – fehlende Teile lassen sich
 nachträglich importieren). Die App prüft den GGUF-Dateianfang und warnt bei unpassendem
@@ -433,7 +435,7 @@ cd src-tauri && cargo test -- --ignored --test-threads=1
 ```
 
 KI (Entwickler-Builds): llama-server für Linux holen und per Umgebungsvariable setzen
-(gilt nur in Debug-Builds), Modell unter „KI-Modell …“ importieren:
+(gilt nur in Debug-Builds), Modell unter „KI-Modell verwalten …“ importieren:
 
 ```sh
 scripts/fetch-llama-server.sh linux-x64 /tmp/llama

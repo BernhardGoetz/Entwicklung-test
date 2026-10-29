@@ -7,9 +7,18 @@ const OPTIONS: { value: ThemePref; label: string; title: string }[] = [
 ];
 
 /** Segmented control (native radio buttons: arrow keys work as usual). */
-export function ThemeToggle({ value, onChange }: { value: ThemePref; onChange: (p: ThemePref) => void }) {
+export function ThemeToggle({
+  value,
+  onChange,
+  labelledBy,
+}: {
+  value: ThemePref;
+  onChange: (p: ThemePref) => void;
+  /** id of a visible label; otherwise „Farbschema“ for screen readers. */
+  labelledBy?: string;
+}) {
   return (
-    <fieldset className="segmented" aria-label="Farbschema">
+    <fieldset className="segmented" aria-labelledby={labelledBy} aria-label={labelledBy ? undefined : "Farbschema"}>
       <legend className="sr-only">Farbschema</legend>
       {OPTIONS.map((o) => (
         <label key={o.value} title={o.title} className={value === o.value ? "checked" : undefined}>

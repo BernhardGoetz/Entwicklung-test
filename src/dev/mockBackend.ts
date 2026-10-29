@@ -103,10 +103,20 @@ export function installMock(): void {
       switch (cmd) {
         case "docker_status":
           if (state === "missing") return { state: "notInstalled" };
-          if (state === "stopped") return { state: "notRunning" };
+          if (state === "stopped" || state === "stopfail") return { state: "notRunning" };
+          if (state === "tcp")
+            return {
+              state: "ok",
+              product: "Docker Desktop",
+              version: "28.3.2",
+              warning: 
+                "Achtung: DOCKER_HOST=tcp://192.168.1.20:2375 verbindet unverschlüsselt und ohne Anmeldung über das Netzwerk. Wer diesen Port erreicht, kann Container starten und den Rechner übernehmen. Bitte nur auf dem eigenen Rechner verwenden oder auf den Socket bzw. die Named Pipe der Engine umstellen.",
+            };
           return { state: "ok", product: "Docker Desktop", version: "28.3.2" };
         case "start_engine":
           await sleep(800);
+          // ?engine=stopfail: the automatic start fails (header shows „… starten“).
+          if (state === "stopfail") throw "Docker Desktop hat nicht innerhalb von 2 Minuten geantwortet.";
           return { state: "ok", product: "Docker Desktop", version: "28.3.2" };
         case "get_engine":
           return { engine: "docker", source: "config" };
