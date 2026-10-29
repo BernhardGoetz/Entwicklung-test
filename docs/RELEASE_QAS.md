@@ -113,8 +113,9 @@ Releases entstehen nur noch über QAS und Abnahme.
      **unverändert** übernommen.
    - macOS: Die DMGs aus QAS werden unverändert veröffentlicht. Apple hat keine
      Test-Signatur, sie sind also schon in QAS final signiert (falls eingerichtet).
-3. **updater-sign:** Signiert den fertigen Windows-Installer aus `promote-windows` und
-   die macOS-Archive (`*.app.tar.gz`) für den App-Updater und prüft die Signaturen.
+3. **updater-sign:** Prüft den fertigen Windows-Installer aus `promote-windows` und die
+   macOS-Archive (`*.app.tar.gz`) gegen die Manifeste der erzeugenden Jobs, signiert sie
+   für den App-Updater und prüft die Signaturen.
    Ohne Updater-Schlüssel: übersprungen mit Warnung. Siehe [`UPDATER.md`](UPDATER.md).
 4. **release:** Prüft erneut, dass `v<version>` frei ist. Ein erneuter Lauf desselben
    Commits mit Entwurf ist erlaubt. Dann setzt der Job den Tag `v<version>` auf den
@@ -127,6 +128,33 @@ Releases entstehen nur noch über QAS und Abnahme.
 5. **pull-request:** Legt den PR `qas` → `main` mit dem Titel „Release v<version> nach
    main“ an. Existiert schon ein offener PR, legt er keinen zweiten an. Auf `main` wird
    nie direkt geschrieben. Den PR prüfst und mergst du selbst.
+
+## Integrität der Artefakte zwischen den Jobs
+
+Jeder Schritt eines späteren Jobs desselben Laufs könnte Artefakte ersetzen
+(`upload-artifact` mit `overwrite`, das Laufzeit-Token hängt nicht an `permissions:`).
+Ein kompromittierter Baustein in z. B. `promote-images` könnte so das macOS-Updater-Archiv
+austauschen, das `updater-sign` danach gültig signieren würde. Deshalb gilt:
+
+- Jeder Job, der ein Release-Artefakt erzeugt, gibt ein **Manifest** (SHA-256 und
+  Dateiname je Datei, `scripts/artifact-manifest.sh write`) als Job-Output weiter:
+  `version` (gepinnter `catalog.json`), `images` (je Sprache `image-digests.json`, die
+  Image-Archive amd64/arm64 und der Registry-Digest), `build-windows` (`SHA256SUMS.txt`
+  der unsignierten Programmdateien), `bundle-windows` und `promote-windows` (Installer,
+  Signatur-Manifest), `bundle-macos` (je Architektur DMG und `.app.tar.gz`) und
+  `updater-sign` (Updater-Signaturen).
+- Jeder Job, der ein Artefakt verwendet, prüft es **vor** dem Bündeln, Signieren oder
+  Veröffentlichen (`scripts/artifact-manifest.sh verify`): gleiche Dateinamen, gleiche
+  SHA-256, keine zusätzlichen und keine fehlenden Dateien. `promote-images` prüft
+  außerdem, dass `image-digests.json` genau den Digest nennt, den `images` gebaut hat.
+  Abweichung oder fehlender Output → Abbruch.
+- Matrix-Jobs (`images`, `bundle-macos`) schreiben je Eintrag einen eigenen Output-Namen
+  (z. B. `dmg_macos_arm64`). Kommt ein Wert nicht an, scheitert die Prüfung (nie still
+  ungeprüft).
+- `updater-sign` installiert nur die Tauri-CLI (`scripts/install-signer.sh`: Version und
+  sha512-Integrität aus `package-lock.json`, `npm ci --ignore-scripts` in einem eigenen
+  Ordner), kein vollständiges `npm ci`. Der private Updater-Schlüssel steht nur im Schritt
+  „Signieren“; geprüft wird in einem eigenen Schritt ohne Schlüssel.
 
 ## Nötige GitHub-Einstellungen (einmalig)
 

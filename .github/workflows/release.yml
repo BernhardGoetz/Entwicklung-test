@@ -53,6 +53,14 @@ name: Release (QAS und Abnahme)
 #
 # Artefakte, die nach der Abnahme noch gebraucht werden, bleiben 30 Tage
 # erhalten (so lange wartet auch eine offene Abnahme höchstens).
+#
+# Integrität zwischen den Jobs: Jeder Job, der ein Release-Artefakt erzeugt,
+# gibt dessen Manifest (SHA-256 je Datei, scripts/artifact-manifest.sh) als
+# Job-Output weiter; jeder Job, der es verwendet, prüft es vor dem Bündeln,
+# Signieren oder Veröffentlichen und bricht bei Abweichung ab. Ein Schritt
+# eines späteren Jobs könnte Artefakte desselben Laufs sonst unbemerkt
+# ersetzen. Matrix-Jobs schreiben je Eintrag einen eigenen Output-Namen; ein
+# fehlender Wert lässt die Prüfung scheitern.
 
 on:
   push:
@@ -77,6 +85,7 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       registry: ${{ steps.v.outputs.registry }}
       qas_tag: ${{ steps.v.outputs.qas_tag }}
+      catalog: ${{ steps.manifest.outputs.catalog }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -148,6 +157,10 @@ jobs:
               src-tauri/src/ai/catalog.json
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Manifest des Katalogs
+        id: manifest
+        run: scripts/artifact-manifest.sh write catalog src-tauri/src/ai/catalog.json
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: model-catalog
@@ -161,6 +174,17 @@ jobs:
     permissions:
       contents: read # Checkout
       packages: write # Push der Images nach GHCR
+    # Je Sprache eigene Output-Namen (Matrix): Manifeste der Archive und
+    # der image-digests.json, Registry-Digest des Images.
+    outputs:
+      digests_python: ${{ steps.manifest.outputs.digests_python }}
+      digests_java: ${{ steps.manifest.outputs.digests_java }}
+      amd64_python: ${{ steps.manifest.outputs.amd64_python }}
+      amd64_java: ${{ steps.manifest.outputs.amd64_java }}
+      arm64_python: ${{ steps.manifest.outputs.arm64_python }}
+      arm64_java: ${{ steps.manifest.outputs.arm64_java }}
+      image_python: ${{ steps.manifest.outputs.image_python }}
+      image_java: ${{ steps.manifest.outputs.image_java }}
     strategy:
       fail-fast: true
       matrix:
@@ -210,6 +234,23 @@ jobs:
           scripts/export-image-archives.sh amd64 image-archives
           scripts/export-image-archives.sh arm64 image-archives
           echo "$REPO@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Manifeste der Artefakte
+        id: manifest
+        env:
+          LANGUAGE: ${{ matrix.language }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh write "digests_$LANGUAGE" image-archives/image-digests.json
+          for arch in amd64 arm64; do
+            scripts/artifact-manifest.sh write "${arch}_$LANGUAGE" "image-archives/code-pruefer-$LANGUAGE-$arch.tar.gz"
+          done
+          if ! [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Kein gültiger Image-Digest ($IMAGE_DIGEST)."
+            exit 1
+          fi
+          echo "image_$LANGUAGE=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -271,11 +312,17 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: model-catalog
-          path: src-tauri/src/ai
+          path: artifacts/catalog
 
       - name: KI-Modellkatalog prüfen
         shell: bash
-        run: scripts/pin-models.sh --check
+        env:
+          CATALOG_MANIFEST: ${{ needs.version.outputs.catalog }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify artifacts/catalog "$CATALOG_MANIFEST"
+          cp artifacts/catalog/catalog.json src-tauri/src/ai/catalog.json
+          scripts/pin-models.sh --check
 
       - run: npm ci
 
@@ -353,12 +400,20 @@ jobs:
     environment: qas
     outputs:
       signed: ${{ steps.mode.outputs.enabled }}
+      installer: ${{ steps.manifest.outputs.installer }}
+      signing_manifest: ${{ steps.manifest.outputs.signing_manifest }}
     env:
       BUNDLE_STAGE: qas
       BUNDLE_ARTIFACT: qas-bundle-windows-x64
       SIGNING_ENVIRONMENT: qas
       UNSIGNED_SUMS_SHA256: ${{ needs.build-windows.outputs.sums_sha256 }}
+      AMD64_PYTHON: ${{ needs.images.outputs.amd64_python }}
+      AMD64_JAVA: ${{ needs.images.outputs.amd64_java }}
+      DIGESTS_PYTHON: ${{ needs.images.outputs.digests_python }}
+      DIGESTS_JAVA: ${{ needs.images.outputs.digests_java }}
       QAS_SIGNED: ""
+      QAS_INSTALLER: ""
+      QAS_SIGNING_MANIFEST: ""
       # Secrets sind in `if:` nicht direkt verfügbar.
       HAS_SIGNPATH_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
       SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -401,12 +456,12 @@ jobs:
           cp windows-unsigned/code-pruefer.exe src-tauri/target/release/
           cp windows-unsigned/llama/* src-tauri/resources/llama/
 
-      - name: Image-Archive (amd64) in den Ressourcenordner
+      - name: Image-Archive (amd64)
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: image-*-amd64
           merge-multiple: true
-          path: src-tauri/resources/images
+          path: artifacts/images
 
       - name: Prüfsummen der Images
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -414,9 +469,14 @@ jobs:
           pattern: digests-*
           path: digests
 
-      - name: image-digests.json zusammenführen
+      - name: Image-Artefakte prüfen und einsetzen
         shell: bash
-        run: jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify artifacts/images "$AMD64_PYTHON" "$AMD64_JAVA"
+          scripts/artifact-manifest.sh verify digests "$DIGESTS_PYTHON" "$DIGESTS_JAVA"
+          cp artifacts/images/*.tar.gz src-tauri/resources/images/
+          jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
 
       # Signatur nur, wenn Secret SIGNPATH_API_TOKEN und die Variablen
       # SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG und
@@ -492,6 +552,13 @@ jobs:
         with:
           name: qas-bundle-windows-x64
           path: qas-bundle
+
+      # Genau der Installer, den bundle-windows hochgeladen hat (und der im
+      # QAS-Pre-Release getestet wurde).
+      - name: QAS-Installer prüfen
+        if: env.BUNDLE_STAGE == 'production'
+        shell: bash
+        run: scripts/artifact-manifest.sh verify qas-bundle "$QAS_INSTALLER"
 
       - name: QAS-Installer unverändert übernehmen
         if: steps.mode.outputs.reuse == 'true'
@@ -736,6 +803,11 @@ jobs:
           name: qas-bundle-windows-x64-signing-manifest
           path: qas-manifest
 
+      - name: QAS-Manifest prüfen
+        if: env.BUNDLE_STAGE == 'production' && env.QAS_SIGNED == 'true'
+        shell: bash
+        run: scripts/artifact-manifest.sh verify qas-manifest "$QAS_SIGNING_MANIFEST"
+
       - name: Mit dem QAS-Installer vergleichen
         if: env.BUNDLE_STAGE == 'production'
         shell: pwsh
@@ -783,6 +855,19 @@ jobs:
             throw "Release-Installer weicht inhaltlich vom QAS-Installer ab"
           }
 
+      # Manifest genau der Dateien, die gleich hochgeladen werden
+      # (Job-Outputs installer, signing_manifest).
+      - name: Manifeste der Artefakte
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          scripts/artifact-manifest.sh write installer src-tauri/target/release/bundle/nsis/*.exe
+          if [ -f signpath/signing-manifest.txt ]; then
+            scripts/artifact-manifest.sh write signing_manifest signpath/signing-manifest.txt
+          fi
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.BUNDLE_ARTIFACT }}
@@ -819,11 +904,19 @@ jobs:
     # hier gebaut und signiert (Apple hat kein Test-Zertifikat); nach der
     # Abnahme werden genau diese DMGs veröffentlicht.
     environment: qas
+    # Je Matrix-Eintrag eigene Output-Namen (Manifeste von DMG und
+    # Updater-Archiv).
+    outputs:
+      dmg_macos_arm64: ${{ steps.manifest-dmg.outputs.dmg_macos_arm64 }}
+      dmg_macos_x64: ${{ steps.manifest-dmg.outputs.dmg_macos_x64 }}
+      updater_macos_arm64: ${{ steps.manifest-updater.outputs.updater_macos_arm64 }}
+      updater_macos_x64: ${{ steps.manifest-updater.outputs.updater_macos_x64 }}
     env:
       TARGET: ${{ matrix.target }}
       LLAMA_PLATFORM: ${{ matrix.llama }}
       FILE_ARCH: ${{ matrix.file_arch }}
       VERSION: ${{ needs.version.outputs.version }}
+      OUTPUT_KEY: ${{ matrix.name == 'macos-arm64' && 'macos_arm64' || 'macos_x64' }}
       # Secrets sind in `if:` nicht direkt verfügbar.
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
@@ -838,12 +931,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Image-Archive (${{ matrix.arch }}) in den Ressourcenordner
+      - name: Image-Archive (${{ matrix.arch }})
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: image-*-${{ matrix.arch }}
           merge-multiple: true
-          path: src-tauri/resources/images
+          path: artifacts/images
 
       - name: Prüfsummen der Images
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -851,17 +944,28 @@ jobs:
           pattern: digests-*
           path: digests
 
-      - name: image-digests.json zusammenführen
-        run: jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
-
       - name: Gepinnter KI-Modellkatalog
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: model-catalog
-          path: src-tauri/src/ai
+          path: artifacts/catalog
 
-      - name: KI-Modellkatalog prüfen
-        run: scripts/pin-models.sh --check
+      - name: Artefakte prüfen und einsetzen
+        env:
+          ARCHIVE_PYTHON: ${{ matrix.arch == 'amd64' && needs.images.outputs.amd64_python || needs.images.outputs.arm64_python }}
+          ARCHIVE_JAVA: ${{ matrix.arch == 'amd64' && needs.images.outputs.amd64_java || needs.images.outputs.arm64_java }}
+          DIGESTS_PYTHON: ${{ needs.images.outputs.digests_python }}
+          DIGESTS_JAVA: ${{ needs.images.outputs.digests_java }}
+          CATALOG_MANIFEST: ${{ needs.version.outputs.catalog }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify artifacts/images "$ARCHIVE_PYTHON" "$ARCHIVE_JAVA"
+          scripts/artifact-manifest.sh verify digests "$DIGESTS_PYTHON" "$DIGESTS_JAVA"
+          scripts/artifact-manifest.sh verify artifacts/catalog "$CATALOG_MANIFEST"
+          cp artifacts/images/*.tar.gz src-tauri/resources/images/
+          jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
+          cp artifacts/catalog/catalog.json src-tauri/src/ai/catalog.json
+          scripts/pin-models.sh --check
 
       - name: llama-server (KI-Laufzeit) holen und prüfen
         run: scripts/fetch-llama-server.sh "$LLAMA_PLATFORM"
@@ -892,6 +996,10 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run tauri -- build --target "$TARGET" --bundles app,dmg --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.updater.conf.json
 
+      - name: Manifest des DMG
+        id: manifest-dmg
+        run: scripts/artifact-manifest.sh write "dmg_$OUTPUT_KEY" "src-tauri/target/$TARGET/release/bundle/dmg/"*.dmg
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bundle-${{ matrix.name }}
@@ -921,6 +1029,10 @@ jobs:
           COPYFILE_DISABLE=1 tar -czf "$out" "${apps[0]}"
           tar -tzf "$out" | head -n 3
           ls -l "$out"
+
+      - name: Manifest des Updater-Archivs
+        id: manifest-updater
+        run: scripts/artifact-manifest.sh write "updater_$OUTPUT_KEY" updater/*.app.tar.gz
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -960,6 +1072,17 @@ jobs:
         with:
           name: model-catalog
           path: catalog
+
+      - name: Artefakte prüfen (Manifeste aus bundle-windows, bundle-macos, version)
+        env:
+          WINDOWS_INSTALLER: ${{ needs.bundle-windows.outputs.installer }}
+          DMG_ARM64: ${{ needs.bundle-macos.outputs.dmg_macos_arm64 }}
+          DMG_X64: ${{ needs.bundle-macos.outputs.dmg_macos_x64 }}
+          CATALOG_MANIFEST: ${{ needs.version.outputs.catalog }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify qas "$WINDOWS_INSTALLER" "$DMG_ARM64" "$DMG_X64"
+          scripts/artifact-manifest.sh verify catalog "$CATALOG_MANIFEST"
 
       # Wie im Release: ASCII-Dateinamen. Keine latest.json in QAS (die
       # App fragt zwar nur releases/latest ab, aber ein QAS-Pre-Release soll
@@ -1044,20 +1167,34 @@ jobs:
   # Images ohne Neubau befördern: :<version> zeigt danach auf denselben
   # Digest (Manifest-Liste) wie der getestete QAS-Tag.
   promote-images:
-    needs: [version, abnahme]
+    needs: [version, images, abnahme]
     runs-on: ubuntu-latest
     permissions:
+      contents: read # Checkout (scripts/artifact-manifest.sh)
       packages: write # Tag :<version> in GHCR setzen
     env:
       REGISTRY: ${{ needs.version.outputs.registry }}
       VERSION: ${{ needs.version.outputs.version }}
       QAS_IMAGE_TAG: ${{ needs.version.outputs.version }}-qas.${{ github.run_number }}
+      # Registry-Digests aus dem Job images (je Sprache).
+      IMAGE_PYTHON: ${{ needs.images.outputs.image_python }}
+      IMAGE_JAVA: ${{ needs.images.outputs.image_java }}
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
       - name: Prüfsummen der Images
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: digests-*
           path: digests
+
+      - name: Prüfsummen-Artefakt prüfen
+        env:
+          DIGESTS_PYTHON: ${{ needs.images.outputs.digests_python }}
+          DIGESTS_JAVA: ${{ needs.images.outputs.digests_java }}
+        run: scripts/artifact-manifest.sh verify digests "$DIGESTS_PYTHON" "$DIGESTS_JAVA"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
@@ -1080,6 +1217,13 @@ jobs:
               digest="$(jq -r --arg l "$lang" '.images[$l].repoDigest' "$f")"
               if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
                 echo "::error::Kein Registry-Digest für $lang in $f."
+                exit 1
+              fi
+              # Derselbe Digest, den der Job images gebaut und gepusht hat.
+              built_var="IMAGE_$(echo "$lang" | tr '[:lower:]' '[:upper:]')"
+              built="${!built_var:-}"
+              if [ "$built" != "$digest" ]; then
+                echo "::error::$lang: image-digests.json nennt $digest, der Job images hat ${built:-nichts} gebaut."
                 exit 1
               fi
               qas="$(digest_of "$repo:$QAS_IMAGE_TAG")"
@@ -1114,7 +1258,7 @@ jobs:
   # unsigniertem QAS-Installer) wird der QAS-Installer unverändert
   # übernommen.
   promote-windows:
-    needs: [version, build-windows, bundle-windows, abnahme]
+    needs: [version, images, build-windows, bundle-windows, abnahme]
     runs-on: windows-latest
     permissions:
       contents: read # Checkout
@@ -1122,12 +1266,20 @@ jobs:
     environment: release
     outputs:
       signed: ${{ steps.mode.outputs.enabled }}
+      installer: ${{ steps.manifest.outputs.installer }}
+      signing_manifest: ${{ steps.manifest.outputs.signing_manifest }}
     env:
       BUNDLE_STAGE: production
       BUNDLE_ARTIFACT: bundle-windows-x64
       SIGNING_ENVIRONMENT: release
       UNSIGNED_SUMS_SHA256: ${{ needs.build-windows.outputs.sums_sha256 }}
+      AMD64_PYTHON: ${{ needs.images.outputs.amd64_python }}
+      AMD64_JAVA: ${{ needs.images.outputs.amd64_java }}
+      DIGESTS_PYTHON: ${{ needs.images.outputs.digests_python }}
+      DIGESTS_JAVA: ${{ needs.images.outputs.digests_java }}
       QAS_SIGNED: ${{ needs.bundle-windows.outputs.signed }}
+      QAS_INSTALLER: ${{ needs.bundle-windows.outputs.installer }}
+      QAS_SIGNING_MANIFEST: ${{ needs.bundle-windows.outputs.signing_manifest }}
       HAS_SIGNPATH_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
       SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
       SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
@@ -1144,6 +1296,11 @@ jobs:
   # App eingebaut ist (Variable TAURI_UPDATER_PUBKEY); passt sie nicht,
   # bricht der Job ab. Fehlen Schlüssel und Variable: kein Updater-Release
   # (Warnung, kein Fehler).
+  # Vor dem Signieren werden die Dateien gegen die Manifeste aus
+  # promote-windows und bundle-macos geprüft. Installiert wird nur die
+  # Tauri-CLI (scripts/install-signer.sh: Version und Integrität aus
+  # package-lock.json, ohne Install-Skripte), kein vollständiges `npm ci`;
+  # der private Schlüssel steht nur im Schritt „Signieren“.
   updater-sign:
     needs: [version, bundle-macos, promote-windows]
     runs-on: ubuntu-latest
@@ -1152,6 +1309,7 @@ jobs:
     environment: release
     outputs:
       enabled: ${{ steps.mode.outputs.enabled }}
+      signed: ${{ steps.manifest.outputs.signed }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
       # Secrets sind in `if:` nicht direkt verfügbar.
@@ -1188,9 +1346,11 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
-      # Für `tauri signer sign` (Tauri-CLI aus package-lock.json).
-      - if: steps.mode.outputs.enabled == 'true'
-        run: npm ci
+      # Nur `tauri signer sign` (Tauri-CLI, Version/Integrität aus
+      # package-lock.json, --ignore-scripts).
+      - name: Signierwerkzeug installieren
+        if: steps.mode.outputs.enabled == 'true'
+        run: scripts/install-signer.sh "$RUNNER_TEMP/signer"
 
       - name: Windows-Installer (Release, final signiert)
         if: steps.mode.outputs.enabled == 'true'
@@ -1207,7 +1367,20 @@ jobs:
           merge-multiple: true
           path: in/macos
 
-      - name: Signieren und prüfen
+      # Signiert wird nur, was promote-windows bzw. bundle-macos hochgeladen
+      # haben.
+      - name: Artefakte prüfen (Manifeste aus promote-windows, bundle-macos)
+        if: steps.mode.outputs.enabled == 'true'
+        env:
+          WINDOWS_INSTALLER: ${{ needs.promote-windows.outputs.installer }}
+          UPDATER_ARM64: ${{ needs.bundle-macos.outputs.updater_macos_arm64 }}
+          UPDATER_X64: ${{ needs.bundle-macos.outputs.updater_macos_x64 }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify in/windows "$WINDOWS_INSTALLER"
+          scripts/artifact-manifest.sh verify in/macos "$UPDATER_ARM64" "$UPDATER_X64"
+
+      - name: Signieren
         if: steps.mode.outputs.enabled == 'true'
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -1235,12 +1408,19 @@ jobs:
             files+=("updater/$(basename "$f")")
           done
           for f in "${files[@]}"; do
-            npx --no-install tauri signer sign --app-version "$VERSION" "$f" > /dev/null
+            "$RUNNER_TEMP/signer/node_modules/.bin/tauri" signer sign --app-version "$VERSION" "$f" > /dev/null
+          done
+
+      - name: Signaturen prüfen
+        if: steps.mode.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          for f in updater/*.exe updater/*.app.tar.gz; do
             node scripts/updater.mjs verify "$f" --version "$VERSION"
           done
           # Der Installer selbst kommt im Job release aus bundle-windows-x64;
           # hier nur seine Signatur weitergeben.
-          rm "$win"
+          rm updater/*.exe
           {
             echo "### App-Updater: Signaturen"
             echo
@@ -1248,6 +1428,11 @@ jobs:
             (cd updater && sha256sum -- *)
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Manifest der Signaturen
+        id: manifest
+        if: steps.mode.outputs.enabled == 'true'
+        run: scripts/artifact-manifest.sh write signed updater/*
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: steps.mode.outputs.enabled == 'true'
@@ -1294,6 +1479,23 @@ jobs:
         with:
           name: updater-signed
           path: updater
+
+      # Veröffentlicht wird nur, was die erzeugenden Jobs hochgeladen haben.
+      - name: Artefakte prüfen (Manifeste aus promote-windows, bundle-macos, updater-sign, version)
+        env:
+          WINDOWS_INSTALLER: ${{ needs.promote-windows.outputs.installer }}
+          DMG_ARM64: ${{ needs.bundle-macos.outputs.dmg_macos_arm64 }}
+          DMG_X64: ${{ needs.bundle-macos.outputs.dmg_macos_x64 }}
+          CATALOG_MANIFEST: ${{ needs.version.outputs.catalog }}
+          UPDATER_ENABLED: ${{ needs.updater-sign.outputs.enabled }}
+          UPDATER_SIGNED: ${{ needs.updater-sign.outputs.signed }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify release "$WINDOWS_INSTALLER" "$DMG_ARM64" "$DMG_X64"
+          scripts/artifact-manifest.sh verify catalog "$CATALOG_MANIFEST"
+          if [ "$UPDATER_ENABLED" = "true" ]; then
+            scripts/artifact-manifest.sh verify updater "$UPDATER_SIGNED"
+          fi
 
       # GitHub ersetzt Sonderzeichen in Asset-Namen; mit ASCII-Namen passen
       # die URLs in latest.json und die Namen in SHA256SUMS.txt genau.

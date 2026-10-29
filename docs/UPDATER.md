@@ -88,7 +88,12 @@ Entwicklungsumgebung nicht abrufbar; Stand der GitHub-Doku]** Zusätzlich:
    `Code-Pruefer_<version>_aarch64.app.tar.gz` bzw. `_x64.app.tar.gz` (Artefakte
    `updater-macos-*`, nicht im QAS-Pre-Release).
 3. **updater-sign** (neu, nach `promote-windows` und `bundle-macos`, Environment
-   `release`): signiert mit `tauri signer sign --app-version <version>` den
+   `release`): prüft die Dateien zuerst gegen die Manifeste (SHA-256) aus
+   `promote-windows` und `bundle-macos` ([`RELEASE_QAS.md`](RELEASE_QAS.md),
+   „Integrität der Artefakte“). Installiert wird nur die Tauri-CLI
+   (`scripts/install-signer.sh`, Version und Integrität aus `package-lock.json`, ohne
+   Install-Skripte), kein `npm ci`; der private Schlüssel steht nur im Schritt
+   „Signieren“. Dann signiert der Job mit `tauri signer sign --app-version <version>` den
    **endgültigen** Windows-Installer aus `promote-windows`, also nach der letzten
    SignPath-Runde, und die beiden macOS-Archive. Danach prüft
    `node scripts/updater.mjs verify` jede Signatur gegen `TAURI_UPDATER_PUBKEY` (gleicher
