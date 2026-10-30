@@ -13,4 +13,3 @@ src-tauri/tauri.sign.conf.json
 src-tauri/resources/llama/
 signpath/
 windows-unsigned/
-src-tauri/tauri.updater.conf.json

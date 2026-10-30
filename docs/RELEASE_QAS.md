@@ -35,11 +35,8 @@ Workflow: [`.github/workflows/release.yml`](../.github/workflows/release.yml).
         ├─► promote-windows ─ dieselben unsignierten Dateien mit Release-Signing
         │                     neu bündeln (Env. „release“), Inhalt mit QAS vergleichen
         ▼
- updater-sign ─────── Updater-Signaturen über den finalen Installer und die
-        │             macOS-Archive (Env. „release“, docs/UPDATER.md)
-        ▼
  release ──────────── Tag v<version> auf dem QAS-Commit, Entwurfs-Release mit
-        │             latest.json, SHA256SUMS.txt + Build-Provenance-Attestierung
+        │             SHA256SUMS.txt + Build-Provenance-Attestierung
         ▼
  pull-request ─────── PR „Release v<version> nach main“ (qas → main)
 ```
@@ -69,8 +66,6 @@ Releases entstehen nur noch über QAS und Abnahme.
 - Unter Releases das Pre-Release `v<version>-qas.<n>` öffnen (Link auch in der
   Zusammenfassung des Laufs und am wartenden Job `abnahme`) und Installer bzw. DMGs laden.
 - Prüfsummen: `sha256sum -c SHA256SUMS.txt`.
-- Das Pre-Release enthält keine `latest.json`: Installierte Apps bieten QAS-Stände nie
-  als Update an. Den Updater selbst testet man auf einem Fork ([`UPDATER.md`](UPDATER.md)).
 - Windows: Ist SignPath im Environment `qas` eingerichtet, sind die Dateien mit dem
   **Test-Zertifikat** signiert. Windows zeigt sie als nicht vertrauenswürdig an; das ist
   in QAS so gewollt. Die Signaturtabelle steht in der Zusammenfassung des Jobs
@@ -113,19 +108,12 @@ Releases entstehen nur noch über QAS und Abnahme.
      **unverändert** übernommen.
    - macOS: Die DMGs aus QAS werden unverändert veröffentlicht. Apple hat keine
      Test-Signatur, sie sind also schon in QAS final signiert (falls eingerichtet).
-3. **updater-sign:** Prüft den fertigen Windows-Installer aus `promote-windows` und die
-   macOS-Archive (`*.app.tar.gz`) gegen die Manifeste der erzeugenden Jobs, signiert sie
-   für den App-Updater und prüft die Signaturen.
-   Ohne Updater-Schlüssel: übersprungen mit Warnung. Siehe [`UPDATER.md`](UPDATER.md).
-4. **release:** Prüft erneut, dass `v<version>` frei ist. Ein erneuter Lauf desselben
+3. **release:** Prüft erneut, dass `v<version>` frei ist. Ein erneuter Lauf desselben
    Commits mit Entwurf ist erlaubt. Dann setzt der Job den Tag `v<version>` auf den
    QAS-Commit und legt ein **Entwurfs-Release** an, mit Windows-Installer (Release),
-   DMGs, `latest.json` und `*.app.tar.gz` (App-Updater, falls eingerichtet),
-   `SHA256SUMS.txt` und Build-Provenance-Attestierung. Dateinamen ohne Umlaut
-   (`Code-Pruefer_…`). **Veröffentlichen musst du selbst** (Release öffnen → „Publish
-   release“, „Set as the latest release“ angehakt lassen). Erst dann bieten installierte
-   Apps das Update an.
-5. **pull-request:** Legt den PR `qas` → `main` mit dem Titel „Release v<version> nach
+   DMGs, `SHA256SUMS.txt` und Build-Provenance-Attestierung. **Veröffentlichen musst du
+   selbst** (Release öffnen → „Publish release“), wie bisher.
+4. **pull-request:** Legt den PR `qas` → `main` mit dem Titel „Release v<version> nach
    main“ an. Existiert schon ein offener PR, legt er keinen zweiten an. Auf `main` wird
    nie direkt geschrieben. Den PR prüfst und mergst du selbst.
 
@@ -155,16 +143,15 @@ Herausgebers in dem Moment kompromittiert, würde sonst die bösartige Datei gep
 
 Jeder Schritt eines späteren Jobs desselben Laufs könnte Artefakte ersetzen
 (`upload-artifact` mit `overwrite`, das Laufzeit-Token hängt nicht an `permissions:`).
-Ein kompromittierter Baustein in z. B. `promote-images` könnte so das macOS-Updater-Archiv
-austauschen, das `updater-sign` danach gültig signieren würde. Deshalb gilt:
+Ein kompromittierter Baustein in z. B. `promote-images` könnte so ein DMG austauschen,
+das `release` danach veröffentlichen würde. Deshalb gilt:
 
 - Jeder Job, der ein Release-Artefakt erzeugt, gibt ein **Manifest** (SHA-256 und
   Dateiname je Datei, `scripts/artifact-manifest.sh write`) als Job-Output weiter:
   `version` (gepinnter `catalog.json`), `images` (je Sprache `image-digests.json`, die
   Image-Archive amd64/arm64 und der Registry-Digest), `build-windows` (`SHA256SUMS.txt`
   der unsignierten Programmdateien), `bundle-windows` und `promote-windows` (Installer,
-  Signatur-Manifest), `bundle-macos` (je Architektur DMG und `.app.tar.gz`) und
-  `updater-sign` (Updater-Signaturen).
+  Signatur-Manifest) und `bundle-macos` (je Architektur das DMG).
 - Jeder Job, der ein Artefakt verwendet, prüft es **vor** dem Bündeln, Signieren oder
   Veröffentlichen (`scripts/artifact-manifest.sh verify`): gleiche Dateinamen, gleiche
   SHA-256, keine zusätzlichen und keine fehlenden Dateien. `promote-images` prüft
@@ -173,10 +160,6 @@ austauschen, das `updater-sign` danach gültig signieren würde. Deshalb gilt:
 - Matrix-Jobs (`images`, `bundle-macos`) schreiben je Eintrag einen eigenen Output-Namen
   (z. B. `dmg_macos_arm64`). Kommt ein Wert nicht an, scheitert die Prüfung (nie still
   ungeprüft).
-- `updater-sign` installiert nur die Tauri-CLI (`scripts/install-signer.sh`: Version und
-  sha512-Integrität aus `package-lock.json`, `npm ci --ignore-scripts` in einem eigenen
-  Ordner), kein vollständiges `npm ci`. Der private Updater-Schlüssel steht nur im Schritt
-  „Signieren“; geprüft wird in einem eigenen Schritt ohne Schlüssel.
 
 ## Nötige GitHub-Einstellungen (einmalig)
 
@@ -186,10 +169,7 @@ Settings → Environments:
 |---|---|---|---|
 | `qas` | keine | „Selected branches and tags“: Branch `qas` | SignPath **Test-Signing** (`SIGNPATH_API_TOKEN`; `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG` = `test-signing`, optional `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG`, `SIGNPATH_SIGN_UPSTREAM`), Apple-Secrets (`APPLE_CERTIFICATE`, …) |
 | `production` | **Bernhard** (Required reviewers); optional „Prevent self-review“ **aus** lassen, da Bernhard selbst pusht | Branch `qas` | keine (nur Freigabe) |
-| `release` | keine (die Freigabe erfolgt über `production`) | Branch `qas` | SignPath **Release-Signing** (dieselben Namen, `SIGNPATH_SIGNING_POLICY_SLUG` = `release-signing`); App-Updater: Secrets `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` ([`UPDATER.md`](UPDATER.md)) |
-
-Repository-Variable (Settings → Secrets and variables → Actions → Variables):
-`TAURI_UPDATER_PUBKEY` (öffentlicher Updater-Schlüssel; wird in die App eingebaut).
+| `release` | keine (die Freigabe erfolgt über `production`) | Branch `qas` | SignPath **Release-Signing** (dieselben Namen, `SIGNPATH_SIGNING_POLICY_SLUG` = `release-signing`) |
 
 Weitere Einstellungen:
 

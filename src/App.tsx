@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ENGINE_NAMES,
   aiStatus,
-  checkForUpdate,
   dockerStatus,
   getEngine,
   listLanguages,
@@ -13,8 +12,6 @@ import {
   progressText,
   runTests,
   setEngine,
-  setUpdateInterval,
-  updateInfo,
   warmUpAi,
   startEngine,
   updateImages,
@@ -30,9 +27,6 @@ import {
   type Progress,
   type RunReport,
   type TestCase,
-  type UpdateInfo,
-  type UpdateInterval,
-  type UpdateOffer,
 } from "./api";
 import { CodeEditor } from "./components/CodeEditor";
 import { EngineNotices, EngineStatus, type EngineState } from "./components/DockerBanner";
@@ -44,8 +38,6 @@ import { ModelSetup } from "./components/ModelSetup";
 import { MAX_TESTS, TestCaseEditor, newTestCase } from "./components/TestCaseEditor";
 import { TabBar, TabPanel, type TabDef } from "./components/Tabs";
 import { SettingsDialog } from "./components/SettingsDialog";
-import { UpdateDialog } from "./components/UpdateDialog";
-import type { CheckNote } from "./components/UpdateSettings";
 import { readStored, useTheme, writeStored } from "./theme";
 
 function reportText(r: ImagesReport, what: string): string | null {
@@ -58,11 +50,6 @@ function reportText(r: ImagesReport, what: string): string | null {
 type TabKey = "task" | "tests" | "result";
 const TAB_KEY = "code-pruefer.tab";
 const isTab = (v: string | null): v is TabKey => v === "task" || v === "tests" || v === "result";
-
-// Automatic update check: shortly after the start, then hourly while the app
-// runs; the backend only asks GitHub when the chosen interval is due.
-const UPDATE_FIRST_CHECK_MS = 5_000;
-const UPDATE_RECHECK_MS = 60 * 60 * 1000;
 
 export default function App() {
   const { pref: themePref, setPref: setThemePref, theme } = useTheme();
@@ -115,12 +102,6 @@ export default function App() {
   const [imagesBusy, setImagesBusy] = useState<string | null>(null);
   const [imagesNote, setImagesNote] = useState<{ text: string; error: boolean } | null>(null);
   const imagesPrepared = useRef(false);
-  // App updates: settings info, an offer waiting to be shown, the dialog.
-  const [update, setUpdate] = useState<UpdateInfo | null>(null);
-  const [updateOffer, setUpdateOffer] = useState<UpdateOffer | null>(null);
-  const [updateOpen, setUpdateOpen] = useState(false);
-  const [updateChecking, setUpdateChecking] = useState(false);
-  const [updateNote, setUpdateNote] = useState<CheckNote | null>(null);
 
   const runImageTask = useCallback(
     async (task: () => Promise<ImagesReport>, busyText: string, doneText: string, failText: string) => {
@@ -230,55 +211,6 @@ export default function App() {
       void unlistenImages.then((f) => f());
     };
   }, [refreshDocker]);
-
-  useEffect(() => {
-    updateInfo()
-      .then(setUpdate)
-      .catch(() => undefined);
-    const auto = () =>
-      checkForUpdate(false)
-        .then((offer) => {
-          if (offer) setUpdateOffer(offer);
-          return updateInfo().then(setUpdate);
-        })
-        .catch(() => undefined);
-    const first = window.setTimeout(auto, UPDATE_FIRST_CHECK_MS);
-    const timer = window.setInterval(auto, UPDATE_RECHECK_MS);
-    return () => {
-      window.clearTimeout(first);
-      window.clearInterval(timer);
-    };
-  }, []);
-
-  const onUpdateIntervalChange = (interval: UpdateInterval) => {
-    setUpdateNote(null);
-    setUpdateInterval(interval)
-      .then(setUpdate)
-      .catch((e) => setUpdateNote({ text: String(e), tone: "error" }));
-  };
-
-  // „Jetzt nach Updates suchen“: a found update replaces the settings dialog.
-  const onCheckUpdate = async () => {
-    setUpdateChecking(true);
-    setUpdateNote(null);
-    try {
-      const offer = await checkForUpdate(true);
-      if (offer) {
-        setUpdateOffer(offer);
-        setSettingsOpen(false);
-        setUpdateOpen(true);
-      } else {
-        setUpdateNote({ text: "Keine neue Version verfügbar – diese Version ist aktuell.", tone: "ok" });
-      }
-    } catch (e) {
-      setUpdateNote({ text: String(e), tone: "error" });
-    } finally {
-      setUpdateChecking(false);
-      updateInfo()
-        .then(setUpdate)
-        .catch(() => undefined);
-    }
-  };
 
   const language = languages.find((l) => l.id === languageId);
   const code = codeByLang[languageId] ?? "";
@@ -425,23 +357,6 @@ export default function App() {
           ? "Die Container-Engine wird beim Prüfen automatisch gestartet."
           : null;
 
-  // Updates never interrupt a check or an AI job: the offer waits until
-  // nothing runs and no other dialog is open; installing waits as well.
-  const updateBusy = running
-    ? "Eine Prüfung läuft gerade."
-    : generating
-      ? "Die KI erzeugt gerade Testfälle."
-      : fixing
-        ? "Die KI korrigiert gerade den Aufgabentext."
-        : imagesBusy !== null
-          ? "Die Runner-Images werden gerade vorbereitet."
-          : starting !== null
-            ? "Die Container-Engine wird gerade gestartet."
-            : null;
-  useEffect(() => {
-    if (updateOffer !== null && !updateOpen && updateBusy === null && !settingsOpen && !setupOpen) setUpdateOpen(true);
-  }, [updateOffer, updateOpen, updateBusy, settingsOpen, setupOpen]);
-
   const engineState: EngineState = {
     status: docker,
     engine,
@@ -582,23 +497,6 @@ export default function App() {
             // Replace the settings (no stacked dialogs); focus returns to the gear.
             setSettingsOpen(false);
             setSetupOpen(true);
-          }}
-          update={update}
-          updateChecking={updateChecking}
-          updateNote={updateNote}
-          onUpdateIntervalChange={onUpdateIntervalChange}
-          onCheckUpdate={() => void onCheckUpdate()}
-        />
-      )}
-      {updateOpen && updateOffer && (
-        <UpdateDialog
-          offer={updateOffer}
-          busyReason={updateBusy}
-          returnFocus={gearRef}
-          onLater={() => {
-            // „Später“: asked again at the next due check.
-            setUpdateOpen(false);
-            setUpdateOffer(null);
           }}
         />
       )}
