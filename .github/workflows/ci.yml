@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main, qas]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Ein Lauf je Branch bzw. Pull Request; ein neuer Push bricht den laufenden
+# Lauf eines Pull Requests ab, auf Branches läuft er zu Ende.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck + Build
+        run: npm run build
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Tauri-Systemabhängigkeiten
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev build-essential pkg-config libssl-dev
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+      # tauri::generate_context! erwartet das Frontend-Verzeichnis dist/.
+      - run: npm ci && npm run build
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Runner-Images lokal bauen
+        run: |
+          docker build -t code-pruefer-python:dev images/python
+          docker build -t code-pruefer-java:dev images/java
+      - name: Docker-Integrationstests
+        working-directory: src-tauri
+        run: |
+          cargo test --test docker_integration -- --ignored --test-threads=1
+          cargo test --test image_bundle -- --ignored --test-threads=1

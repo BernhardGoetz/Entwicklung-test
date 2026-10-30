@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Wie default.xml, zusätzlich mit den unveränderten Fremdbinaries:
+    llama-…-<name>.exe|.dll      llama.cpp-Laufzeit (Release b…, SHA-256 gepinnt
+                                 in scripts/fetch-llama-server.sh)
+    nsisplugin-…-<name>.dll      NSIS-Plugins (NSIS-Distribution, nsis_tauri_utils)
+  NUR verwenden, wenn die SignPath Foundation schriftlich bestätigt hat, dass
+  diese Dateien mit dem Projektzertifikat signiert werden dürfen; dann in
+  GitHub die Variable SIGNPATH_SIGN_UPSTREAM=true setzen
+  (docs/RELEASE_SIGNING.md, Abschnitt „Fremdbinaries“).
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file-set>
+      <include path="app-*-code-pruefer.exe" min-matches="0" max-matches="1" />
+      <include path="uninstaller-*-uninstall.exe" min-matches="0" max-matches="1" />
+      <include path="installer-*-setup.exe" min-matches="0" max-matches="1" />
+      <for-each>
+        <authenticode-sign />
+      </for-each>
+    </pe-file-set>
+    <pe-file-set>
+      <include path="llama-*.exe" min-matches="0" max-matches="unbounded" />
+      <include path="llama-*.dll" min-matches="0" max-matches="unbounded" />
+      <include path="nsisplugin-*.dll" min-matches="0" max-matches="unbounded" />
+      <for-each>
+        <authenticode-sign />
+      </for-each>
+    </pe-file-set>
+  </zip-file>
+</artifact-configuration>

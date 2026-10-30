@@ -1,0 +1,81 @@
+[package]
+name = "code-pruefer"
+version = "0.1.0"
+description = "Code-Prüfer: Programmieraufgaben lokal in Docker-Containern testen"
+authors = ["Bernhard Goetz"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "code_pruefer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2.8.4"
+# Self-update from the published GitHub releases (docs/UPDATER.md). Without
+# the "zip" feature: only needed for Tauri-v1 update archives.
+tauri-plugin-updater = { version = "2.14.0", default-features = false, features = ["rustls-tls", "system-proxy"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bollard = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "process", "sync", "fs"] }
+futures-util = "0.3"
+thiserror = "2"
+base64 = "0.22"
+bytes = "1"
+flate2 = "1"
+sha2 = "0.10"
+# Document import (task sheets): DOCX = ZIP + XML, PDF text layer.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+quick-xml = "0.42"
+pdf-extract = "0.12.1"
+# Bounded LZW decoding in the PDF checks (docs/pdf_guard.rs); lopdf uses
+# the same crate.
+weezl = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "rustls-tls-native-roots", "json", "stream"] }
+tokio-util = "0.7"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+getrandom = "0.3"
+# Already used by tauri-plugin-updater; needed for its types (endpoint URL,
+# release date).
+url = "2"
+time = { version = "0.3", features = ["formatting"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[target.'cfg(unix)'.dependencies]
+# setrlimit for the document worker (docs/worker.rs, proc_guard.rs).
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+# Built-in OCR (Windows.Media.Ocr) and PDF page rendering (Windows.Data.Pdf).
+windows = { version = "0.62", features = [
+    "Data_Pdf",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Security",
+    # Job objects: memory limit and kill-on-close for child processes
+    # (proc_guard.rs).
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Built-in OCR (Vision) and PDF page rendering (PDFKit).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics"] }
+objc2-vision = { version = "0.3", default-features = false, features = ["std", "VNRequest", "VNRecognizeTextRequest", "VNRequestHandler", "VNObservation", "VNTypes", "objc2-core-foundation"] }
+objc2-pdf-kit = { version = "0.3", default-features = false, features = ["std", "PDFDocument", "PDFPage", "objc2-app-kit"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "resources/images/*.tar.gz": "images/",
+      "resources/images/image-digests.json": "images/image-digests.json",
+      "resources/llama/*": "llama/"
+    }
+  }
+}

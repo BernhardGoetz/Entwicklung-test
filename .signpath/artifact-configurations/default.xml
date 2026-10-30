@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath-Artefaktkonfiguration für Code-Prüfer (Windows).
+  In SignPath unter Project → Artifact Configurations einfügen (als Default
+  oder mit eigenem Slug, dann GitHub-Variable SIGNPATH_ARTIFACT_CONFIGURATION_SLUG).
+  SignPath liest diese Datei NICHT aus dem Repository; sie liegt hier nur zur
+  Versionierung und Prüfung.
+
+  Das Artefakt ist ein ZIP (GitHub-Artefakt) mit flachen Dateinamen
+  <art>-<sha256 der unsignierten Datei>-<name> (scripts/signpath-stage.mjs).
+  Je Signaturauftrag ist nur ein Teil davon enthalten (Runden), deshalb
+  min-matches="0".
+
+  Signiert werden nur selbst gebaute Dateien:
+    app-…-code-pruefer.exe       die App (cargo build in build-windows)
+    uninstaller-…-uninstall.exe  von makensis aus src-tauri/windows/installer.nsi erzeugt
+    installer-…-setup.exe        der NSIS-Installer
+  Fremdbinaries (llama.cpp-Laufzeit, NSIS-Plugins) signiert nur
+  with-upstream.xml – nur verwenden, wenn die SignPath Foundation das erlaubt.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file-set>
+      <include path="app-*-code-pruefer.exe" min-matches="0" max-matches="1" />
+      <include path="uninstaller-*-uninstall.exe" min-matches="0" max-matches="1" />
+      <include path="installer-*-setup.exe" min-matches="0" max-matches="1" />
+      <for-each>
+        <authenticode-sign />
+      </for-each>
+    </pe-file-set>
+  </zip-file>
+</artifact-configuration>

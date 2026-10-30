@@ -1,0 +1,413 @@
+{
+  "$description": "Code-Prüfer Design-Tokens (Quelle für src/styles.css; siehe docs/design/DESIGN.md)",
+  "font": {
+    "family": {
+      "sans": {
+        "$value": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable\", \"Segoe UI\", system-ui, sans-serif",
+        "$type": "fontFamily"
+      },
+      "mono": {
+        "$value": "\"Cascadia Code\", \"JetBrains Mono\", Consolas, ui-monospace, monospace",
+        "$type": "fontFamily"
+      }
+    },
+    "size": {
+      "xs": {
+        "$value": "12px",
+        "$type": "dimension"
+      },
+      "sm": {
+        "$value": "13px",
+        "$type": "dimension"
+      },
+      "md": {
+        "$value": "14px",
+        "$type": "dimension"
+      },
+      "lg": {
+        "$value": "16px",
+        "$type": "dimension"
+      },
+      "xl": {
+        "$value": "18px",
+        "$type": "dimension"
+      }
+    },
+    "weight": {
+      "regular": {
+        "$value": 400,
+        "$type": "fontWeight"
+      },
+      "medium": {
+        "$value": 500,
+        "$type": "fontWeight"
+      },
+      "semibold": {
+        "$value": 600,
+        "$type": "fontWeight"
+      }
+    },
+    "lineHeight": {
+      "tight": {
+        "$value": 1.3,
+        "$type": "number"
+      },
+      "normal": {
+        "$value": 1.5,
+        "$type": "number"
+      }
+    }
+  },
+  "space": {
+    "0-5": {
+      "$value": "2px",
+      "$type": "dimension"
+    },
+    "1": {
+      "$value": "4px",
+      "$type": "dimension"
+    },
+    "2": {
+      "$value": "8px",
+      "$type": "dimension"
+    },
+    "3": {
+      "$value": "12px",
+      "$type": "dimension"
+    },
+    "4": {
+      "$value": "16px",
+      "$type": "dimension"
+    },
+    "6": {
+      "$value": "24px",
+      "$type": "dimension"
+    },
+    "8": {
+      "$value": "32px",
+      "$type": "dimension"
+    },
+    "12": {
+      "$value": "48px",
+      "$type": "dimension"
+    }
+  },
+  "radius": {
+    "sm": {
+      "$value": "4px",
+      "$type": "dimension"
+    },
+    "md": {
+      "$value": "6px",
+      "$type": "dimension"
+    },
+    "lg": {
+      "$value": "8px",
+      "$type": "dimension"
+    },
+    "full": {
+      "$value": "999px",
+      "$type": "dimension"
+    }
+  },
+  "size": {
+    "control": {
+      "$value": "32px",
+      "$type": "dimension"
+    },
+    "controlSmall": {
+      "$value": "26px",
+      "$type": "dimension"
+    },
+    "dot": {
+      "$value": "8px",
+      "$type": "dimension"
+    },
+    "asideWidth": {
+      "$value": "360px",
+      "$type": "dimension"
+    },
+    "editorMinHeight": {
+      "$value": "200px",
+      "$type": "dimension"
+    }
+  },
+  "duration": {
+    "fast": {
+      "$value": "120ms",
+      "$type": "duration"
+    }
+  },
+  "color": {
+    "light": {
+      "bg": {
+        "$value": "#ffffff",
+        "$type": "color"
+      },
+      "surface": {
+        "$value": "#f6f8fa",
+        "$type": "color"
+      },
+      "surface-hover": {
+        "$value": "#eef1f4",
+        "$type": "color"
+      },
+      "surface-active": {
+        "$value": "#e6eaef",
+        "$type": "color"
+      },
+      "overlay": {
+        "$value": "#ffffff",
+        "$type": "color"
+      },
+      "border": {
+        "$value": "#d1d9e0",
+        "$type": "color"
+      },
+      "border-muted": {
+        "$value": "#e6eaef",
+        "$type": "color"
+      },
+      "border-control": {
+        "$value": "#818b98",
+        "$type": "color"
+      },
+      "text": {
+        "$value": "#1f2328",
+        "$type": "color"
+      },
+      "text-muted": {
+        "$value": "#59636e",
+        "$type": "color"
+      },
+      "text-on-accent": {
+        "$value": "#ffffff",
+        "$type": "color"
+      },
+      "accent": {
+        "$value": "#0969da",
+        "$type": "color"
+      },
+      "accent-hover": {
+        "$value": "#0757b8",
+        "$type": "color"
+      },
+      "accent-subtle": {
+        "$value": "#ddf4ff",
+        "$type": "color"
+      },
+      "accent-emphasis": {
+        "$value": "#0969da",
+        "$type": "color"
+      },
+      "accent-emphasis-hover": {
+        "$value": "#0757b8",
+        "$type": "color"
+      },
+      "preview-paper": {
+        "$value": "#ffffff",
+        "$type": "color"
+      },
+      "focus-ring": {
+        "$value": "#0969da",
+        "$type": "color"
+      },
+      "success": {
+        "$value": "#1a7f37",
+        "$type": "color"
+      },
+      "danger": {
+        "$value": "#d1242f",
+        "$type": "color"
+      },
+      "warning": {
+        "$value": "#9a6700",
+        "$type": "color"
+      },
+      "danger-subtle": {
+        "$value": "#ffebe9",
+        "$type": "color"
+      },
+      "success-subtle": {
+        "$value": "#dafbe1",
+        "$type": "color"
+      },
+      "diff-del-bg": {
+        "$value": "#ffebe9",
+        "$type": "color"
+      },
+      "diff-add-bg": {
+        "$value": "#dafbe1",
+        "$type": "color"
+      },
+      "diff-del-mark": {
+        "$value": "#ffcecb",
+        "$type": "color"
+      },
+      "diff-add-mark": {
+        "$value": "#aceebb",
+        "$type": "color"
+      },
+      "neutral-dot": {
+        "$value": "#818b98",
+        "$type": "color"
+      },
+      "backdrop": {
+        "$value": "rgba(31, 35, 40, 0.4)",
+        "$type": "color"
+      }
+    },
+    "dark": {
+      "bg": {
+        "$value": "#0d1117",
+        "$type": "color"
+      },
+      "surface": {
+        "$value": "#151b23",
+        "$type": "color"
+      },
+      "surface-hover": {
+        "$value": "#1c232c",
+        "$type": "color"
+      },
+      "surface-active": {
+        "$value": "#232a33",
+        "$type": "color"
+      },
+      "overlay": {
+        "$value": "#151b23",
+        "$type": "color"
+      },
+      "border": {
+        "$value": "#30363d",
+        "$type": "color"
+      },
+      "border-muted": {
+        "$value": "#21262d",
+        "$type": "color"
+      },
+      "border-control": {
+        "$value": "#656c76",
+        "$type": "color"
+      },
+      "text": {
+        "$value": "#e6edf3",
+        "$type": "color"
+      },
+      "text-muted": {
+        "$value": "#9198a1",
+        "$type": "color"
+      },
+      "text-on-accent": {
+        "$value": "#ffffff",
+        "$type": "color"
+      },
+      "accent": {
+        "$value": "#4493f8",
+        "$type": "color"
+      },
+      "accent-hover": {
+        "$value": "#388bfd",
+        "$type": "color"
+      },
+      "accent-subtle": {
+        "$value": "#10243e",
+        "$type": "color"
+      },
+      "accent-emphasis": {
+        "$value": "#1f6feb",
+        "$type": "color"
+      },
+      "accent-emphasis-hover": {
+        "$value": "#1a5fd0",
+        "$type": "color"
+      },
+      "preview-paper": {
+        "$value": "#ffffff",
+        "$type": "color"
+      },
+      "focus-ring": {
+        "$value": "#4493f8",
+        "$type": "color"
+      },
+      "success": {
+        "$value": "#3fb950",
+        "$type": "color"
+      },
+      "danger": {
+        "$value": "#f85149",
+        "$type": "color"
+      },
+      "warning": {
+        "$value": "#d29922",
+        "$type": "color"
+      },
+      "danger-subtle": {
+        "$value": "#3c1e22",
+        "$type": "color"
+      },
+      "success-subtle": {
+        "$value": "#12301c",
+        "$type": "color"
+      },
+      "diff-del-bg": {
+        "$value": "#3c1e22",
+        "$type": "color"
+      },
+      "diff-add-bg": {
+        "$value": "#12301c",
+        "$type": "color"
+      },
+      "diff-del-mark": {
+        "$value": "#6e2a2d",
+        "$type": "color"
+      },
+      "diff-add-mark": {
+        "$value": "#1f5530",
+        "$type": "color"
+      },
+      "neutral-dot": {
+        "$value": "#656c76",
+        "$type": "color"
+      },
+      "backdrop": {
+        "$value": "rgba(1, 4, 9, 0.6)",
+        "$type": "color"
+      }
+    }
+  },
+  "shadow": {
+    "overlay": {
+      "light": {
+        "$value": "0 8px 24px rgba(31, 35, 40, 0.12)",
+        "$type": "shadow"
+      },
+      "dark": {
+        "$value": "0 8px 24px rgba(1, 4, 9, 0.5)",
+        "$type": "shadow"
+      }
+    }
+  },
+  "breakpoint": {
+    "narrow": {
+      "$value": "899px",
+      "$type": "dimension"
+    },
+    "medium": {
+      "$value": "1099px",
+      "$type": "dimension"
+    },
+    "wideTests": {
+      "$value": "1200px",
+      "$type": "dimension"
+    },
+    "wide": {
+      "$value": "1500px",
+      "$type": "dimension"
+    },
+    "extraWide": {
+      "$value": "1600px",
+      "$type": "dimension"
+    }
+  }
+}

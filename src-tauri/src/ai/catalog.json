@@ -1,0 +1,25 @@
+{
+  "_comment": "Fester Modellkatalog. revision, size und sha256 werden mit scripts/pin-models.sh aus der Hugging-Face-API eingetragen (nie von Hand): über den Workflow pin-models.yml als Pull Request, den Bernhard prüft und mergt. Der Release-Workflow pinnt nicht selbst, er vergleicht die eingecheckten Pins mit der Hugging-Face-API (pin-models.sh --verify) und bricht bei Abweichung oder fehlenden Pins ab. Solange ein Eintrag nicht gepinnt ist, verweigert die App den Download (Import einer .gguf-Datei bleibt möglich). Qwen2.5-Coder-3B fehlt absichtlich: seine Lizenz (Qwen Research License) erlaubt keine kommerzielle Nutzung; 1.5B und 7B stehen unter Apache-2.0.",
+  "models": [
+    {
+      "id": "qwen2.5-coder-1.5b",
+      "name": "Qwen2.5-Coder 1.5B Instruct (Q5_K_M)",
+      "repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+      "quant": "q5_k_m",
+      "license": "Apache-2.0",
+      "solutions": 5,
+      "revision": "",
+      "files": []
+    },
+    {
+      "id": "qwen2.5-coder-7b",
+      "name": "Qwen2.5-Coder 7B Instruct (Q4_K_M)",
+      "repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+      "quant": "q4_k_m",
+      "license": "Apache-2.0",
+      "solutions": 3,
+      "revision": "",
+      "files": []
+    }
+  ]
+}

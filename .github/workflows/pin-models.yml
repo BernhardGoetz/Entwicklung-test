@@ -1,0 +1,73 @@
+name: KI-Modellkatalog pinnen
+
+# Pinnt src-tauri/src/ai/catalog.json (Revision, Dateien, Größe, SHA-256 aus
+# der Hugging-Face-API, scripts/pin-models.sh) und legt dafür einen Pull
+# Request an. Bernhard prüft die Werte auf huggingface.co und mergt; erst
+# danach verwenden Releases diese Pins (release.yml vergleicht sie nur noch
+# mit der API und pinnt nie selbst). Manuell starten: Actions →
+# „KI-Modellkatalog pinnen“ → „Run workflow“ auf dem Branch, in den der PR
+# gehen soll. Siehe docs/RELEASE_QAS.md.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pin-models
+  cancel-in-progress: false
+
+jobs:
+  pin:
+    name: Katalog pinnen und Pull Request anlegen
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Branch und Commit über die API anlegen
+      pull-requests: write # Pull Request anlegen
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Pinnen und prüfen
+        run: |
+          set -euo pipefail
+          scripts/pin-models.sh
+          scripts/pin-models.sh --check
+          scripts/pin-models.sh --verify
+
+      # Commit über die Contents-API (kein Token im Git-Konfig des
+      # Checkouts); der PR geht in den Branch, auf dem der Lauf gestartet
+      # wurde.
+      - name: Pull Request anlegen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BASE: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          file=src-tauri/src/ai/catalog.json
+          if git diff --quiet -- "$file"; then
+            echo "catalog.json ist bereits auf dem aktuellen Stand gepinnt." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          branch="pin-models/run-${GITHUB_RUN_ID}"
+          gh api "repos/$GH_REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$GITHUB_SHA" > /dev/null
+          blob="$(gh api "repos/$GH_REPO/contents/$file?ref=$GITHUB_SHA" -q .sha)"
+          gh api -X PUT "repos/$GH_REPO/contents/$file" \
+            -f message="KI-Modellkatalog pinnen (Hugging Face, Lauf ${GITHUB_RUN_ID})" \
+            -f content="$(base64 -w0 "$file")" \
+            -f branch="$branch" -f sha="$blob" > /dev/null
+          table="$(jq -r '.models[] as $m | $m.files[]
+            | "| \($m.id) | [\($m.repo)@\($m.revision[0:12])](https://huggingface.co/\($m.repo)/tree/\($m.revision)) | \(.name) | \(.size) | `\(.sha256)` |"' "$file")"
+          body="$(printf '%s\n' \
+            "Pins aus der Hugging-Face-API (scripts/pin-models.sh, Lauf ${GITHUB_RUN_ID})." \
+            "" \
+            "| Modell | Revision | Datei | Größe (Bytes) | SHA-256 |" \
+            "|---|---|---|---|---|" \
+            "$table" \
+            "" \
+            'Vor dem Mergen prüfen: Revision im Repository des Herausgebers (Commit-Historie), Dateiname, Größe und SHA-256 (auf huggingface.co bei der Datei unter „Files and versions“). Releases verwenden danach genau diese Pins und brechen ab, wenn Hugging Face für die Revision etwas anderes meldet.')"
+          url="$(gh pr create --base "$BASE" --head "$branch" \
+            --title "KI-Modellkatalog pinnen" --body "$body")"
+          echo "Pull Request: $url" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,1645 @@
+name: Release (QAS und Abnahme)
+
+# Release-Ablauf mit QAS-Stufe und manueller Abnahme (docs/RELEASE_QAS.md):
+#
+#   push auf Branch "qas" (oder "Run workflow" auf qas)
+#     -> version, images, build-windows, bundle-windows, bundle-macos
+#        (wie ein Release; Windows mit SignPath-Test-Signing aus dem
+#        Environment "qas", falls eingerichtet)
+#     -> qas-release: GitHub-Pre-Release v<version>-qas.<lauf> zum Testen
+#     -> abnahme: wartet auf "Approve and deploy" (Environment "production")
+#     -> promote-images: Images per Digest auf :<version> umtaggen
+#        promote-windows: dieselben unsignierten Programmdateien mit
+#        Release-Signing (Environment "release") neu bündeln
+#     -> updater-sign: Updater-Signaturen (Environment "release") über den
+#        finalen Windows-Installer und die macOS-Archive (.app.tar.gz)
+#     -> release: Tag v<version> auf dem QAS-Commit, Entwurfs-Release mit
+#        latest.json (App-Updater), SHA256SUMS.txt und
+#        Build-Provenance-Attestierung
+#     -> pull-request: PR qas -> main
+#
+# Gebaut wird nur einmal (QAS); die Abnahme befördert genau diesen Build.
+# Im Einzelnen:
+#  1. die Runner-Images multi-arch (amd64/arm64), gepusht nach
+#     ghcr.io/<owner>/code-pruefer-<sprache>:<version>-qas.<lauf> und
+#     :sha-<commit>; :<version> entsteht erst nach der Abnahme (gleicher
+#     Digest),
+#  2. je Architektur gzip-Archive der Images (Offline, im Installer enthalten),
+#     per Digest aus der Registry geholt, dazu image-digests.json mit den
+#     Prüfsummen, gegen die die App Archive und Downloads prüft,
+#  3. den Windows-Installer (NSIS, x64) und macOS-DMGs (Apple Silicon + Intel)
+#     mit eingebetteten Images und llama-server (KI-Laufzeit, Version und
+#     SHA-256 gepinnt in scripts/fetch-llama-server.sh;
+#     src-tauri/tauri.release.conf.json). KI-Modelle sind nicht enthalten.
+#     Windows wird über SignPath signiert, sobald SignPath im jeweiligen
+#     Environment eingerichtet ist (docs/RELEASE_SIGNING.md), sonst
+#     unsigniert.
+# App-Updater (docs/UPDATER.md): Die Builds bekommen den öffentlichen
+# Schlüssel aus der Repository-Variable TAURI_UPDATER_PUBKEY
+# (src-tauri/tauri.updater.conf.json, scripts/updater.mjs config); ohne sie
+# läuft die App ohne Updater. Signiert wird erst nach der Abnahme über die
+# fertigen (bei Windows: Authenticode-signierten) Dateien, mit den Secrets
+# TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) aus dem Environment "release".
+# QAS-Pre-Releases bekommen nie eine latest.json; die App fragt nur
+# releases/latest ab (keine Entwürfe, keine Pre-Releases).
+# Der KI-Modellkatalog (Revision, Datei, Größe, SHA-256) ist im Repository
+# gepinnt: Pins entstehen nur über den Workflow pin-models.yml als Pull
+# Request, den Bernhard prüft und mergt. Der Job "version" pinnt nicht
+# selbst (kein Vertrauen beim ersten Abruf), sondern vergleicht die
+# eingecheckten Pins mit der Hugging-Face-API und bricht bei jeder
+# Abweichung ab (scripts/pin-models.sh --verify); dann gibt er den Katalog
+# als Artefakt an die Bundle-Jobs weiter. Die Werte stehen in der
+# Job-Zusammenfassung und in den Release-Notizen.
+# Die App erwartet <IMAGE_REGISTRY>/code-pruefer-<sprache>:<Cargo-Version>;
+# der Job "version" bricht ab, wenn Cargo.toml, tauri.conf.json,
+# package.json oder der Registry-Namensraum nicht zusammenpassen oder die
+# Version schon als Tag/Release existiert.
+#
+# Artefakte, die nach der Abnahme noch gebraucht werden, bleiben 30 Tage
+# erhalten (so lange wartet auch eine offene Abnahme höchstens).
+#
+# Integrität zwischen den Jobs: Jeder Job, der ein Release-Artefakt erzeugt,
+# gibt dessen Manifest (SHA-256 je Datei, scripts/artifact-manifest.sh) als
+# Job-Output weiter; jeder Job, der es verwendet, prüft es vor dem Bündeln,
+# Signieren oder Veröffentlichen und bricht bei Abweichung ab. Ein Schritt
+# eines späteren Jobs könnte Artefakte desselben Laufs sonst unbemerkt
+# ersetzen. Matrix-Jobs schreiben je Eintrag einen eigenen Output-Namen; ein
+# fehlender Wert lässt die Prüfung scheitern.
+
+on:
+  push:
+    branches: [qas]
+  workflow_dispatch:
+
+# Keine Rechte auf Workflow-Ebene; jeder Job bekommt nur, was er braucht.
+permissions: {}
+
+# Ein Lauf je Branch; ein neuer Push wartet, bis der laufende (auch eine
+# offene Abnahme) abgeschlossen oder abgelehnt ist.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      registry: ${{ steps.v.outputs.registry }}
+      qas_tag: ${{ steps.v.outputs.qas_tag }}
+      catalog: ${{ steps.manifest.outputs.catalog }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Version und Image-Referenzen prüfen
+        id: v
+        run: |
+          set -euo pipefail
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -n 1)"
+          tauri_version="$(jq -r .version src-tauri/tauri.conf.json)"
+          npm_version="$(jq -r .version package.json)"
+          if [ "$GITHUB_REF" != "refs/heads/qas" ]; then
+            echo "::error::Releases laufen nur über den Branch qas (gestartet auf $GITHUB_REF)."
+            exit 1
+          fi
+          for v in "$tauri_version" "$npm_version"; do
+            if [ "$v" != "$cargo_version" ]; then
+              echo "::error::Versionen passen nicht: Cargo.toml=$cargo_version tauri.conf.json=$tauri_version package.json=$npm_version"
+              exit 1
+            fi
+          done
+          # GHCR-Namen müssen klein geschrieben sein.
+          owner="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          registry="ghcr.io/$owner"
+          app_registry="$(sed -n 's/^pub const IMAGE_REGISTRY: &str = "\(.*\)";$/\1/p' src-tauri/src/runner/languages.rs)"
+          if [ "$registry" != "$app_registry" ]; then
+            echo "::error::Die App erwartet Images unter $app_registry, der Workflow würde nach $registry pushen (IMAGE_REGISTRY in languages.rs anpassen)."
+            exit 1
+          fi
+          qas_tag="v${cargo_version}-qas.${GITHUB_RUN_NUMBER}"
+          {
+            echo "version=$cargo_version"
+            echo "registry=$registry"
+            echo "qas_tag=$qas_tag"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "QAS-Lauf für Version $cargo_version: Pre-Release \`$qas_tag\`"
+            echo
+            echo "Images (QAS): \`$registry/code-pruefer-<sprache>:${qas_tag#v}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Eine Version wird genau einmal freigegeben: existiert v<version> schon
+      # als Tag oder Release, muss zuerst die Version erhöht werden.
+      - name: Version noch nicht veröffentlicht?
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: scripts/check-version-unreleased.sh "v$VERSION"
+
+      # Die Pins kommen aus dem Repository (PR aus pin-models.yml). Hier nur
+      # Vollständigkeit prüfen und mit der Hugging-Face-API vergleichen:
+      # andere Dateien, Größen oder SHA-256 für die gepinnte Revision, oder
+      # eine gelöschte Revision → Abbruch. Die Bundle-Jobs bauen genau diese
+      # Datei in die App ein.
+      - name: KI-Modellkatalog prüfen (eingecheckte Pins gegen Hugging Face)
+        run: |
+          set -euo pipefail
+          if ! scripts/pin-models.sh --check; then
+            echo '::error::catalog.json ist nicht (vollständig) gepinnt. Workflow „KI-Modellkatalog pinnen“ (pin-models.yml) starten, den Pull Request prüfen und mergen (docs/RELEASE_QAS.md).'
+            exit 1
+          fi
+          scripts/pin-models.sh --verify
+          {
+            echo "### KI-Modelle (in die App eingebaut, Download per Knopf)"
+            echo
+            echo "| Modell | Repository | Revision | Datei | Größe (Bytes) | SHA-256 |"
+            echo "|---|---|---|---|---|---|"
+            jq -r '.models[] as $m | $m.files[]
+              | "| \($m.id) | \($m.repo) | `\($m.revision)` | \(.name) | \(.size) | `\(.sha256)` |"' \
+              src-tauri/src/ai/catalog.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Manifest des Katalogs
+        id: manifest
+        run: scripts/artifact-manifest.sh write catalog src-tauri/src/ai/catalog.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: model-catalog
+          path: src-tauri/src/ai/catalog.json
+          retention-days: 30
+          if-no-files-found: error
+
+  images:
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Checkout
+      packages: write # Push der Images nach GHCR
+    # Je Sprache eigene Output-Namen (Matrix): Manifeste der Archive und
+    # der image-digests.json, Registry-Digest des Images.
+    outputs:
+      digests_python: ${{ steps.manifest.outputs.digests_python }}
+      digests_java: ${{ steps.manifest.outputs.digests_java }}
+      amd64_python: ${{ steps.manifest.outputs.amd64_python }}
+      amd64_java: ${{ steps.manifest.outputs.amd64_java }}
+      arm64_python: ${{ steps.manifest.outputs.arm64_python }}
+      arm64_java: ${{ steps.manifest.outputs.arm64_java }}
+      image_python: ${{ steps.manifest.outputs.image_python }}
+      image_java: ${{ steps.manifest.outputs.image_java }}
+    strategy:
+      fail-fast: true
+      matrix:
+        language: [python, java]
+    env:
+      REPO: ${{ needs.version.outputs.registry }}/code-pruefer-${{ matrix.language }}
+      VERSION: ${{ needs.version.outputs.version }}
+      QAS_IMAGE_TAG: ${{ needs.version.outputs.version }}-qas.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Login GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build und Push (linux/amd64, linux/arm64)
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: images/${{ matrix.language }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Nur QAS-Tags; :<version> setzt promote-images nach der Abnahme
+          # (gleicher Digest, kein Neubau).
+          tags: |
+            ${{ env.REPO }}:sha-${{ github.sha }}
+            ${{ env.REPO }}:${{ env.QAS_IMAGE_TAG }}
+          # Bewusst ohne Build-Cache (Schutz vor Cache-Poisoning).
+          no-cache: true
+
+      # Die Archive werden aus den gerade gepushten Images (per Digest)
+      # erzeugt, damit Offline- und Online-Variante identische Digests haben.
+      - name: Image-Archive exportieren (amd64, arm64)
+        env:
+          MODE: pull
+          LANGUAGES: ${{ matrix.language }}
+          IMAGE_REGISTRY: ${{ needs.version.outputs.registry }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          scripts/export-image-archives.sh amd64 image-archives
+          scripts/export-image-archives.sh arm64 image-archives
+          echo "$REPO@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Manifeste der Artefakte
+        id: manifest
+        env:
+          LANGUAGE: ${{ matrix.language }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh write "digests_$LANGUAGE" image-archives/image-digests.json
+          for arch in amd64 arm64; do
+            scripts/artifact-manifest.sh write "${arch}_$LANGUAGE" "image-archives/code-pruefer-$LANGUAGE-$arch.tar.gz"
+          done
+          if ! [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Kein gültiger Image-Digest ($IMAGE_DIGEST)."
+            exit 1
+          fi
+          echo "image_$LANGUAGE=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-${{ matrix.language }}
+          path: image-archives/image-digests.json
+          retention-days: 30
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image-${{ matrix.language }}-amd64
+          path: image-archives/code-pruefer-${{ matrix.language }}-amd64.tar.gz
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image-${{ matrix.language }}-arm64
+          path: image-archives/code-pruefer-${{ matrix.language }}-arm64.tar.gz
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+  # Release-Jobs bauen ohne npm- und Rust-Cache (Schutz vor Cache-Poisoning);
+  # nur ci.yml nutzt Caches.
+  #
+  # Windows in zwei Jobs, damit die Signatur (SignPath, asynchron über
+  # GitHub-Artefakte, docs/RELEASE_SIGNING.md) die App nicht neu baut:
+  #  - build-windows kompiliert code-pruefer.exe (ohne Bündeln, ohne
+  #    Secrets) und legt sie mit der KI-Laufzeit als Artefakt
+  #    "windows-unsigned" ab (mit SHA256SUMS.txt),
+  #  - bundle-windows (QAS, Environment "qas") und promote-windows (nach der
+  #    Abnahme, Environment "release") bündeln daraus mit `tauri bundle` den
+  #    NSIS-Installer und signieren dabei über SignPath (oder gar nicht,
+  #    solange SignPath im jeweiligen Environment nicht eingerichtet ist).
+  #    Beide Jobs haben dieselben Schritte (YAML-Anker
+  #    &windows-bundle-steps); was sie unterscheidet, steht in ihrem env.
+  build-windows:
+    needs: version
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      # SHA-256 von SHA256SUMS.txt: bindet QAS- und Release-Bündelung an
+      # genau diese unsignierten Programmdateien.
+      sums_sha256: ${{ steps.collect.outputs.sums_sha256 }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Gepinnter KI-Modellkatalog
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: model-catalog
+          path: artifacts/catalog
+
+      - name: KI-Modellkatalog prüfen
+        shell: bash
+        env:
+          CATALOG_MANIFEST: ${{ needs.version.outputs.catalog }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify artifacts/catalog "$CATALOG_MANIFEST"
+          cp artifacts/catalog/catalog.json src-tauri/src/ai/catalog.json
+          scripts/pin-models.sh --check
+
+      - run: npm ci
+
+      # Öffentlicher Updater-Schlüssel (Repository-Variable, kein Secret) als
+      # Konfigurations-Overlay; ohne Variable: leeres Overlay, App ohne
+      # Updater (Warnung).
+      - name: Updater-Konfiguration
+        shell: bash
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: node scripts/updater.mjs config src-tauri/tauri.updater.conf.json
+
+      # --no-bundle: nur Frontend + cargo build --release (wie `tauri build`),
+      # gebündelt wird in bundle-windows.
+      - name: App bauen (unsigniert, ohne Installer)
+        run: npm run tauri -- build --no-bundle --config src-tauri/tauri.updater.conf.json
+
+      - name: llama-server (KI-Laufzeit, Windows x64) holen und prüfen
+        shell: bash
+        run: scripts/fetch-llama-server.sh win-x64
+
+      # llama-server braucht die Visual-C++-Laufzeit (MSVCP140.dll,
+      # VCRUNTIME140.dll, VCRUNTIME140_1.dll), die nicht auf jedem Windows
+      # installiert ist. Sie wird app-lokal neben llama-server.exe gelegt
+      # (Redist-Ordner der Visual-Studio-Installation des Runners). Die DLLs
+      # sind von Microsoft signiert und werden nicht neu signiert.
+      - name: Visual-C++-Laufzeit für llama-server
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem -Path "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "Visual-C++-Redist-Ordner nicht gefunden" }
+          foreach ($dll in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
+            Copy-Item (Join-Path $crt.FullName $dll) src-tauri/resources/llama/
+          }
+          Get-ChildItem src-tauri/resources/llama
+
+      - name: Unsignierte Programmdateien sammeln
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p windows-unsigned/llama
+          cp src-tauri/target/release/code-pruefer.exe windows-unsigned/
+          cp src-tauri/resources/llama/* windows-unsigned/llama/
+          (cd windows-unsigned && sha256sum code-pruefer.exe llama/* > SHA256SUMS.txt)
+          echo "sums_sha256=$(sha256sum windows-unsigned/SHA256SUMS.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Windows: unsignierte Programmdateien (SHA-256)"
+            echo
+            echo '```'
+            cat windows-unsigned/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-unsigned
+          path: windows-unsigned/
+          retention-days: 30
+          if-no-files-found: error
+
+  bundle-windows:
+    needs: [images, build-windows]
+    runs-on: windows-latest
+    permissions:
+      contents: read # Checkout
+      # SignPath (Pipeline-Connector) liest mit dem GITHUB_TOKEN dieses Jobs
+      # die Job-Daten und lädt das zu signierende Artefakt herunter
+      # (Eingabe github-token der Action, Standard: github.token).
+      actions: read # Artefakt-Download durch SignPath
+    # SignPath-Secret und -Variablen (Test-Signing) liegen im Environment
+    # "qas".
+    environment: qas
+    outputs:
+      signed: ${{ steps.mode.outputs.enabled }}
+      installer: ${{ steps.manifest.outputs.installer }}
+      signing_manifest: ${{ steps.manifest.outputs.signing_manifest }}
+    env:
+      BUNDLE_STAGE: qas
+      BUNDLE_ARTIFACT: qas-bundle-windows-x64
+      SIGNING_ENVIRONMENT: qas
+      UNSIGNED_SUMS_SHA256: ${{ needs.build-windows.outputs.sums_sha256 }}
+      AMD64_PYTHON: ${{ needs.images.outputs.amd64_python }}
+      AMD64_JAVA: ${{ needs.images.outputs.amd64_java }}
+      DIGESTS_PYTHON: ${{ needs.images.outputs.digests_python }}
+      DIGESTS_JAVA: ${{ needs.images.outputs.digests_java }}
+      QAS_SIGNED: ""
+      QAS_INSTALLER: ""
+      QAS_SIGNING_MANIFEST: ""
+      # Secrets sind in `if:` nicht direkt verfügbar.
+      HAS_SIGNPATH_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+      SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+      # Fremdbinaries (llama.cpp-Laufzeit, NSIS-Plugins) nur signieren, wenn
+      # die SignPath Foundation das ausdrücklich erlaubt hat.
+      SIGNPATH_SIGN_UPSTREAM: ${{ vars.SIGNPATH_SIGN_UPSTREAM == 'true' }}
+      SIGNPATH_SIGNED_DIR: ${{ github.workspace }}/signpath/signed
+    steps: &windows-bundle-steps
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      # `tauri bundle` liest die Projektdaten über `cargo metadata`.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: npm ci
+
+      - name: Unsignierte Programmdateien aus build-windows
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-unsigned
+          path: windows-unsigned
+
+      - name: Programmdateien prüfen und einsetzen
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Dieselben Dateien wie in build-windows (und damit wie in QAS).
+          actual="$(sha256sum windows-unsigned/SHA256SUMS.txt | cut -d' ' -f1)"
+          if [ "$actual" != "$UNSIGNED_SUMS_SHA256" ]; then
+            echo "::error::SHA256SUMS.txt passt nicht zu build-windows ($actual != $UNSIGNED_SUMS_SHA256)."
+            exit 1
+          fi
+          (cd windows-unsigned && sha256sum -c SHA256SUMS.txt)
+          mkdir -p src-tauri/target/release src-tauri/resources/llama
+          cp windows-unsigned/code-pruefer.exe src-tauri/target/release/
+          cp windows-unsigned/llama/* src-tauri/resources/llama/
+
+      - name: Image-Archive (amd64)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: image-*-amd64
+          merge-multiple: true
+          path: artifacts/images
+
+      - name: Prüfsummen der Images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digests-*
+          path: digests
+
+      - name: Image-Artefakte prüfen und einsetzen
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify artifacts/images "$AMD64_PYTHON" "$AMD64_JAVA"
+          scripts/artifact-manifest.sh verify digests "$DIGESTS_PYTHON" "$DIGESTS_JAVA"
+          cp artifacts/images/*.tar.gz src-tauri/resources/images/
+          jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
+
+      # Signatur nur, wenn Secret SIGNPATH_API_TOKEN und die Variablen
+      # SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG und
+      # SIGNPATH_SIGNING_POLICY_SLUG im Environment des Jobs gesetzt sind
+      # ("qas": Test-Signing, "release": Release-Signing).
+      # Ohne alle vier: unsignierter Installer mit Warnung; nur ein Teil
+      # gesetzt: Abbruch (Tippfehler sollen nicht still unsigniert enden).
+      # Nach der Abnahme ohne SignPath und mit unsigniertem QAS-Installer
+      # wird der QAS-Installer unverändert übernommen (reuse).
+      - name: Signatur-Modus bestimmen
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          set_count=0
+          for v in "$HAS_SIGNPATH_TOKEN" "${SIGNPATH_ORGANIZATION_ID:+true}" \
+            "${SIGNPATH_PROJECT_SLUG:+true}" "${SIGNPATH_SIGNING_POLICY_SLUG:+true}"; do
+            if [ "$v" = "true" ]; then set_count=$((set_count + 1)); fi
+          done
+          if [ "$set_count" -eq 0 ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            if [ "$BUNDLE_STAGE" = "production" ] && [ "$QAS_SIGNED" != "true" ]; then
+              echo "reuse=true" >> "$GITHUB_OUTPUT"
+            fi
+            echo "::warning::SignPath ist im Environment $SIGNING_ENVIRONMENT nicht eingerichtet – der Windows-Installer ist UNSIGNIERT (docs/RELEASE_SIGNING.md)."
+            {
+              echo "### ⚠️ Windows-Installer unsigniert"
+              echo
+              echo "SignPath ist im Environment \`$SIGNING_ENVIRONMENT\` nicht eingerichtet (Secret \`SIGNPATH_API_TOKEN\`,"
+              echo "Variablen \`SIGNPATH_ORGANIZATION_ID\`, \`SIGNPATH_PROJECT_SLUG\`, \`SIGNPATH_SIGNING_POLICY_SLUG\`)."
+              echo "SmartScreen warnt, Smart App Control blockiert den Installer. Anleitung: docs/RELEASE_SIGNING.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$set_count" -ne 4 ]; then
+            echo "::error::SignPath ist nur teilweise eingerichtet (Secret SIGNPATH_API_TOKEN und Variablen SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG im Environment $SIGNING_ENVIRONMENT prüfen)."
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          # signCommand mit absolutem Skriptpfad (Tauri ruft ihn auch aus
+          # makensis heraus auf, mit anderem Arbeitsverzeichnis).
+          node -e '
+            const path = require("node:path");
+            const script = path.join(process.env.GITHUB_WORKSPACE, "scripts", "signpath-stage.mjs");
+            const conf = { bundle: { windows: { signCommand: { cmd: "node", args: [script, "%1"] } } } };
+            require("node:fs").writeFileSync("src-tauri/tauri.sign.conf.json", JSON.stringify(conf, null, 2));
+          '
+          cat src-tauri/tauri.sign.conf.json
+          {
+            echo "### Windows-Signatur: SignPath"
+            echo
+            echo "Signing Policy: \`$SIGNPATH_SIGNING_POLICY_SLUG\`, Fremdbinaries signieren: \`$SIGNPATH_SIGN_UPSTREAM\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --no-binary-patching: Tauri würde sonst code-pruefer.exe bei jedem
+      # Bündeln verändern (Bundle-Typ "nsis" für den Updater) und damit eine
+      # vorhandene Signatur zerstören; so bleibt die Exe bitgleich mit
+      # "windows-unsigned". Der Updater braucht die Markierung nicht: er
+      # nimmt dann den Eintrag "windows-x86_64" aus latest.json und erkennt
+      # den NSIS-Installer am Dateiinhalt (tauri-plugin-updater 2.14.0).
+      # createUpdaterArtifacts bleibt aus: die Updater-Signatur muss über den
+      # fertig signierten Installer gehen (Job updater-sign).
+      - name: Installer bauen (unsigniert)
+        if: steps.mode.outputs.enabled != 'true' && steps.mode.outputs.reuse != 'true'
+        shell: bash
+        run: npm run tauri -- bundle --bundles nsis --no-binary-patching --config src-tauri/tauri.release.conf.json
+
+      # Nach der Abnahme: der getestete QAS-Installer, zum Vergleich bzw. zur
+      # unveränderten Übernahme.
+      - name: QAS-Installer holen
+        if: env.BUNDLE_STAGE == 'production'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qas-bundle-windows-x64
+          path: qas-bundle
+
+      # Genau der Installer, den bundle-windows hochgeladen hat (und der im
+      # QAS-Pre-Release getestet wurde).
+      - name: QAS-Installer prüfen
+        if: env.BUNDLE_STAGE == 'production'
+        shell: bash
+        run: scripts/artifact-manifest.sh verify qas-bundle "$QAS_INSTALLER"
+
+      - name: QAS-Installer unverändert übernehmen
+        if: steps.mode.outputs.reuse == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/target/release/bundle/nsis
+          cp qas-bundle/*-setup.exe src-tauri/target/release/bundle/nsis/
+          echo "QAS-Installer unverändert übernommen (weder QAS noch Release signiert)." >> "$GITHUB_STEP_SUMMARY"
+
+      # Signieren in Runden (scripts/signpath-stage.mjs): Jede Runde bündelt
+      # neu; Tauri ruft dabei für jede zu signierende Datei das Skript auf,
+      # das bereits signierte Fassungen einsetzt und den Rest sammelt. Das
+      # Gesammelte geht als Artefakt an SignPath. Ohne Fremdbinaries:
+      #   Runde 1: code-pruefer.exe + Uninstaller, Runde 2: Installer.
+      # Mit Fremdbinaries (SIGNPATH_SIGN_UPSTREAM=true):
+      #   Runde 1: code-pruefer.exe, llama-Laufzeit, NSIS-Plugins,
+      #   Runde 2: Uninstaller (enthält die Plugins), Runde 3: Installer.
+      # Jeder Signaturauftrag wartet bis zu einer Stunde (bei Release-
+      # Signing muss er in SignPath manuell freigegeben werden).
+      - name: "Runde 1: bündeln und sammeln"
+        id: r1
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        env:
+          SIGNPATH_STAGE_DIR: ${{ github.workspace }}/signpath/stage-1
+        run: |
+          set -euo pipefail
+          npm run tauri -- bundle --bundles nsis --no-binary-patching \
+            --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.sign.conf.json
+          scripts/signpath-round.sh "$SIGNPATH_STAGE_DIR"
+
+      - name: "Runde 1: Artefakt für SignPath"
+        id: u1
+        if: steps.r1.outputs.pending == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signpath-${{ env.BUNDLE_STAGE }}-unsigned-1
+          path: signpath/stage-1/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: "Runde 1: bei SignPath signieren"
+        if: steps.r1.outputs.pending == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.u1.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signpath/signed-1
+
+      - name: "Runde 1: Signaturen übernehmen"
+        if: steps.r1.outputs.pending == 'true'
+        shell: bash
+        run: node scripts/signpath-stage.mjs --import signpath/signed-1 signpath/stage-1
+
+      - name: "Runde 2: bündeln und sammeln"
+        id: r2
+        if: steps.r1.outputs.pending == 'true' && steps.r1.outputs.installer != 'true'
+        shell: bash
+        env:
+          SIGNPATH_STAGE_DIR: ${{ github.workspace }}/signpath/stage-2
+        run: |
+          set -euo pipefail
+          npm run tauri -- bundle --bundles nsis --no-binary-patching \
+            --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.sign.conf.json
+          scripts/signpath-round.sh "$SIGNPATH_STAGE_DIR"
+
+      - name: "Runde 2: Artefakt für SignPath"
+        id: u2
+        if: steps.r2.outputs.pending == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signpath-${{ env.BUNDLE_STAGE }}-unsigned-2
+          path: signpath/stage-2/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: "Runde 2: bei SignPath signieren"
+        if: steps.r2.outputs.pending == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.u2.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signpath/signed-2
+
+      - name: "Runde 2: Signaturen übernehmen"
+        if: steps.r2.outputs.pending == 'true'
+        shell: bash
+        run: node scripts/signpath-stage.mjs --import signpath/signed-2 signpath/stage-2
+
+      - name: "Runde 3: bündeln und sammeln"
+        id: r3
+        if: steps.r2.outputs.pending == 'true' && steps.r2.outputs.installer != 'true'
+        shell: bash
+        env:
+          SIGNPATH_STAGE_DIR: ${{ github.workspace }}/signpath/stage-3
+        run: |
+          set -euo pipefail
+          npm run tauri -- bundle --bundles nsis --no-binary-patching \
+            --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.sign.conf.json
+          # Letzte Runde: hier darf nur noch der Installer offen sein.
+          scripts/signpath-round.sh "$SIGNPATH_STAGE_DIR" --last
+
+      - name: "Runde 3: Artefakt für SignPath"
+        id: u3
+        if: steps.r3.outputs.pending == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signpath-${{ env.BUNDLE_STAGE }}-unsigned-3
+          path: signpath/stage-3/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: "Runde 3: bei SignPath signieren"
+        if: steps.r3.outputs.pending == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.u3.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signpath/signed-3
+
+      - name: "Runde 3: Signaturen übernehmen"
+        if: steps.r3.outputs.pending == 'true'
+        shell: bash
+        run: node scripts/signpath-stage.mjs --import signpath/signed-3 signpath/stage-3
+
+      # Der Installer ist die letzte signierte Datei; Tauri hat ihn nach dem
+      # Sammeln nicht mehr angefasst, also passt sein SHA-256 zur Stage.
+      - name: Signierten Installer einsetzen
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if [ "${#installers[@]}" -ne 1 ]; then
+            echo "::error::Erwartet genau einen Installer, gefunden: ${#installers[@]}"
+            exit 1
+          fi
+          node scripts/signpath-stage.mjs --apply "${installers[0]}"
+          # Liste der signierten Dateien (Namen enthalten das SHA-256 der
+          # unsignierten Fassung) für den Vergleich QAS <-> Release.
+          for f in signpath/stage-*/*; do basename "$f"; done | sort > signpath/signing-manifest.txt
+          cat signpath/signing-manifest.txt
+
+      - name: Signatur-Manifest
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.BUNDLE_ARTIFACT }}-signing-manifest
+          path: signpath/signing-manifest.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      # Prüft den Installer und jede PE-Datei darin (mit 7-Zip entpackt:
+      # Programmordner, $PLUGINSDIR, uninstall.exe). Mit SignPath schlägt der
+      # Job fehl, wenn Installer, code-pruefer.exe oder uninstall.exe nicht
+      # signiert sind, eine Datei eine ungültige Signatur hat oder eine
+      # unbekannte PE-Datei unsigniert ist. Fremdbinaries (llama-Laufzeit,
+      # NSIS-Plugins) dürfen nur ohne SIGNPATH_SIGN_UPSTREAM unsigniert sein
+      # (Warnung). Mit einer Test-Signing-Policy (Slug enthält "test") ist
+      # das Zertifikat nicht vertrauenswürdig; dann genügt eine vorhandene
+      # Signatur.
+      - name: Signaturen prüfen
+        shell: pwsh
+        env:
+          SIGNING_ENABLED: ${{ steps.mode.outputs.enabled }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $enabled = $env:SIGNING_ENABLED -eq "true"
+          $upstreamSigned = $env:SIGNPATH_SIGN_UPSTREAM -eq "true"
+          $trusted = $enabled -and ($env:SIGNPATH_SIGNING_POLICY_SLUG -notmatch "test")
+          $installer = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if ($installer.Count -ne 1) { throw "Erwartet genau einen Installer" }
+          $payload = Join-Path $env:RUNNER_TEMP "payload"
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe" }
+          & $sevenZip x -y "-o$payload" $installer[0].FullName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip konnte den Installer nicht entpacken" }
+          if (-not (Test-Path (Join-Path $payload "code-pruefer.exe"))) { throw "code-pruefer.exe nicht im Installer gefunden" }
+          $files = @($installer[0]) + @(Get-ChildItem -Path $payload -Recurse -File -Include *.exe, *.dll)
+          $errors = @(); $warnings = @(); $rows = @()
+          foreach ($f in $files) {
+            $rel = if ($f.FullName.StartsWith($payload)) { $f.FullName.Substring($payload.Length + 1) } else { $f.Name }
+            $sig = Get-AuthenticodeSignature -LiteralPath $f.FullName
+            $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "" }
+            $rows += "| ``$rel`` | $($sig.Status) | $subject |"
+            $microsoft = $sig.Status -eq "Valid" -and $subject -match "O=Microsoft Corporation"
+            $own = $f.FullName -eq $installer[0].FullName -or $rel -in @("code-pruefer.exe", "uninstall.exe")
+            $upstream = $rel -like "llama\*" -or $rel -like '$PLUGINSDIR\*'
+            if ($microsoft) { continue }
+            if (-not $sig.SignerCertificate) {
+              if (-not $enabled) { continue }
+              if ($upstream -and -not $upstreamSigned) { $warnings += $rel; continue }
+              $errors += "$rel ist nicht signiert"
+              continue
+            }
+            if ($sig.Status -ne "Valid" -and ($trusted -or (-not $own -and -not $upstream))) {
+              $errors += "$rel`: Signatur $($sig.Status) ($($sig.StatusMessage))"
+            }
+          }
+          $summary = @("### Windows: Signaturen im Installer", "", "| Datei | Status | Signiert von |", "|---|---|---|") + $rows
+          if ($warnings.Count -gt 0) {
+            $summary += @("", "Unsigniert (Fremdbinaries, SIGNPATH_SIGN_UPSTREAM ist nicht true): $($warnings.Count) Dateien.")
+            Write-Output "::warning::$($warnings.Count) Fremdbinaries (llama-Laufzeit, NSIS-Plugins) sind unsigniert; Smart App Control kann sie blockieren (docs/RELEASE_SIGNING.md)."
+          }
+          if (-not $enabled) { $summary += @("", "**Signatur nicht eingerichtet – alles unsigniert.**") }
+          $summary | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Output "::error::$_" }
+            throw "$($errors.Count) Signaturfehler"
+          }
+
+      # Nach der Abnahme: Inhalt mit dem getesteten QAS-Installer vergleichen.
+      # Gleiche Dateiliste; jede Datei bitgleich, außer signierten PE-Dateien
+      # (eigene Dateien bzw. Fremdbinaries mit Signatur), die sich nur in der
+      # Signatur unterscheiden dürfen: deren unsignierte Fassungen werden
+      # über die Signatur-Manifeste (SHA-256 vor dem Signieren) verglichen.
+      - name: QAS-Manifest holen
+        id: qas-manifest
+        if: env.BUNDLE_STAGE == 'production' && env.QAS_SIGNED == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qas-bundle-windows-x64-signing-manifest
+          path: qas-manifest
+
+      - name: QAS-Manifest prüfen
+        if: env.BUNDLE_STAGE == 'production' && env.QAS_SIGNED == 'true'
+        shell: bash
+        run: scripts/artifact-manifest.sh verify qas-manifest "$QAS_SIGNING_MANIFEST"
+
+      - name: Mit dem QAS-Installer vergleichen
+        if: env.BUNDLE_STAGE == 'production'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe" }
+          function Expand($installer, $dir) {
+            & $sevenZip x -y "-o$dir" $installer | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7-Zip konnte $installer nicht entpacken" }
+            $map = @{}
+            Get-ChildItem -Path $dir -Recurse -File | ForEach-Object {
+              $map[$_.FullName.Substring($dir.Length + 1)] = $_.FullName
+            }
+            return $map
+          }
+          $qas = Expand (Get-ChildItem qas-bundle/*-setup.exe)[0].FullName (Join-Path $env:RUNNER_TEMP "cmp-qas")
+          $rel = Expand (Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe)[0].FullName (Join-Path $env:RUNNER_TEMP "cmp-release")
+          $errors = @(); $resigned = @()
+          $names = @($qas.Keys) + @($rel.Keys) | Sort-Object -Unique
+          foreach ($n in $names) {
+            if (-not $qas.ContainsKey($n) -or -not $rel.ContainsKey($n)) { $errors += "nur in einem Installer: $n"; continue }
+            $a = (Get-FileHash -Algorithm SHA256 -LiteralPath $qas[$n]).Hash
+            $b = (Get-FileHash -Algorithm SHA256 -LiteralPath $rel[$n]).Hash
+            if ($a -eq $b) { continue }
+            $sa = (Get-AuthenticodeSignature -LiteralPath $qas[$n]).SignerCertificate
+            $sb = (Get-AuthenticodeSignature -LiteralPath $rel[$n]).SignerCertificate
+            if ($n -match '\.(exe|dll)$' -and ($sa -or $sb)) { $resigned += $n; continue }
+            $errors += "inhaltlich verschieden: $n"
+          }
+          # Unsignierte Ausgangsdateien der eigenen Programmdateien gleich?
+          # (Ohne QAS-Signatur sind sie es per SHA256SUMS.txt von build-windows.)
+          $qasManifest = "qas-manifest/signing-manifest.txt"
+          if ((Test-Path $qasManifest) -and (Test-Path signpath/signing-manifest.txt)) {
+            $pick = { param($f) Get-Content $f | Where-Object { $_ -match '^(app|llama)-' } }
+            $diff = Compare-Object @(& $pick $qasManifest) @(& $pick signpath/signing-manifest.txt)
+            if ($diff) { $errors += "Signatur-Manifeste (app/llama) unterscheiden sich: $($diff | Out-String)" }
+          }
+          $summary = @("### Vergleich mit dem QAS-Installer", "",
+            "$($names.Count) Dateien; nur in der Signatur verschieden: $($resigned.Count)",
+            "") + ($resigned | ForEach-Object { "- ``$_``" })
+          $summary | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Output "::error::$_" }
+            throw "Release-Installer weicht inhaltlich vom QAS-Installer ab"
+          }
+
+      # Manifest genau der Dateien, die gleich hochgeladen werden
+      # (Job-Outputs installer, signing_manifest).
+      - name: Manifeste der Artefakte
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          scripts/artifact-manifest.sh write installer src-tauri/target/release/bundle/nsis/*.exe
+          if [ -f signpath/signing-manifest.txt ]; then
+            scripts/artifact-manifest.sh write signing_manifest signpath/signing-manifest.txt
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.BUNDLE_ARTIFACT }}
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+  bundle-macos:
+    needs: [version, images]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+            llama: macos-arm64
+            # Architektur im Dateinamen (wie die DMGs von Tauri)
+            file_arch: aarch64
+          # Intel-Build per Cross-Kompilierung auf dem (Apple-Silicon-)Runner.
+          - name: macos-x64
+            runner: macos-15
+            target: x86_64-apple-darwin
+            arch: amd64
+            llama: macos-x64
+            file_arch: x64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    # Die Apple-Secrets liegen im Environment "qas" (nicht als
+    # Repository-Secrets), damit nur dieser Job sie sieht. macOS wird nur
+    # hier gebaut und signiert (Apple hat kein Test-Zertifikat); nach der
+    # Abnahme werden genau diese DMGs veröffentlicht.
+    environment: qas
+    # Je Matrix-Eintrag eigene Output-Namen (Manifeste von DMG und
+    # Updater-Archiv).
+    outputs:
+      dmg_macos_arm64: ${{ steps.manifest-dmg.outputs.dmg_macos_arm64 }}
+      dmg_macos_x64: ${{ steps.manifest-dmg.outputs.dmg_macos_x64 }}
+      updater_macos_arm64: ${{ steps.manifest-updater.outputs.updater_macos_arm64 }}
+      updater_macos_x64: ${{ steps.manifest-updater.outputs.updater_macos_x64 }}
+    env:
+      TARGET: ${{ matrix.target }}
+      LLAMA_PLATFORM: ${{ matrix.llama }}
+      FILE_ARCH: ${{ matrix.file_arch }}
+      VERSION: ${{ needs.version.outputs.version }}
+      OUTPUT_KEY: ${{ matrix.name == 'macos-arm64' && 'macos_arm64' || 'macos_x64' }}
+      # Secrets sind in `if:` nicht direkt verfügbar.
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Image-Archive (${{ matrix.arch }})
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: image-*-${{ matrix.arch }}
+          merge-multiple: true
+          path: artifacts/images
+
+      - name: Prüfsummen der Images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digests-*
+          path: digests
+
+      - name: Gepinnter KI-Modellkatalog
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: model-catalog
+          path: artifacts/catalog
+
+      - name: Artefakte prüfen und einsetzen
+        env:
+          ARCHIVE_PYTHON: ${{ matrix.arch == 'amd64' && needs.images.outputs.amd64_python || needs.images.outputs.arm64_python }}
+          ARCHIVE_JAVA: ${{ matrix.arch == 'amd64' && needs.images.outputs.amd64_java || needs.images.outputs.arm64_java }}
+          DIGESTS_PYTHON: ${{ needs.images.outputs.digests_python }}
+          DIGESTS_JAVA: ${{ needs.images.outputs.digests_java }}
+          CATALOG_MANIFEST: ${{ needs.version.outputs.catalog }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify artifacts/images "$ARCHIVE_PYTHON" "$ARCHIVE_JAVA"
+          scripts/artifact-manifest.sh verify digests "$DIGESTS_PYTHON" "$DIGESTS_JAVA"
+          scripts/artifact-manifest.sh verify artifacts/catalog "$CATALOG_MANIFEST"
+          cp artifacts/images/*.tar.gz src-tauri/resources/images/
+          jq -s 'reduce .[] as $d ({}; . * $d)' digests/*/image-digests.json > src-tauri/resources/images/image-digests.json
+          cp artifacts/catalog/catalog.json src-tauri/src/ai/catalog.json
+          scripts/pin-models.sh --check
+
+      - name: llama-server (KI-Laufzeit) holen und prüfen
+        run: scripts/fetch-llama-server.sh "$LLAMA_PLATFORM"
+
+      - run: npm ci
+
+      - name: Updater-Konfiguration
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: node scripts/updater.mjs config src-tauri/tauri.updater.conf.json
+
+      - name: App und DMG bauen (unsigniert)
+        if: env.HAS_APPLE_CERT != 'true'
+        run: npm run tauri -- build --target "$TARGET" --bundles app,dmg --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.updater.conf.json
+
+      # OPTIONAL – wird übersprungen, solange das Secret APPLE_CERTIFICATE
+      # fehlt. Benötigte Secrets: APPLE_CERTIFICATE (base64 .p12),
+      # APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY und für die
+      # Notarisierung APPLE_ID, APPLE_PASSWORD (app-spezifisch), APPLE_TEAM_ID.
+      - name: App und DMG bauen (signiert und notarisiert)
+        if: env.HAS_APPLE_CERT == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri -- build --target "$TARGET" --bundles app,dmg --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.updater.conf.json
+
+      - name: Manifest des DMG
+        id: manifest-dmg
+        run: scripts/artifact-manifest.sh write "dmg_$OUTPUT_KEY" "src-tauri/target/$TARGET/release/bundle/dmg/"*.dmg
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bundle-${{ matrix.name }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      # Updater-Paket für macOS: die fertige (ggf. signierte und
+      # notarisierte) .app als tar.gz, wie es createUpdaterArtifacts erzeugen
+      # würde. Signiert wird es erst nach der Abnahme (updater-sign); der
+      # private Schlüssel liegt nur im Environment "release". Nicht im
+      # QAS-Pre-Release.
+      - name: Updater-Archiv (.app.tar.gz)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd "src-tauri/target/$TARGET/release/bundle/macos"
+          apps=(*.app)
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "::error::Erwartet genau eine .app, gefunden: ${#apps[@]}"
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/updater"
+          out="$GITHUB_WORKSPACE/updater/Code-Pruefer_${VERSION}_${FILE_ARCH}.app.tar.gz"
+          # Ohne AppleDouble-Dateien (._*); Symlinks bleiben Symlinks.
+          COPYFILE_DISABLE=1 tar -czf "$out" "${apps[0]}"
+          tar -tzf "$out" | head -n 3
+          ls -l "$out"
+
+      - name: Manifest des Updater-Archivs
+        id: manifest-updater
+        run: scripts/artifact-manifest.sh write "updater_$OUTPUT_KEY" updater/*.app.tar.gz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: updater-${{ matrix.name }}
+          path: updater/*.app.tar.gz
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+  # QAS-Stand als Pre-Release zum Testen (kein Produktions-Release).
+  qas-release:
+    needs: [version, bundle-windows, bundle-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Pre-Release und QAS-Tag anlegen
+    outputs:
+      url: ${{ steps.create.outputs.url }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Windows-Installer (QAS)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qas-bundle-windows-x64
+          path: qas
+
+      - name: macOS-DMGs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bundle-macos-*
+          merge-multiple: true
+          path: qas
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: model-catalog
+          path: catalog
+
+      - name: Artefakte prüfen (Manifeste aus bundle-windows, bundle-macos, version)
+        env:
+          WINDOWS_INSTALLER: ${{ needs.bundle-windows.outputs.installer }}
+          DMG_ARM64: ${{ needs.bundle-macos.outputs.dmg_macos_arm64 }}
+          DMG_X64: ${{ needs.bundle-macos.outputs.dmg_macos_x64 }}
+          CATALOG_MANIFEST: ${{ needs.version.outputs.catalog }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify qas "$WINDOWS_INSTALLER" "$DMG_ARM64" "$DMG_X64"
+          scripts/artifact-manifest.sh verify catalog "$CATALOG_MANIFEST"
+
+      # Wie im Release: ASCII-Dateinamen. Keine latest.json in QAS (die
+      # App fragt zwar nur releases/latest ab, aber ein QAS-Pre-Release soll
+      # nie wie ein Update-Release aussehen).
+      - name: Dateinamen ohne Umlaute, keine Updater-Dateien
+        run: |
+          set -euo pipefail
+          for f in qas/*; do
+            n="$(basename "$f" | sed 's/ü/ue/g; s/ö/oe/g; s/ä/ae/g; s/Ü/Ue/g; s/Ö/Oe/g; s/Ä/Ae/g')"
+            if [ "$n" != "$(basename "$f")" ]; then mv -- "$f" "qas/$n"; fi
+          done
+          if compgen -G "qas/*.json" > /dev/null || compgen -G "qas/*.sig" > /dev/null || compgen -G "qas/*.tar.gz" > /dev/null; then
+            echo "::error::Updater-Dateien gehören nicht ins QAS-Pre-Release."
+            exit 1
+          fi
+
+      - name: SHA256SUMS.txt
+        working-directory: qas
+        run: |
+          sha256sum -- * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt .
+          cat SHA256SUMS.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pre-Release anlegen
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          REGISTRY: ${{ needs.version.outputs.registry }}
+          QAS_TAG: ${{ needs.version.outputs.qas_tag }}
+          WINDOWS_SIGNED: ${{ needs.bundle-windows.outputs.signed }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(qas/*)
+          if [ "${#files[@]}" -lt 2 ]; then
+            echo "::error::Installer fehlen."
+            exit 1
+          fi
+          if [ "$WINDOWS_SIGNED" = "true" ]; then
+            export WINDOWS_NOTE="Test-Signatur über SignPath, nicht vertrauenswürdig"
+          else
+            export WINDOWS_NOTE="unsigniert"
+          fi
+          IMAGE_TAG="${QAS_TAG#v}" scripts/release-notes.sh qas catalog/catalog.json > notes.md
+          if gh release view "$QAS_TAG" >/dev/null 2>&1; then
+            # Erneuter Lauf desselben QAS-Laufs: nur Pre-Releases ersetzen.
+            if [ "$(gh release view "$QAS_TAG" --json isPrerelease -q .isPrerelease)" != "true" ]; then
+              echo "::error::$QAS_TAG existiert und ist kein Pre-Release."
+              exit 1
+            fi
+            gh release upload "$QAS_TAG" "${files[@]}" --clobber
+          else
+            gh release create "$QAS_TAG" "${files[@]}" --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "Code-Prüfer ${VERSION} – QAS-Lauf ${GITHUB_RUN_NUMBER}" \
+              --notes-file notes.md
+          fi
+          url="$(gh release view "$QAS_TAG" --json url -q .url)"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "QAS-Pre-Release: $url" >> "$GITHUB_STEP_SUMMARY"
+
+  # Manuelle Abnahme: wartet, bis ein Pflicht-Reviewer des Environments
+  # "production" den Lauf freigibt ("Review deployments" -> "Approve and
+  # deploy"); "Reject" beendet den Lauf ohne Release. GitHub bricht eine
+  # offene Freigabe nach 30 Tagen ab.
+  abnahme:
+    needs: [version, qas-release]
+    runs-on: ubuntu-latest
+    permissions: {}
+    environment:
+      name: production
+      url: ${{ needs.qas-release.outputs.url }}
+    steps:
+      - name: Abnahme erteilt
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          QAS_TAG: ${{ needs.version.outputs.qas_tag }}
+        run: echo "QAS-Stand $QAS_TAG als Version $VERSION abgenommen (Commit $GITHUB_SHA)." >> "$GITHUB_STEP_SUMMARY"
+
+  # Images ohne Neubau befördern: :<version> zeigt danach auf denselben
+  # Digest (Manifest-Liste) wie der getestete QAS-Tag.
+  promote-images:
+    needs: [version, images, abnahme]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Checkout (scripts/artifact-manifest.sh)
+      packages: write # Tag :<version> in GHCR setzen
+    env:
+      REGISTRY: ${{ needs.version.outputs.registry }}
+      VERSION: ${{ needs.version.outputs.version }}
+      QAS_IMAGE_TAG: ${{ needs.version.outputs.version }}-qas.${{ github.run_number }}
+      # Registry-Digests aus dem Job images (je Sprache).
+      IMAGE_PYTHON: ${{ needs.images.outputs.image_python }}
+      IMAGE_JAVA: ${{ needs.images.outputs.image_java }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Prüfsummen der Images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digests-*
+          path: digests
+
+      - name: Prüfsummen-Artefakt prüfen
+        env:
+          DIGESTS_PYTHON: ${{ needs.images.outputs.digests_python }}
+          DIGESTS_JAVA: ${{ needs.images.outputs.digests_java }}
+        run: scripts/artifact-manifest.sh verify digests "$DIGESTS_PYTHON" "$DIGESTS_JAVA"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Login GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ":<version> auf den QAS-Digest setzen"
+        run: |
+          set -euo pipefail
+          digest_of() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest
+          }
+          for f in digests/*/image-digests.json; do
+            for lang in $(jq -r '.images | keys[]' "$f"); do
+              repo="$REGISTRY/code-pruefer-$lang"
+              digest="$(jq -r --arg l "$lang" '.images[$l].repoDigest' "$f")"
+              if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "::error::Kein Registry-Digest für $lang in $f."
+                exit 1
+              fi
+              # Derselbe Digest, den der Job images gebaut und gepusht hat.
+              built_var="IMAGE_$(echo "$lang" | tr '[:lower:]' '[:upper:]')"
+              built="${!built_var:-}"
+              if [ "$built" != "$digest" ]; then
+                echo "::error::$lang: image-digests.json nennt $digest, der Job images hat ${built:-nichts} gebaut."
+                exit 1
+              fi
+              qas="$(digest_of "$repo:$QAS_IMAGE_TAG")"
+              if [ "$qas" != "$digest" ]; then
+                echo "::error::$repo:$QAS_IMAGE_TAG zeigt auf $qas, getestet wurde $digest."
+                exit 1
+              fi
+              if existing="$(digest_of "$repo:$VERSION" 2>/dev/null)"; then
+                if [ "$existing" != "$digest" ]; then
+                  echo "::error::$repo:$VERSION existiert bereits mit anderem Digest ($existing)."
+                  exit 1
+                fi
+                echo "$repo:$VERSION zeigt schon auf $digest."
+              else
+                docker buildx imagetools create --tag "$repo:$VERSION" "$repo@$digest"
+              fi
+              promoted="$(digest_of "$repo:$VERSION")"
+              if [ "$promoted" != "$digest" ]; then
+                echo "::error::$repo:$VERSION zeigt auf $promoted statt $digest."
+                exit 1
+              fi
+              echo "$repo:$VERSION -> $digest" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+
+  # Nach der Abnahme: dieselben unsignierten Programmdateien aus
+  # build-windows (SHA-256 geprüft) mit Release-Signing (Environment
+  # "release") neu bündeln. Neu gebündelt wird nur, weil die Signatur es
+  # verlangt: Uninstaller und Installer betten signierte Dateien ein. Der
+  # Vergleichsschritt stellt sicher, dass sich der Inhalt vom QAS-Installer
+  # nur in den Signaturen unterscheidet. Ohne SignPath (und mit
+  # unsigniertem QAS-Installer) wird der QAS-Installer unverändert
+  # übernommen.
+  promote-windows:
+    needs: [version, images, build-windows, bundle-windows, abnahme]
+    runs-on: windows-latest
+    permissions:
+      contents: read # Checkout
+      actions: read # Artefakt-Download durch SignPath
+    environment: release
+    outputs:
+      signed: ${{ steps.mode.outputs.enabled }}
+      installer: ${{ steps.manifest.outputs.installer }}
+      signing_manifest: ${{ steps.manifest.outputs.signing_manifest }}
+    env:
+      BUNDLE_STAGE: production
+      BUNDLE_ARTIFACT: bundle-windows-x64
+      SIGNING_ENVIRONMENT: release
+      UNSIGNED_SUMS_SHA256: ${{ needs.build-windows.outputs.sums_sha256 }}
+      AMD64_PYTHON: ${{ needs.images.outputs.amd64_python }}
+      AMD64_JAVA: ${{ needs.images.outputs.amd64_java }}
+      DIGESTS_PYTHON: ${{ needs.images.outputs.digests_python }}
+      DIGESTS_JAVA: ${{ needs.images.outputs.digests_java }}
+      QAS_SIGNED: ${{ needs.bundle-windows.outputs.signed }}
+      QAS_INSTALLER: ${{ needs.bundle-windows.outputs.installer }}
+      QAS_SIGNING_MANIFEST: ${{ needs.bundle-windows.outputs.signing_manifest }}
+      HAS_SIGNPATH_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+      SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+      SIGNPATH_SIGN_UPSTREAM: ${{ vars.SIGNPATH_SIGN_UPSTREAM == 'true' }}
+      SIGNPATH_SIGNED_DIR: ${{ github.workspace }}/signpath/signed
+    steps: *windows-bundle-steps
+
+  # Updater-Signaturen (minisign, `tauri signer sign --app-version`) über
+  # die FINALEN Dateien: den Windows-Installer aus promote-windows (nach der
+  # letzten SignPath-Runde, Authenticode-signiert) und die macOS-Archive aus
+  # bundle-macos. Der private Schlüssel liegt nur im Environment "release".
+  # Jede Signatur wird mit dem öffentlichen Schlüssel geprüft, der in die
+  # App eingebaut ist (Variable TAURI_UPDATER_PUBKEY); passt sie nicht,
+  # bricht der Job ab. Fehlen Schlüssel und Variable: kein Updater-Release
+  # (Warnung, kein Fehler).
+  # Vor dem Signieren werden die Dateien gegen die Manifeste aus
+  # promote-windows und bundle-macos geprüft. Installiert wird nur die
+  # Tauri-CLI (scripts/install-signer.sh: Version und Integrität aus
+  # package-lock.json, ohne Install-Skripte), kein vollständiges `npm ci`;
+  # der private Schlüssel steht nur im Schritt „Signieren“.
+  updater-sign:
+    needs: [version, bundle-macos, promote-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: release
+    outputs:
+      enabled: ${{ steps.mode.outputs.enabled }}
+      signed: ${{ steps.manifest.outputs.signed }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      # Secrets sind in `if:` nicht direkt verfügbar.
+      HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+      TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+    steps:
+      - name: Updater-Modus bestimmen
+        id: mode
+        run: |
+          set -euo pipefail
+          if [ "$HAS_UPDATER_KEY" != "true" ] && [ -z "$TAURI_UPDATER_PUBKEY" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Updater nicht eingerichtet (Secret TAURI_SIGNING_PRIVATE_KEY im Environment release, Variable TAURI_UPDATER_PUBKEY) – das Release bekommt keine latest.json, installierte Apps finden es nicht (docs/UPDATER.md)."
+            {
+              echo "### ⚠️ Ohne App-Updater"
+              echo
+              echo "Secret \`TAURI_SIGNING_PRIVATE_KEY\` (Environment \`release\`) und Variable \`TAURI_UPDATER_PUBKEY\` fehlen."
+              echo "Das Release enthält keine \`latest.json\`. Anleitung: docs/UPDATER.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$HAS_UPDATER_KEY" != "true" ] || [ -z "$TAURI_UPDATER_PUBKEY" ]; then
+            echo "::error::Updater nur teilweise eingerichtet: Secret TAURI_SIGNING_PRIVATE_KEY (Environment release) und Repository-Variable TAURI_UPDATER_PUBKEY müssen beide gesetzt sein."
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          node-version: 22
+          package-manager-cache: false
+      # Nur `tauri signer sign` (Tauri-CLI, Version/Integrität aus
+      # package-lock.json, --ignore-scripts).
+      - name: Signierwerkzeug installieren
+        if: steps.mode.outputs.enabled == 'true'
+        run: scripts/install-signer.sh "$RUNNER_TEMP/signer"
+
+      - name: Windows-Installer (Release, final signiert)
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bundle-windows-x64
+          path: in/windows
+
+      - name: macOS-Updater-Archive
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: updater-macos-*
+          merge-multiple: true
+          path: in/macos
+
+      # Signiert wird nur, was promote-windows bzw. bundle-macos hochgeladen
+      # haben.
+      - name: Artefakte prüfen (Manifeste aus promote-windows, bundle-macos)
+        if: steps.mode.outputs.enabled == 'true'
+        env:
+          WINDOWS_INSTALLER: ${{ needs.promote-windows.outputs.installer }}
+          UPDATER_ARM64: ${{ needs.bundle-macos.outputs.updater_macos_arm64 }}
+          UPDATER_X64: ${{ needs.bundle-macos.outputs.updater_macos_x64 }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify in/windows "$WINDOWS_INSTALLER"
+          scripts/artifact-manifest.sh verify in/macos "$UPDATER_ARM64" "$UPDATER_X64"
+
+      - name: Signieren
+        if: steps.mode.outputs.enabled == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(in/windows/*-setup.exe)
+          if [ "${#installers[@]}" -ne 1 ]; then
+            echo "::error::Erwartet genau einen Windows-Installer, gefunden: ${#installers[@]}"
+            exit 1
+          fi
+          mkdir -p updater
+          # Asset-Namen ohne Umlaut (wie im Job release, GitHub ersetzt sie sonst).
+          win="updater/Code-Pruefer_${VERSION}_x64-setup.exe"
+          cp "${installers[0]}" "$win"
+          files=("$win")
+          for arch in aarch64 x64; do
+            f="in/macos/Code-Pruefer_${VERSION}_${arch}.app.tar.gz"
+            if [ ! -f "$f" ]; then
+              echo "::error::$f fehlt."
+              exit 1
+            fi
+            cp "$f" updater/
+            files+=("updater/$(basename "$f")")
+          done
+          for f in "${files[@]}"; do
+            "$RUNNER_TEMP/signer/node_modules/.bin/tauri" signer sign --app-version "$VERSION" "$f" > /dev/null
+          done
+
+      - name: Signaturen prüfen
+        if: steps.mode.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          for f in updater/*.exe updater/*.app.tar.gz; do
+            node scripts/updater.mjs verify "$f" --version "$VERSION"
+          done
+          # Der Installer selbst kommt im Job release aus bundle-windows-x64;
+          # hier nur seine Signatur weitergeben.
+          rm updater/*.exe
+          {
+            echo "### App-Updater: Signaturen"
+            echo
+            echo '```'
+            (cd updater && sha256sum -- *)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Manifest der Signaturen
+        id: manifest
+        if: steps.mode.outputs.enabled == 'true'
+        run: scripts/artifact-manifest.sh write signed updater/*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          name: updater-signed
+          path: updater/
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    needs: [version, bundle-macos, promote-windows, promote-images, updater-sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Tag v<version> und Entwurfs-Release anlegen
+      id-token: write # Signatur der Attestierung (Sigstore)
+      attestations: write # Attestierung speichern
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # Release-Fassung: Windows aus promote-windows, macOS aus QAS.
+      - name: Windows-Installer (Release)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bundle-windows-x64
+          path: release
+
+      - name: macOS-DMGs (aus QAS)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bundle-macos-*
+          merge-multiple: true
+          path: release
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: model-catalog
+          path: catalog
+
+      - name: Updater-Signaturen und macOS-Archive
+        if: needs.updater-sign.outputs.enabled == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: updater-signed
+          path: updater
+
+      # Veröffentlicht wird nur, was die erzeugenden Jobs hochgeladen haben.
+      - name: Artefakte prüfen (Manifeste aus promote-windows, bundle-macos, updater-sign, version)
+        env:
+          WINDOWS_INSTALLER: ${{ needs.promote-windows.outputs.installer }}
+          DMG_ARM64: ${{ needs.bundle-macos.outputs.dmg_macos_arm64 }}
+          DMG_X64: ${{ needs.bundle-macos.outputs.dmg_macos_x64 }}
+          CATALOG_MANIFEST: ${{ needs.version.outputs.catalog }}
+          UPDATER_ENABLED: ${{ needs.updater-sign.outputs.enabled }}
+          UPDATER_SIGNED: ${{ needs.updater-sign.outputs.signed }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify release "$WINDOWS_INSTALLER" "$DMG_ARM64" "$DMG_X64"
+          scripts/artifact-manifest.sh verify catalog "$CATALOG_MANIFEST"
+          if [ "$UPDATER_ENABLED" = "true" ]; then
+            scripts/artifact-manifest.sh verify updater "$UPDATER_SIGNED"
+          fi
+
+      # GitHub ersetzt Sonderzeichen in Asset-Namen; mit ASCII-Namen passen
+      # die URLs in latest.json und die Namen in SHA256SUMS.txt genau.
+      - name: Dateinamen ohne Umlaute
+        run: |
+          set -euo pipefail
+          for f in release/*; do
+            n="$(basename "$f" | sed 's/ü/ue/g; s/ö/oe/g; s/ä/ae/g; s/Ü/Ue/g; s/Ö/Oe/g; s/Ä/Ae/g')"
+            if [ "$n" != "$(basename "$f")" ]; then mv -- "$f" "release/$n"; fi
+          done
+          ls -l release
+
+      # latest.json für den App-Updater (nur im echten Release, nie in QAS).
+      # Hinweistext: docs/updates/<version>.txt (Klartext), sonst ein
+      # Standardtext. Jede Signatur wird beim Schreiben erneut geprüft.
+      - name: latest.json (App-Updater)
+        if: needs.updater-sign.outputs.enabled == 'true'
+        env:
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+          mv updater/*.app.tar.gz release/
+          notes="docs/updates/${VERSION}.txt"
+          if [ ! -f "$notes" ]; then
+            notes="$RUNNER_TEMP/update-notes.txt"
+            printf 'Code-Prüfer %s ist verfügbar. Alle Änderungen stehen auf der Release-Seite auf GitHub.\n' "$VERSION" > "$notes"
+          fi
+          node scripts/updater.mjs manifest --version "$VERSION" \
+            --base-url "https://github.com/${GH_REPO}/releases/download/v${VERSION}" \
+            --notes-file "$notes" --sig-dir updater --out release/latest.json \
+            "windows-x86_64=release/Code-Pruefer_${VERSION}_x64-setup.exe" \
+            "darwin-aarch64=release/Code-Pruefer_${VERSION}_aarch64.app.tar.gz" \
+            "darwin-x86_64=release/Code-Pruefer_${VERSION}_x64.app.tar.gz"
+          {
+            echo "### App-Updater: latest.json"
+            echo
+            echo '```json'
+            cat release/latest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Version noch nicht veröffentlicht?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: scripts/check-version-unreleased.sh "v$VERSION" --rerun-ok "$GITHUB_SHA"
+
+      - name: SHA256SUMS.txt
+        working-directory: release
+        run: |
+          sha256sum -- * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt .
+          cat SHA256SUMS.txt >> "$GITHUB_STEP_SUMMARY"
+
+      # Prüfen: gh attestation verify <Datei> --repo <owner>/<repo>
+      - name: Build-Provenance attestieren
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release/*
+
+      # Mit der vorinstallierten gh-CLI statt einer Fremd-Action, die das
+      # Token mit Schreibrecht bekäme. Der Tag wird ausdrücklich gesetzt
+      # (ein Entwurf allein legt keinen Tag an).
+      - name: Tag v<version> und Entwurfs-Release anlegen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          REGISTRY: ${{ needs.version.outputs.registry }}
+          QAS_TAG: ${{ needs.version.outputs.qas_tag }}
+          WINDOWS_SIGNED: ${{ needs.promote-windows.outputs.signed }}
+          TAG_EXISTS: ${{ steps.check.outputs.tag_exists }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release/*)
+          if [ "${#files[@]}" -lt 2 ]; then
+            echo "::error::Installer fehlen."
+            exit 1
+          fi
+          if [ "$WINDOWS_SIGNED" = "true" ]; then
+            export WINDOWS_NOTE="signiert über SignPath (Herausgeber: SignPath Foundation)"
+          else
+            export WINDOWS_NOTE="unsigniert"
+          fi
+          IMAGE_TAG="$VERSION" scripts/release-notes.sh release catalog/catalog.json > notes.md
+          tag="v${VERSION}"
+          if [ "$TAG_EXISTS" != "true" ]; then
+            gh api "repos/$GH_REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" > /dev/null
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Erneuter Lauf: Entwurf aktualisieren (veröffentlicht -> oben abgebrochen).
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --draft --verify-tag \
+              --title "Code-Prüfer ${VERSION}" \
+              --notes-file notes.md
+          fi
+          # Die URLs in latest.json setzen genau diese Asset-Namen voraus.
+          missing=0
+          assets="$(gh release view "$tag" --json assets -q '.assets[].name')"
+          for f in "${files[@]}"; do
+            if ! grep -Fxq -- "$(basename "$f")" <<< "$assets"; then
+              echo "::error::Asset $(basename "$f") fehlt im Release (GitHub hat den Namen geändert?)."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then exit 1; fi
+          echo "Entwurfs-Release $tag angelegt (Tag auf $GITHUB_SHA) – zum Veröffentlichen in GitHub auf 'Publish release' klicken (\"Set as the latest release\" angehakt lassen, sonst findet der App-Updater es nicht)." >> "$GITHUB_STEP_SUMMARY"
+
+  # Abgenommenen Stand nach main bringen – nur als Pull Request, nie direkt.
+  # Voraussetzung: Settings -> Actions -> General -> "Allow GitHub Actions to
+  # create and approve pull requests".
+  pull-request:
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write # PR qas -> main anlegen
+    steps:
+      - name: Pull Request qas -> main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          QAS_TAG: ${{ needs.version.outputs.qas_tag }}
+        run: |
+          set -euo pipefail
+          existing="$(gh pr list --base main --head qas --state open --json url -q '.[0].url')"
+          if [ -n "$existing" ]; then
+            echo "Pull Request existiert bereits: $existing" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          url="$(gh pr create --base main --head qas \
+            --title "Release v${VERSION} nach main" \
+            --body "Abgenommener QAS-Stand \`${QAS_TAG}\` (Commit ${GITHUB_SHA}), veröffentlicht als Release v${VERSION} (Entwurf). Automatisch angelegt vom Release-Workflow.")"
+          echo "Pull Request: $url" >> "$GITHUB_STEP_SUMMARY"
