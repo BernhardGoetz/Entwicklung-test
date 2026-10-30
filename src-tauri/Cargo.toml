@@ -36,7 +36,7 @@ quick-xml = "0.42"
 pdf-extract = "0.12.1"
 # Bounded LZW decoding in the PDF checks (docs/pdf_guard.rs); lopdf uses
 # the same crate.
-weezl = "0.1"
+weezl = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "rustls-tls-native-roots", "json", "stream"] }
 tokio-util = "0.7"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
