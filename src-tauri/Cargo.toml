@@ -40,7 +40,7 @@ weezl = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "rustls-tls-native-roots", "json", "stream"] }
 tokio-util = "0.7"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
-getrandom = "0.3"
+getrandom = "0.4"
 # Already used by tauri-plugin-updater; needed for its types (endpoint URL,
 # release date).
 url = "2"
