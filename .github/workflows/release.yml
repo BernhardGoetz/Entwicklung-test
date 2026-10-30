@@ -91,7 +91,7 @@ jobs:
       qas_tag: ${{ steps.v.outputs.qas_tag }}
       catalog: ${{ steps.manifest.outputs.catalog }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -201,7 +201,7 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
       QAS_IMAGE_TAG: ${{ needs.version.outputs.version }}-qas.${{ github.run_number }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
@@ -306,7 +306,7 @@ jobs:
       # genau diese unsignierten Programmdateien.
       sums_sha256: ${{ steps.collect.outputs.sums_sha256 }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -431,7 +431,7 @@ jobs:
       SIGNPATH_SIGN_UPSTREAM: ${{ vars.SIGNPATH_SIGN_UPSTREAM == 'true' }}
       SIGNPATH_SIGNED_DIR: ${{ github.workspace }}/signpath/signed
     steps: &windows-bundle-steps
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -927,7 +927,7 @@ jobs:
       # Secrets sind in `if:` nicht direkt verfügbar.
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -1058,7 +1058,7 @@ jobs:
     outputs:
       url: ${{ steps.create.outputs.url }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1187,7 +1187,7 @@ jobs:
       IMAGE_PYTHON: ${{ needs.images.outputs.image_python }}
       IMAGE_JAVA: ${{ needs.images.outputs.image_java }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1344,7 +1344,7 @@ jobs:
           fi
           echo "enabled=true" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.mode.outputs.enabled == 'true'
         with:
           persist-credentials: false
@@ -1457,7 +1457,7 @@ jobs:
       id-token: write # Signatur der Attestierung (Sigstore)
       attestations: write # Attestierung speichern
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
