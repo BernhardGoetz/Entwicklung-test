@@ -141,39 +141,130 @@ pub const QUICK_POLICY: RetryPolicy = RetryPolicy {
 pub enum AttemptError {
     /// The endpoint exists but did not answer within the ping timeout.
     Timeout(Duration),
-    /// No connection (endpoint missing, refused, error answer).
+    /// No connection or an error answer; German text from
+    /// [`describe_error`] („Endpunkt nicht vorhanden …“, „HTTP 500: …“).
     Unreachable(String),
-    /// The endpoint is served by a process that is not the engine (Windows
-    /// named pipe of another user, see [`super::pipe_owner`]); German text.
-    Untrusted(String),
 }
 
-/// German reason for [`RunnerError::NoEngine`]. A timeout wins over other
-/// failures: it shows that an engine exists but is too slow. Pure,
-/// unit-tested.
-pub fn failure_reason(errors: &[(String, AttemptError)]) -> String {
-    // A refused (possibly hijacked) endpoint is the most important news.
-    if let Some((_, AttemptError::Untrusted(why))) = errors
-        .iter()
-        .find(|(_, e)| matches!(e, AttemptError::Untrusted(_)))
-    {
-        return why.clone();
-    }
-    if let Some((host, AttemptError::Timeout(t))) = errors
-        .iter()
-        .find(|(_, e)| matches!(e, AttemptError::Timeout(_)))
-    {
-        return format!(
-            "Zeitüberschreitung: {host} hat nicht innerhalb von {} s geantwortet",
-            t.as_secs()
-        );
-    }
-    match errors.last() {
-        Some((host, AttemptError::Unreachable(e))) => {
-            format!("keine Verbindung zu {host}: {e}")
+impl std::fmt::Display for AttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(t) => write!(
+                f,
+                "Zeitüberschreitung (keine Antwort innerhalb von {} s)",
+                t.as_secs()
+            ),
+            Self::Unreachable(why) => f.write_str(why),
         }
-        _ => "kein Endpunkt gefunden".to_string(),
     }
+}
+
+/// Longest engine message kept in an error text (HTTP error bodies).
+const MESSAGE_LIMIT: usize = 300;
+
+fn shorten(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() > MESSAGE_LIMIT {
+        let cut: String = text.chars().take(MESSAGE_LIMIT).collect();
+        format!("{cut} …")
+    } else {
+        text.to_string()
+    }
+}
+
+/// German description of a bollard error with the underlying cause, so a
+/// report from a user's machine says what actually failed: the HTTP status
+/// and body of an error answer („HTTP 500: …“), a missing pipe or socket,
+/// denied access, a refused connection, a timeout. Other errors keep their
+/// text plus the chain of causes. Pure, unit-tested.
+pub fn describe_error(e: &bollard::errors::Error) -> String {
+    use bollard::errors::Error as E;
+    match e {
+        E::DockerResponseServerError {
+            status_code,
+            message,
+        } => {
+            let message = shorten(message);
+            if message.is_empty() {
+                format!("HTTP {status_code} (ohne Text)")
+            } else {
+                format!("HTTP {status_code}: {message}")
+            }
+        }
+        E::RequestTimeoutError => "Zeitüberschreitung der Anfrage".to_string(),
+        // Unix: bollard checks the socket file before connecting.
+        E::SocketNotFoundError(path) => {
+            format!("Endpunkt nicht vorhanden – die Engine läuft nicht (Socket {path} fehlt)")
+        }
+        _ => {
+            let chain = error_chain(e);
+            match io_error_kind(e) {
+                Some(std::io::ErrorKind::NotFound) => {
+                    format!("Endpunkt nicht vorhanden – die Engine läuft nicht ({chain})")
+                }
+                Some(std::io::ErrorKind::PermissionDenied) => format!(
+                    "Zugriff verweigert – unter Windows ggf. Mitglied der Gruppe \
+                     „docker-users“ werden und neu anmelden ({chain})"
+                ),
+                Some(std::io::ErrorKind::ConnectionRefused) => {
+                    format!("Verbindung abgelehnt ({chain})")
+                }
+                Some(std::io::ErrorKind::TimedOut) => format!("Zeitüberschreitung ({chain})"),
+                _ => chain,
+            }
+        }
+    }
+}
+
+/// The error's text followed by its causes (`a: b: c`), without repeats
+/// (transparent wrappers print the same text as their source).
+pub fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        let text = err.to_string();
+        let text = text.trim();
+        if !text.is_empty() && !parts.iter().any(|p| p.contains(text)) {
+            parts.push(text.to_string());
+        }
+        current = err.source();
+    }
+    shorten(&parts.join(": "))
+}
+
+/// Kind of the first `std::io::Error` in the error or its causes.
+fn io_error_kind(e: &bollard::errors::Error) -> Option<std::io::ErrorKind> {
+    if let bollard::errors::Error::IOError { err } = e {
+        return Some(err.kind());
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return Some(io.kind());
+        }
+        current = err.source();
+    }
+    None
+}
+
+/// German reason for [`RunnerError::NoEngine`]: the last failure of every
+/// endpoint that was tried, in order („<host>: <grund>; …“), so a report
+/// shows what each candidate answered. Pure, unit-tested.
+pub fn failure_reason(errors: &[(String, AttemptError)]) -> String {
+    let mut last: Vec<(&str, &AttemptError)> = Vec::new();
+    for (host, e) in errors {
+        match last.iter_mut().find(|(h, _)| *h == host.as_str()) {
+            Some(entry) => entry.1 = e,
+            None => last.push((host.as_str(), e)),
+        }
+    }
+    if last.is_empty() {
+        return "kein Endpunkt gefunden".to_string();
+    }
+    last.iter()
+        .map(|(host, e)| format!("{host}: {e}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Tries every host per round and pauses with exponential backoff between
@@ -206,22 +297,12 @@ where
 }
 
 /// One connection attempt: client for `host` plus a ping within `timeout`.
-/// On Windows, a named pipe is only used if its server process belongs to
-/// this user or to an installed program ([`super::pipe_owner`]).
 async fn try_host(host: String, timeout: Duration) -> Result<Docker, AttemptError> {
-    #[cfg(windows)]
-    {
-        let h = host.clone();
-        tokio::task::spawn_blocking(move || super::pipe_owner::verify(&h))
-            .await
-            .map_err(|e| AttemptError::Unreachable(e.to_string()))?
-            .map_err(AttemptError::Untrusted)?;
-    }
-    let docker =
-        Docker::connect_with_host(&host).map_err(|e| AttemptError::Unreachable(e.to_string()))?;
+    let docker = Docker::connect_with_host(&host)
+        .map_err(|e| AttemptError::Unreachable(describe_error(&e)))?;
     match tokio::time::timeout(timeout, docker.ping()).await {
         Ok(Ok(_)) => Ok(docker),
-        Ok(Err(e)) => Err(AttemptError::Unreachable(e.to_string())),
+        Ok(Err(e)) => Err(AttemptError::Unreachable(describe_error(&e))),
         Err(_) => Err(AttemptError::Timeout(timeout)),
     }
 }
@@ -1010,8 +1091,10 @@ mod tests {
             .await;
         assert_eq!(n, 3);
         let msg = r.unwrap_err();
-        assert!(msg.starts_with("Zeitüberschreitung"), "{msg}");
-        assert!(msg.contains("docker_engine"), "{msg}");
+        assert_eq!(
+            msg,
+            "npipe:////./pipe/docker_engine: Zeitüberschreitung (keine Antwort innerhalb von 0 s)"
+        );
         // Only one round for status checks.
         let mut n = 0;
         let r: Result<(), String> = connect_with(&hosts(&["x"]), QUICK_POLICY, |_, _| {
@@ -1020,24 +1103,36 @@ mod tests {
         })
         .await;
         assert_eq!(n, 1);
-        assert_eq!(
-            r.unwrap_err(),
-            "keine Verbindung zu x: Verbindung abgelehnt"
-        );
+        assert_eq!(r.unwrap_err(), "x: Verbindung abgelehnt");
         let r: Result<(), String> =
             connect_with(&[], FAST, |_, _| async { Ok::<(), AttemptError>(()) }).await;
         assert_eq!(r.unwrap_err(), "kein Endpunkt gefunden");
     }
 
+    /// Every endpoint with its own (last) reason, in the order tried.
     #[test]
-    fn timeout_wins_in_reason_and_error_text() {
+    fn reason_names_every_endpoint() {
         let reason = failure_reason(&[
-            ("a".into(), AttemptError::Timeout(Duration::from_secs(10))),
-            ("b".into(), AttemptError::Unreachable("x".into())),
+            (
+                "npipe:////./pipe/docker_engine".into(),
+                AttemptError::Unreachable("HTTP 500: erste Runde".into()),
+            ),
+            (
+                "npipe:////./pipe/podman-machine-default".into(),
+                AttemptError::Unreachable("Endpunkt nicht vorhanden".into()),
+            ),
+            (
+                "npipe:////./pipe/docker_engine".into(),
+                AttemptError::Timeout(Duration::from_secs(10)),
+            ),
         ]);
-        assert!(reason.contains("10 s"), "{reason}");
+        assert_eq!(
+            reason,
+            "npipe:////./pipe/docker_engine: Zeitüberschreitung (keine Antwort innerhalb von \
+             10 s); npipe:////./pipe/podman-machine-default: Endpunkt nicht vorhanden"
+        );
         let msg = RunnerError::NoEngine(reason).to_string();
-        assert!(msg.starts_with("Keine laufende Container-Engine gefunden (Zeitüberschreitung"));
+        assert!(msg.starts_with("Keine laufende Container-Engine gefunden (npipe:"));
         assert!(
             msg.ends_with("Bitte Docker Desktop oder Podman starten."),
             "{msg}"
@@ -1047,16 +1142,104 @@ mod tests {
     }
 
     #[test]
-    fn refused_pipe_wins_in_reason() {
-        let reason = failure_reason(&[
-            ("a".into(), AttemptError::Timeout(Duration::from_secs(10))),
-            (
-                "npipe:////./pipe/docker_engine".into(),
-                AttemptError::Untrusted("abgelehnt: fremder Prozess".into()),
-            ),
-            ("b".into(), AttemptError::Unreachable("x".into())),
-        ]);
-        assert_eq!(reason, "abgelehnt: fremder Prozess");
+    fn engine_errors_are_described_in_german_with_cause() {
+        use bollard::errors::Error as E;
+        // Error answer of the engine (e.g. Docker Desktop whose VM is down).
+        let e = E::DockerResponseServerError {
+            status_code: 500,
+            message: " Internal Server Error \n".into(),
+        };
+        assert_eq!(describe_error(&e), "HTTP 500: Internal Server Error");
+        assert_eq!(
+            RunnerError::Docker(e).to_string(),
+            "Fehler der Container-Engine: HTTP 500: Internal Server Error"
+        );
+        let long = E::DockerResponseServerError {
+            status_code: 502,
+            message: "x".repeat(1000),
+        };
+        let d = describe_error(&long);
+        assert!(d.starts_with("HTTP 502: xxx") && d.ends_with(" …"), "{d}");
+        assert!(d.chars().count() < 320, "{d}");
+        // Missing pipe/socket, denied access, refused.
+        let io = |kind, text: &str| E::IOError {
+            err: std::io::Error::new(kind, text.to_string()),
+        };
+        let d = describe_error(&io(std::io::ErrorKind::NotFound, "os error 2"));
+        assert!(
+            d.starts_with("Endpunkt nicht vorhanden") && d.contains("os error 2"),
+            "{d}"
+        );
+        let d = describe_error(&io(std::io::ErrorKind::PermissionDenied, "os error 5"));
+        assert!(
+            d.starts_with("Zugriff verweigert") && d.contains("docker-users"),
+            "{d}"
+        );
+        let d = describe_error(&io(std::io::ErrorKind::ConnectionRefused, "refused"));
+        assert_eq!(d, "Verbindung abgelehnt (refused)");
+        assert_eq!(
+            describe_error(&E::RequestTimeoutError),
+            "Zeitüberschreitung der Anfrage"
+        );
+    }
+
+    /// A wrapped connection error keeps its cause, without repeats.
+    #[test]
+    fn error_chain_lists_causes_once() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("client error (Connect)")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let e = Outer(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Das System kann die angegebene Datei nicht finden. (os error 2)",
+        ));
+        assert_eq!(
+            error_chain(&e),
+            "client error (Connect): Das System kann die angegebene Datei nicht finden. (os \
+             error 2)"
+        );
+    }
+
+    /// Real bollard error for a socket that does not exist (Unix); on
+    /// Windows the missing named pipe takes the same path (io NotFound).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_connection_errors_name_the_cause() {
+        let host = format!(
+            "unix:///tmp/code-pruefer-kein-socket-{}.sock",
+            std::process::id()
+        );
+        let err = try_host(host, Duration::from_secs(5)).await.unwrap_err();
+        let AttemptError::Unreachable(why) = err else {
+            panic!("{err:?}");
+        };
+        assert!(why.starts_with("Endpunkt nicht vorhanden"), "{why}");
+        // A socket file nobody listens on: the cause comes through hyper.
+        let path =
+            std::env::temp_dir().join(format!("code-pruefer-tot-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let err = try_host(format!("unix://{}", path.display()), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        let AttemptError::Unreachable(why) = err else {
+            panic!("{err:?}");
+        };
+        assert!(why.starts_with("Verbindung abgelehnt ("), "{why}");
+        assert!(
+            why.contains("refused") || why.contains("os error 111"),
+            "{why}"
+        );
     }
 
     #[test]

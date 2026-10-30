@@ -3,7 +3,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type DockerStatus =
   | { state: "notInstalled" }
-  | { state: "notRunning" }
+  /** reason: what the connection attempt said, per endpoint (German). */
+  | { state: "notRunning"; reason?: string }
   | {
       state: "ok";
       version: string;

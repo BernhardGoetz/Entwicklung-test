@@ -479,9 +479,10 @@ pub async fn ensure_running_with<O: EngineOps>(
         if engine == Engine::Podman {
             ops.refresh_podman().await;
         }
-        if let Ok(c) = ops.poll().await {
-            return Ok(c);
-        }
+        let last_error = match ops.poll().await {
+            Ok(c) => return Ok(c),
+            Err(e) => e,
+        };
         let waited = started.elapsed();
         if waited >= timing.timeout {
             let mut msg = format!(
@@ -493,6 +494,9 @@ pub async fn ensure_running_with<O: EngineOps>(
             if let Some(note) = launch_note {
                 msg.push_str(&format!(" Meldung: {note}"));
             }
+            // What the last connection attempt said (per endpoint), so the
+            // cause is visible and can be reported.
+            msg.push_str(&format!(" Letzter Verbindungsversuch: {last_error}"));
             return Err(msg);
         }
         on_message(format!("{name} wird gestartet … ({} s)", waited.as_secs()));
@@ -966,6 +970,10 @@ mod tests {
         let (r, _) = ensure(&sim, Engine::Podman);
         let e = r.unwrap_err();
         assert!(e.contains("Podman wurde gestartet, antwortet aber"), "{e}");
+        assert!(
+            e.ends_with(" Letzter Verbindungsversuch: noch nicht"),
+            "{e}"
+        );
         assert!(sim.count("poll") >= 2);
     }
 

@@ -89,6 +89,14 @@ sich der Endpunkt explizit festlegen; sie hat Vorrang vor der Engine-Auswahl. Ei
 `tcp://`- oder `http://`-Endpunkt ist immer unverschlüsselt und ohne Anmeldung (die App
 unterstützt kein TLS); dafür zeigt das Hauptfenster unter der Kopfzeile eine Warnung.
 
+Klappt die Verbindung nicht, nennt die Fehlermeldung für **jeden** probierten Endpunkt
+den letzten Grund, z. B. `npipe:////./pipe/docker_engine: HTTP 500: …` (die Engine
+antwortet mit einem Fehler, bei Docker Desktop typisch für eine nicht gestartete VM),
+`Zeitüberschreitung (keine Antwort innerhalb von 10 s)`, `Endpunkt nicht vorhanden – die
+Engine läuft nicht (…)` oder `Zugriff verweigert …` (Windows: Gruppe `docker-users`).
+Dieselbe Angabe steht als „Verbindungsversuch: …“ im Hinweis „… ist installiert, aber
+nicht gestartet“ und am Ende der Meldung, wenn der automatische Start nicht hilft.
+
 ### Runner-Images (Python, Java)
 
 Release-Installer enthalten die Runner-Images als komprimierte Archive
@@ -170,14 +178,20 @@ Jede Prüfung startet einen frischen Container, der danach immer gelöscht wird:
   steuern kann (Docker-Socket, Named Pipe, `DOCKER_HOST`), hat faktisch
   Administratorrechte – das gilt unabhängig vom Code-Prüfer.
 - **Named Pipes unter Windows** (`docker_engine`, `podman-machine-default`) gibt es nur
-  einmal pro Rechner, für alle angemeldeten Benutzer. Damit kein anderer Benutzer eine
-  solche Pipe vor der Engine anlegen und Code oder Ergebnisse abgreifen kann, fragt die
-  App vor jeder Verbindung den Prozess hinter der Pipe ab
-  (`GetNamedPipeServerProcessId`). Sie verbindet sich nur, wenn er unter dem eigenen
-  Benutzerkonto läuft oder aus einem Ordner stammt, in den nur Administratoren schreiben
-  (`Programme`, `Windows`); sonst erscheint eine Fehlermeldung
-  (`src-tauri/src/runner/pipe_owner.rs`). **[ungeprüft auf echtem Windows: entwickelt und
-  per Cross-Compile geprüft; die Regeln sind Unit-getestet]**
+  einmal pro Rechner, für alle angemeldeten Benutzer. Ein anderer angemeldeter Benutzer
+  könnte eine solche Pipe vor der Engine anlegen und so Code und Ergebnisse sehen bzw.
+  fälschen. **Akzeptiertes Restrisiko:** Die App prüft den Prozess hinter der Pipe nicht
+  (mehr). Eine solche Prüfung (`GetNamedPipeServerProcessId`, Audit 2/I2) war kurz
+  eingebaut, wurde aber wieder entfernt: Sie war auf echtem Windows nie getestet, öffnete
+  die Pipe vor jeder Verbindung zusätzlich ohne Identifikations-Einschränkung (der
+  Pipe-Server hätte sich als der Benutzer ausgeben können) und fiel zeitlich mit dem
+  Fehlerbericht „Prüfen und KI: Container-Engine nicht erreichbar“ unter Docker Desktop
+  und Podman zusammen. Die eigentliche Verbindung (bollard/tokio) öffnet die Pipe mit
+  `SECURITY_IDENTIFICATION`, der Server kann den Benutzer also nicht imitieren. Das
+  Szenario setzt einen zweiten, gleichzeitig angemeldeten und böswilligen Benutzer auf
+  demselben Rechner voraus; der Code-Prüfer ist für Einzelplatz-Rechner gedacht.
+  Gegenmaßnahme bei geteilten Rechnern: die Engine starten, bevor sich andere Benutzer
+  anmelden.
 - **Aufgabenblätter und Modelldateien sind nicht vertrauenswürdig** (Mitschüler,
   Lernplattform, gefälschte Mail). Dokumente (PDF, Bilder, DOCX) werden in einem eigenen,
   begrenzten Hilfsprozess gelesen (dieselbe Exe mit verstecktem Argument; 1,5 GB

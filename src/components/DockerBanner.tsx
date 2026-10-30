@@ -115,6 +115,7 @@ export function EngineNotices({
           <strong>{name} ist installiert, aber nicht gestartet.</strong> Die App startet die gewählte Engine
           automatisch; alternativ {name} selbst starten und dann erneut prüfen.
           <button onClick={onRetry}>Erneut prüfen</button>
+          {status.reason && <span className="engine-reason muted">Verbindungsversuch: {status.reason}</span>}
         </p>,
       );
     } else {

@@ -103,7 +103,12 @@ export function installMock(): void {
       switch (cmd) {
         case "docker_status":
           if (state === "missing") return { state: "notInstalled" };
-          if (state === "stopped" || state === "stopfail") return { state: "notRunning" };
+          if (state === "stopped" || state === "stopfail")
+            return {
+              state: "notRunning",
+              reason:
+                "npipe:////./pipe/docker_engine: HTTP 500: Internal Server Error; npipe:////./pipe/podman-machine-default: Endpunkt nicht vorhanden – die Engine läuft nicht (os error 2)",
+            };
           if (state === "tcp")
             return {
               state: "ok",

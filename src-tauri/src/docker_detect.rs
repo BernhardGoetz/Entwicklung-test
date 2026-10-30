@@ -3,15 +3,20 @@
 use serde::Serialize;
 
 use crate::engine;
-use crate::runner::docker;
+use crate::runner::{docker, RunnerError};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum DockerStatus {
     /// No engine CLI/app/socket found.
     NotInstalled,
-    /// Something is installed but the engine does not answer.
-    NotRunning,
+    /// Something is installed but the engine does not answer. `reason`:
+    /// what the connection attempt said (per endpoint, German), shown as
+    /// detail so a report names the cause.
+    NotRunning {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     Ok {
         version: String,
         /// e.g. "Docker Desktop", "Podman Engine"
@@ -23,29 +28,42 @@ pub enum DockerStatus {
 }
 
 pub async fn detect() -> DockerStatus {
-    if let Ok(client) = docker::connect_quick().await {
-        if let Ok(v) = client.version().await {
-            let product = v
-                .platform
-                .map(|p| p.name)
-                .filter(|n| !n.is_empty())
-                .or_else(|| {
-                    v.components
-                        .and_then(|c| c.into_iter().next())
-                        .map(|c| c.name)
-                })
-                .unwrap_or_else(|| "Docker Engine".to_string());
-            return DockerStatus::Ok {
-                version: v.version.unwrap_or_else(|| "unbekannt".into()),
-                product,
-                warning: docker::insecure_host_warning(docker::docker_host().as_deref()),
-            };
-        }
-    }
+    let reason = match docker::connect_quick().await {
+        Ok(client) => match client.version().await {
+            Ok(v) => return ok_status(v),
+            // The ping worked, but the engine answers with an error.
+            Err(e) => format!(
+                "Die Engine antwortet mit einem Fehler: {}",
+                docker::describe_error(&e)
+            ),
+        },
+        Err(RunnerError::NoEngine(reason)) => reason,
+        Err(e) => e.to_string(),
+    };
     if looks_installed() {
-        DockerStatus::NotRunning
+        DockerStatus::NotRunning {
+            reason: Some(reason),
+        }
     } else {
         DockerStatus::NotInstalled
+    }
+}
+
+fn ok_status(v: bollard::models::SystemVersion) -> DockerStatus {
+    let product = v
+        .platform
+        .map(|p| p.name)
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            v.components
+                .and_then(|c| c.into_iter().next())
+                .map(|c| c.name)
+        })
+        .unwrap_or_else(|| "Docker Engine".to_string());
+    DockerStatus::Ok {
+        version: v.version.unwrap_or_else(|| "unbekannt".into()),
+        product,
+        warning: docker::insecure_host_warning(docker::docker_host().as_deref()),
     }
 }
 
@@ -84,8 +102,14 @@ mod tests {
 
     #[test]
     fn status_serializes_with_state_tag() {
-        let s = serde_json::to_value(DockerStatus::NotRunning).unwrap();
+        let s = serde_json::to_value(DockerStatus::NotRunning { reason: None }).unwrap();
+        assert_eq!(s, serde_json::json!({"state": "notRunning"}));
+        let s = serde_json::to_value(DockerStatus::NotRunning {
+            reason: Some("npipe:////./pipe/docker_engine: HTTP 500: x".into()),
+        })
+        .unwrap();
         assert_eq!(s["state"], "notRunning");
+        assert_eq!(s["reason"], "npipe:////./pipe/docker_engine: HTTP 500: x");
         let s = serde_json::to_value(DockerStatus::Ok {
             version: "27.0".into(),
             product: "Docker Engine".into(),

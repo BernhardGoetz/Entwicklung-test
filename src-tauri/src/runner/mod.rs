@@ -4,7 +4,6 @@ pub mod compare;
 pub mod docker;
 pub mod images;
 pub mod languages;
-pub mod pipe_owner;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +45,9 @@ pub enum RunnerError {
         dev_hint: String,
         detail: String,
     },
-    #[error("Fehler der Container-Engine: {0}")]
+    /// Shown with [`docker::describe_error`] („HTTP 500: …“, „Endpunkt
+    /// nicht vorhanden …“) instead of bollard's English text.
+    #[error("Fehler der Container-Engine: {}", docker::describe_error(.0))]
     Docker(#[from] bollard::errors::Error),
     #[error("{0}")]
     Other(String),
