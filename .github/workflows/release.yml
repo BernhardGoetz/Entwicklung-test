@@ -168,7 +168,7 @@ jobs:
         id: manifest
         run: scripts/artifact-manifest.sh write catalog src-tauri/src/ai/catalog.json
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: model-catalog
           path: src-tauri/src/ai/catalog.json
@@ -259,14 +259,14 @@ jobs:
           fi
           echo "image_$LANGUAGE=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-${{ matrix.language }}
           path: image-archives/image-digests.json
           retention-days: 30
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.language }}-amd64
           path: image-archives/code-pruefer-${{ matrix.language }}-amd64.tar.gz
@@ -274,7 +274,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.language }}-arm64
           path: image-archives/code-pruefer-${{ matrix.language }}-arm64.tar.gz
@@ -386,7 +386,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-unsigned
           path: windows-unsigned/
@@ -601,7 +601,7 @@ jobs:
       - name: "Runde 1: Artefakt für SignPath"
         id: u1
         if: steps.r1.outputs.pending == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signpath-${{ env.BUNDLE_STAGE }}-unsigned-1
           path: signpath/stage-1/
@@ -642,7 +642,7 @@ jobs:
       - name: "Runde 2: Artefakt für SignPath"
         id: u2
         if: steps.r2.outputs.pending == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signpath-${{ env.BUNDLE_STAGE }}-unsigned-2
           path: signpath/stage-2/
@@ -684,7 +684,7 @@ jobs:
       - name: "Runde 3: Artefakt für SignPath"
         id: u3
         if: steps.r3.outputs.pending == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signpath-${{ env.BUNDLE_STAGE }}-unsigned-3
           path: signpath/stage-3/
@@ -731,7 +731,7 @@ jobs:
 
       - name: Signatur-Manifest
         if: steps.mode.outputs.enabled == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.BUNDLE_ARTIFACT }}-signing-manifest
           path: signpath/signing-manifest.txt
@@ -875,7 +875,7 @@ jobs:
             scripts/artifact-manifest.sh write signing_manifest signpath/signing-manifest.txt
           fi
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.BUNDLE_ARTIFACT }}
           path: src-tauri/target/release/bundle/nsis/*.exe
@@ -1007,7 +1007,7 @@ jobs:
         id: manifest-dmg
         run: scripts/artifact-manifest.sh write "dmg_$OUTPUT_KEY" "src-tauri/target/$TARGET/release/bundle/dmg/"*.dmg
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bundle-${{ matrix.name }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
@@ -1041,7 +1041,7 @@ jobs:
         id: manifest-updater
         run: scripts/artifact-manifest.sh write "updater_$OUTPUT_KEY" updater/*.app.tar.gz
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: updater-${{ matrix.name }}
           path: updater/*.app.tar.gz
@@ -1441,7 +1441,7 @@ jobs:
         if: steps.mode.outputs.enabled == 'true'
         run: scripts/artifact-manifest.sh write signed updater/*
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.mode.outputs.enabled == 'true'
         with:
           name: updater-signed
