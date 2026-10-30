@@ -316,7 +316,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Gepinnter KI-Modellkatalog
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: model-catalog
           path: artifacts/catalog
@@ -443,7 +443,7 @@ jobs:
       - run: npm ci
 
       - name: Unsignierte Programmdateien aus build-windows
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: windows-unsigned
           path: windows-unsigned
@@ -464,14 +464,14 @@ jobs:
           cp windows-unsigned/llama/* src-tauri/resources/llama/
 
       - name: Image-Archive (amd64)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-*-amd64
           merge-multiple: true
           path: artifacts/images
 
       - name: Prüfsummen der Images
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: digests-*
           path: digests
@@ -555,7 +555,7 @@ jobs:
       # unveränderten Übernahme.
       - name: QAS-Installer holen
         if: env.BUNDLE_STAGE == 'production'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: qas-bundle-windows-x64
           path: qas-bundle
@@ -805,7 +805,7 @@ jobs:
       - name: QAS-Manifest holen
         id: qas-manifest
         if: env.BUNDLE_STAGE == 'production' && env.QAS_SIGNED == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: qas-bundle-windows-x64-signing-manifest
           path: qas-manifest
@@ -939,20 +939,20 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Image-Archive (${{ matrix.arch }})
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-*-${{ matrix.arch }}
           merge-multiple: true
           path: artifacts/images
 
       - name: Prüfsummen der Images
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: digests-*
           path: digests
 
       - name: Gepinnter KI-Modellkatalog
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: model-catalog
           path: artifacts/catalog
@@ -1063,19 +1063,19 @@ jobs:
           persist-credentials: false
 
       - name: Windows-Installer (QAS)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: qas-bundle-windows-x64
           path: qas
 
       - name: macOS-DMGs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: bundle-macos-*
           merge-multiple: true
           path: qas
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: model-catalog
           path: catalog
@@ -1192,7 +1192,7 @@ jobs:
           persist-credentials: false
 
       - name: Prüfsummen der Images
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: digests-*
           path: digests
@@ -1361,14 +1361,14 @@ jobs:
 
       - name: Windows-Installer (Release, final signiert)
         if: steps.mode.outputs.enabled == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bundle-windows-x64
           path: in/windows
 
       - name: macOS-Updater-Archive
         if: steps.mode.outputs.enabled == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: updater-macos-*
           merge-multiple: true
@@ -1463,26 +1463,26 @@ jobs:
 
       # Release-Fassung: Windows aus promote-windows, macOS aus QAS.
       - name: Windows-Installer (Release)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bundle-windows-x64
           path: release
 
       - name: macOS-DMGs (aus QAS)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: bundle-macos-*
           merge-multiple: true
           path: release
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: model-catalog
           path: catalog
 
       - name: Updater-Signaturen und macOS-Archive
         if: needs.updater-sign.outputs.enabled == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: updater-signed
           path: updater
