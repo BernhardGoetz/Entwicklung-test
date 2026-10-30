@@ -1,5 +1,7 @@
 # Code-Prüfer
 
+> Veröffentlichung einrichten (Schritt für Schritt): [`docs/VEROEFFENTLICHUNG.md`](docs/VEROEFFENTLICHUNG.md)
+
 Desktop-App (Windows und macOS) für Studierende: Programmieraufgaben **lokal** gegen
 eigene Testfälle prüfen.
 
