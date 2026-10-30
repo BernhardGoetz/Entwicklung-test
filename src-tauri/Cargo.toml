@@ -29,7 +29,7 @@ thiserror = "2"
 base64 = "0.22"
 bytes = "1"
 flate2 = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 # Document import (task sheets): DOCX = ZIP + XML, PDF text layer.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 quick-xml = "0.42"
