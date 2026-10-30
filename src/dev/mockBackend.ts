@@ -1,8 +1,9 @@
 // DEV ONLY: mocked Tauri backend for the browser preview
 // (`VITE_MOCK=1 npm run dev`). Imported from main.tsx behind
 // import.meta.env.DEV, so it is not part of production builds.
+import type { Channel } from "@tauri-apps/api/core";
 import { mockIPC } from "@tauri-apps/api/mocks";
-import type { AiStatus, ImportResult, LanguageInfo, RunReport, RunRequest } from "../api";
+import type { AiStatus, ImportResult, InstallProgress, LanguageInfo, RunReport, RunRequest, UpdateInfo } from "../api";
 
 const PY = `def gruss(name: str) -> str:
     return f"Hallo, {name}!"
@@ -95,8 +96,61 @@ function report(req: RunRequest): RunReport {
   };
 }
 
+// ?update=available (default) | none | error | progress | notConfigured | portable
+const UPDATE_NOTES = `Neu in dieser Version:
+- Updates: Der Code-Prüfer sucht beim Start nach neuen Versionen (Einstellungen → Updates).
+- Testfälle mit KI: schneller auf Rechnern ohne Grafikkarte.
+- Texterkennung: bessere Einrückung bei Screenshots.
+
+Behoben:
+- „Images aktualisieren“ meldete Fehler doppelt.`;
+
+function updateMock(param: string) {
+  let info: UpdateInfo = {
+    currentVersion: "0.1.0",
+    availability: param === "notConfigured" ? "notConfigured" : param === "portable" ? "portable" : "available",
+    interval: "daily",
+    lastCheck: Date.parse("2026-10-29T08:15:00Z"),
+    releasesUrl: "https://github.com/bernhardgoetz/entwicklung-test/releases",
+  };
+  const offer = { version: "0.2.0", currentVersion: "0.1.0", notes: UPDATE_NOTES, date: "2026-10-28T12:00:00Z" };
+  return async (cmd: string, a: Record<string, unknown>) => {
+    switch (cmd) {
+      case "update_info":
+        return info;
+      case "set_update_interval":
+        info = { ...info, interval: a.interval as UpdateInfo["interval"] };
+        return info;
+      case "check_for_update":
+        if (info.availability !== "available") return null;
+        await sleep(a.manual ? 700 : 100);
+        if (param === "error" && a.manual)
+          throw "Keine Verbindung zum Update-Server (GitHub). Bitte die Internetverbindung prüfen und es später erneut versuchen.";
+        info = { ...info, lastCheck: Date.now() };
+        return param === "none" || param === "error" ? null : offer;
+      case "install_update": {
+        const ch = a.onProgress as Channel<InstallProgress>;
+        const total = 27_400_000;
+        const stop = param === "progress" ? 0.45 : 1;
+        for (let f = 0.05; f <= stop + 1e-9; f += 0.05) {
+          await sleep(120);
+          ch.onmessage({ kind: "download", downloaded: Math.round(total * f), total });
+        }
+        if (param === "progress") return new Promise(() => undefined);
+        ch.onmessage({ kind: "installing" });
+        await sleep(800);
+        throw "Vorschau: Installation und Neustart werden im Browser nicht ausgeführt.";
+      }
+      default:
+        return undefined;
+    }
+  };
+}
+
 export function installMock(): void {
-  const state = new URLSearchParams(location.search).get("engine") ?? "ok";
+  const params = new URLSearchParams(location.search);
+  const state = params.get("engine") ?? "ok";
+  const update = updateMock(params.get("update") ?? "available");
   mockIPC(
     async (cmd, args) => {
       const a = args as Record<string, unknown>;
@@ -163,6 +217,11 @@ export function installMock(): void {
           };
         case "cancel_ai":
           return null;
+        case "update_info":
+        case "set_update_interval":
+        case "check_for_update":
+        case "install_update":
+          return update(cmd, a);
         default:
           console.warn("mock: unhandled", cmd, args);
           return null;

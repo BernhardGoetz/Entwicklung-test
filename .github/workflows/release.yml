@@ -11,8 +11,11 @@ name: Release (QAS und Abnahme)
 #     -> promote-images: Images per Digest auf :<version> umtaggen
 #        promote-windows: dieselben unsignierten Programmdateien mit
 #        Release-Signing (Environment "release") neu bündeln
+#     -> updater-sign: Updater-Signaturen (Environment "release") über den
+#        finalen Windows-Installer und die macOS-Archive (.app.tar.gz)
 #     -> release: Tag v<version> auf dem QAS-Commit, Entwurfs-Release mit
-#        SHA256SUMS.txt und Build-Provenance-Attestierung
+#        latest.json (App-Updater), SHA256SUMS.txt und
+#        Build-Provenance-Attestierung
 #     -> pull-request: PR qas -> main
 #
 # Gebaut wird nur einmal (QAS); die Abnahme befördert genau diesen Build.
@@ -31,6 +34,14 @@ name: Release (QAS und Abnahme)
 #     Windows wird über SignPath signiert, sobald SignPath im jeweiligen
 #     Environment eingerichtet ist (docs/RELEASE_SIGNING.md), sonst
 #     unsigniert.
+# App-Updater (docs/UPDATER.md): Die Builds bekommen den öffentlichen
+# Schlüssel aus der Repository-Variable TAURI_UPDATER_PUBKEY
+# (src-tauri/tauri.updater.conf.json, scripts/updater.mjs config); ohne sie
+# läuft die App ohne Updater. Signiert wird erst nach der Abnahme über die
+# fertigen (bei Windows: Authenticode-signierten) Dateien, mit den Secrets
+# TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) aus dem Environment "release".
+# QAS-Pre-Releases bekommen nie eine latest.json; die App fragt nur
+# releases/latest ab (keine Entwürfe, keine Pre-Releases).
 # Der KI-Modellkatalog (Revision, Datei, Größe, SHA-256) ist im Repository
 # gepinnt: Pins entstehen nur über den Workflow pin-models.yml als Pull
 # Request, den Bernhard prüft und mergt. Der Job "version" pinnt nicht
@@ -322,10 +333,19 @@ jobs:
 
       - run: npm ci
 
+      # Öffentlicher Updater-Schlüssel (Repository-Variable, kein Secret) als
+      # Konfigurations-Overlay; ohne Variable: leeres Overlay, App ohne
+      # Updater (Warnung).
+      - name: Updater-Konfiguration
+        shell: bash
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: node scripts/updater.mjs config src-tauri/tauri.updater.conf.json
+
       # --no-bundle: nur Frontend + cargo build --release (wie `tauri build`),
       # gebündelt wird in bundle-windows.
       - name: App bauen (unsigniert, ohne Installer)
-        run: npm run tauri -- build --no-bundle
+        run: npm run tauri -- build --no-bundle --config src-tauri/tauri.updater.conf.json
 
       - name: llama-server (KI-Laufzeit, Windows x64) holen und prüfen
         shell: bash
@@ -519,9 +539,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # --no-binary-patching: Tauri würde sonst code-pruefer.exe bei jedem
-      # Bündeln verändern (Bundle-Typ für den Updater, den die App nicht
-      # nutzt) und damit eine vorhandene Signatur zerstören; so bleibt die
-      # Exe bitgleich mit "windows-unsigned".
+      # Bündeln verändern (Bundle-Typ "nsis" für den Updater) und damit eine
+      # vorhandene Signatur zerstören; so bleibt die Exe bitgleich mit
+      # "windows-unsigned". Der Updater braucht die Markierung nicht: er
+      # nimmt dann den Eintrag "windows-x86_64" aus latest.json und erkennt
+      # den NSIS-Installer am Dateiinhalt (tauri-plugin-updater 2.14.0).
+      # createUpdaterArtifacts bleibt aus: die Updater-Signatur muss über den
+      # fertig signierten Installer gehen (Job updater-sign).
       - name: Installer bauen (unsigniert)
         if: steps.mode.outputs.enabled != 'true' && steps.mode.outputs.reuse != 'true'
         shell: bash
@@ -870,12 +894,15 @@ jobs:
             target: aarch64-apple-darwin
             arch: arm64
             llama: macos-arm64
+            # Architektur im Dateinamen (wie die DMGs von Tauri)
+            file_arch: aarch64
           # Intel-Build per Cross-Kompilierung auf dem (Apple-Silicon-)Runner.
           - name: macos-x64
             runner: macos-15
             target: x86_64-apple-darwin
             arch: amd64
             llama: macos-x64
+            file_arch: x64
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -884,13 +911,18 @@ jobs:
     # hier gebaut und signiert (Apple hat kein Test-Zertifikat); nach der
     # Abnahme werden genau diese DMGs veröffentlicht.
     environment: qas
-    # Je Matrix-Eintrag eigene Output-Namen (Manifest des DMG).
+    # Je Matrix-Eintrag eigene Output-Namen (Manifeste von DMG und
+    # Updater-Archiv).
     outputs:
       dmg_macos_arm64: ${{ steps.manifest-dmg.outputs.dmg_macos_arm64 }}
       dmg_macos_x64: ${{ steps.manifest-dmg.outputs.dmg_macos_x64 }}
+      updater_macos_arm64: ${{ steps.manifest-updater.outputs.updater_macos_arm64 }}
+      updater_macos_x64: ${{ steps.manifest-updater.outputs.updater_macos_x64 }}
     env:
       TARGET: ${{ matrix.target }}
       LLAMA_PLATFORM: ${{ matrix.llama }}
+      FILE_ARCH: ${{ matrix.file_arch }}
+      VERSION: ${{ needs.version.outputs.version }}
       OUTPUT_KEY: ${{ matrix.name == 'macos-arm64' && 'macos_arm64' || 'macos_x64' }}
       # Secrets sind in `if:` nicht direkt verfügbar.
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
@@ -947,9 +979,14 @@ jobs:
 
       - run: npm ci
 
+      - name: Updater-Konfiguration
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: node scripts/updater.mjs config src-tauri/tauri.updater.conf.json
+
       - name: App und DMG bauen (unsigniert)
         if: env.HAS_APPLE_CERT != 'true'
-        run: npm run tauri -- build --target "$TARGET" --bundles app,dmg --config src-tauri/tauri.release.conf.json
+        run: npm run tauri -- build --target "$TARGET" --bundles app,dmg --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.updater.conf.json
 
       # OPTIONAL – wird übersprungen, solange das Secret APPLE_CERTIFICATE
       # fehlt. Benötigte Secrets: APPLE_CERTIFICATE (base64 .p12),
@@ -964,7 +1001,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npm run tauri -- build --target "$TARGET" --bundles app,dmg --config src-tauri/tauri.release.conf.json
+        run: npm run tauri -- build --target "$TARGET" --bundles app,dmg --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.updater.conf.json
 
       - name: Manifest des DMG
         id: manifest-dmg
@@ -974,6 +1011,40 @@ jobs:
         with:
           name: bundle-${{ matrix.name }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      # Updater-Paket für macOS: die fertige (ggf. signierte und
+      # notarisierte) .app als tar.gz, wie es createUpdaterArtifacts erzeugen
+      # würde. Signiert wird es erst nach der Abnahme (updater-sign); der
+      # private Schlüssel liegt nur im Environment "release". Nicht im
+      # QAS-Pre-Release.
+      - name: Updater-Archiv (.app.tar.gz)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd "src-tauri/target/$TARGET/release/bundle/macos"
+          apps=(*.app)
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "::error::Erwartet genau eine .app, gefunden: ${#apps[@]}"
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/updater"
+          out="$GITHUB_WORKSPACE/updater/Code-Pruefer_${VERSION}_${FILE_ARCH}.app.tar.gz"
+          # Ohne AppleDouble-Dateien (._*); Symlinks bleiben Symlinks.
+          COPYFILE_DISABLE=1 tar -czf "$out" "${apps[0]}"
+          tar -tzf "$out" | head -n 3
+          ls -l "$out"
+
+      - name: Manifest des Updater-Archivs
+        id: manifest-updater
+        run: scripts/artifact-manifest.sh write "updater_$OUTPUT_KEY" updater/*.app.tar.gz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: updater-${{ matrix.name }}
+          path: updater/*.app.tar.gz
           compression-level: 0
           retention-days: 30
           if-no-files-found: error
@@ -1019,6 +1090,21 @@ jobs:
           set -euo pipefail
           scripts/artifact-manifest.sh verify qas "$WINDOWS_INSTALLER" "$DMG_ARM64" "$DMG_X64"
           scripts/artifact-manifest.sh verify catalog "$CATALOG_MANIFEST"
+
+      # Wie im Release: ASCII-Dateinamen. Keine latest.json in QAS (die
+      # App fragt zwar nur releases/latest ab, aber ein QAS-Pre-Release soll
+      # nie wie ein Update-Release aussehen).
+      - name: Dateinamen ohne Umlaute, keine Updater-Dateien
+        run: |
+          set -euo pipefail
+          for f in qas/*; do
+            n="$(basename "$f" | sed 's/ü/ue/g; s/ö/oe/g; s/ä/ae/g; s/Ü/Ue/g; s/Ö/Oe/g; s/Ä/Ae/g')"
+            if [ "$n" != "$(basename "$f")" ]; then mv -- "$f" "qas/$n"; fi
+          done
+          if compgen -G "qas/*.json" > /dev/null || compgen -G "qas/*.sig" > /dev/null || compgen -G "qas/*.tar.gz" > /dev/null; then
+            echo "::error::Updater-Dateien gehören nicht ins QAS-Pre-Release."
+            exit 1
+          fi
 
       - name: SHA256SUMS.txt
         working-directory: qas
@@ -1209,8 +1295,162 @@ jobs:
       SIGNPATH_SIGNED_DIR: ${{ github.workspace }}/signpath/signed
     steps: *windows-bundle-steps
 
+  # Updater-Signaturen (minisign, `tauri signer sign --app-version`) über
+  # die FINALEN Dateien: den Windows-Installer aus promote-windows (nach der
+  # letzten SignPath-Runde, Authenticode-signiert) und die macOS-Archive aus
+  # bundle-macos. Der private Schlüssel liegt nur im Environment "release".
+  # Jede Signatur wird mit dem öffentlichen Schlüssel geprüft, der in die
+  # App eingebaut ist (Variable TAURI_UPDATER_PUBKEY); passt sie nicht,
+  # bricht der Job ab. Fehlen Schlüssel und Variable: kein Updater-Release
+  # (Warnung, kein Fehler).
+  # Vor dem Signieren werden die Dateien gegen die Manifeste aus
+  # promote-windows und bundle-macos geprüft. Installiert wird nur die
+  # Tauri-CLI (scripts/install-signer.sh: Version und Integrität aus
+  # package-lock.json, ohne Install-Skripte), kein vollständiges `npm ci`;
+  # der private Schlüssel steht nur im Schritt „Signieren“.
+  updater-sign:
+    needs: [version, bundle-macos, promote-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: release
+    outputs:
+      enabled: ${{ steps.mode.outputs.enabled }}
+      signed: ${{ steps.manifest.outputs.signed }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      # Secrets sind in `if:` nicht direkt verfügbar.
+      HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+      TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+    steps:
+      - name: Updater-Modus bestimmen
+        id: mode
+        run: |
+          set -euo pipefail
+          if [ "$HAS_UPDATER_KEY" != "true" ] && [ -z "$TAURI_UPDATER_PUBKEY" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Updater nicht eingerichtet (Secret TAURI_SIGNING_PRIVATE_KEY im Environment release, Variable TAURI_UPDATER_PUBKEY) – das Release bekommt keine latest.json, installierte Apps finden es nicht (docs/UPDATER.md)."
+            {
+              echo "### ⚠️ Ohne App-Updater"
+              echo
+              echo "Secret \`TAURI_SIGNING_PRIVATE_KEY\` (Environment \`release\`) und Variable \`TAURI_UPDATER_PUBKEY\` fehlen."
+              echo "Das Release enthält keine \`latest.json\`. Anleitung: docs/UPDATER.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$HAS_UPDATER_KEY" != "true" ] || [ -z "$TAURI_UPDATER_PUBKEY" ]; then
+            echo "::error::Updater nur teilweise eingerichtet: Secret TAURI_SIGNING_PRIVATE_KEY (Environment release) und Repository-Variable TAURI_UPDATER_PUBKEY müssen beide gesetzt sein."
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          node-version: 22
+          package-manager-cache: false
+      # Nur `tauri signer sign` (Tauri-CLI, Version/Integrität aus
+      # package-lock.json, --ignore-scripts).
+      - name: Signierwerkzeug installieren
+        if: steps.mode.outputs.enabled == 'true'
+        run: scripts/install-signer.sh "$RUNNER_TEMP/signer"
+
+      - name: Windows-Installer (Release, final signiert)
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bundle-windows-x64
+          path: in/windows
+
+      - name: macOS-Updater-Archive
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: updater-macos-*
+          merge-multiple: true
+          path: in/macos
+
+      # Signiert wird nur, was promote-windows bzw. bundle-macos hochgeladen
+      # haben.
+      - name: Artefakte prüfen (Manifeste aus promote-windows, bundle-macos)
+        if: steps.mode.outputs.enabled == 'true'
+        env:
+          WINDOWS_INSTALLER: ${{ needs.promote-windows.outputs.installer }}
+          UPDATER_ARM64: ${{ needs.bundle-macos.outputs.updater_macos_arm64 }}
+          UPDATER_X64: ${{ needs.bundle-macos.outputs.updater_macos_x64 }}
+        run: |
+          set -euo pipefail
+          scripts/artifact-manifest.sh verify in/windows "$WINDOWS_INSTALLER"
+          scripts/artifact-manifest.sh verify in/macos "$UPDATER_ARM64" "$UPDATER_X64"
+
+      - name: Signieren
+        if: steps.mode.outputs.enabled == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(in/windows/*-setup.exe)
+          if [ "${#installers[@]}" -ne 1 ]; then
+            echo "::error::Erwartet genau einen Windows-Installer, gefunden: ${#installers[@]}"
+            exit 1
+          fi
+          mkdir -p updater
+          # Asset-Namen ohne Umlaut (wie im Job release, GitHub ersetzt sie sonst).
+          win="updater/Code-Pruefer_${VERSION}_x64-setup.exe"
+          cp "${installers[0]}" "$win"
+          files=("$win")
+          for arch in aarch64 x64; do
+            f="in/macos/Code-Pruefer_${VERSION}_${arch}.app.tar.gz"
+            if [ ! -f "$f" ]; then
+              echo "::error::$f fehlt."
+              exit 1
+            fi
+            cp "$f" updater/
+            files+=("updater/$(basename "$f")")
+          done
+          for f in "${files[@]}"; do
+            "$RUNNER_TEMP/signer/node_modules/.bin/tauri" signer sign --app-version "$VERSION" "$f" > /dev/null
+          done
+
+      - name: Signaturen prüfen
+        if: steps.mode.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          for f in updater/*.exe updater/*.app.tar.gz; do
+            node scripts/updater.mjs verify "$f" --version "$VERSION"
+          done
+          # Der Installer selbst kommt im Job release aus bundle-windows-x64;
+          # hier nur seine Signatur weitergeben.
+          rm updater/*.exe
+          {
+            echo "### App-Updater: Signaturen"
+            echo
+            echo '```'
+            (cd updater && sha256sum -- *)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Manifest der Signaturen
+        id: manifest
+        if: steps.mode.outputs.enabled == 'true'
+        run: scripts/artifact-manifest.sh write signed updater/*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          name: updater-signed
+          path: updater/
+          retention-days: 30
+          if-no-files-found: error
+
   release:
-    needs: [version, bundle-macos, promote-windows, promote-images]
+    needs: [version, bundle-macos, promote-windows, promote-images, updater-sign]
     runs-on: ubuntu-latest
     permissions:
       contents: write # Tag v<version> und Entwurfs-Release anlegen
@@ -1240,17 +1480,71 @@ jobs:
           name: model-catalog
           path: catalog
 
+      - name: Updater-Signaturen und macOS-Archive
+        if: needs.updater-sign.outputs.enabled == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: updater-signed
+          path: updater
+
       # Veröffentlicht wird nur, was die erzeugenden Jobs hochgeladen haben.
-      - name: Artefakte prüfen (Manifeste aus promote-windows, bundle-macos, version)
+      - name: Artefakte prüfen (Manifeste aus promote-windows, bundle-macos, updater-sign, version)
         env:
           WINDOWS_INSTALLER: ${{ needs.promote-windows.outputs.installer }}
           DMG_ARM64: ${{ needs.bundle-macos.outputs.dmg_macos_arm64 }}
           DMG_X64: ${{ needs.bundle-macos.outputs.dmg_macos_x64 }}
           CATALOG_MANIFEST: ${{ needs.version.outputs.catalog }}
+          UPDATER_ENABLED: ${{ needs.updater-sign.outputs.enabled }}
+          UPDATER_SIGNED: ${{ needs.updater-sign.outputs.signed }}
         run: |
           set -euo pipefail
           scripts/artifact-manifest.sh verify release "$WINDOWS_INSTALLER" "$DMG_ARM64" "$DMG_X64"
           scripts/artifact-manifest.sh verify catalog "$CATALOG_MANIFEST"
+          if [ "$UPDATER_ENABLED" = "true" ]; then
+            scripts/artifact-manifest.sh verify updater "$UPDATER_SIGNED"
+          fi
+
+      # GitHub ersetzt Sonderzeichen in Asset-Namen; mit ASCII-Namen passen
+      # die URLs in latest.json und die Namen in SHA256SUMS.txt genau.
+      - name: Dateinamen ohne Umlaute
+        run: |
+          set -euo pipefail
+          for f in release/*; do
+            n="$(basename "$f" | sed 's/ü/ue/g; s/ö/oe/g; s/ä/ae/g; s/Ü/Ue/g; s/Ö/Oe/g; s/Ä/Ae/g')"
+            if [ "$n" != "$(basename "$f")" ]; then mv -- "$f" "release/$n"; fi
+          done
+          ls -l release
+
+      # latest.json für den App-Updater (nur im echten Release, nie in QAS).
+      # Hinweistext: docs/updates/<version>.txt (Klartext), sonst ein
+      # Standardtext. Jede Signatur wird beim Schreiben erneut geprüft.
+      - name: latest.json (App-Updater)
+        if: needs.updater-sign.outputs.enabled == 'true'
+        env:
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+          mv updater/*.app.tar.gz release/
+          notes="docs/updates/${VERSION}.txt"
+          if [ ! -f "$notes" ]; then
+            notes="$RUNNER_TEMP/update-notes.txt"
+            printf 'Code-Prüfer %s ist verfügbar. Alle Änderungen stehen auf der Release-Seite auf GitHub.\n' "$VERSION" > "$notes"
+          fi
+          node scripts/updater.mjs manifest --version "$VERSION" \
+            --base-url "https://github.com/${GH_REPO}/releases/download/v${VERSION}" \
+            --notes-file "$notes" --sig-dir updater --out release/latest.json \
+            "windows-x86_64=release/Code-Pruefer_${VERSION}_x64-setup.exe" \
+            "darwin-aarch64=release/Code-Pruefer_${VERSION}_aarch64.app.tar.gz" \
+            "darwin-x86_64=release/Code-Pruefer_${VERSION}_x64.app.tar.gz"
+          {
+            echo "### App-Updater: latest.json"
+            echo
+            echo '```json'
+            cat release/latest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Version noch nicht veröffentlicht?
         id: check
@@ -1311,7 +1605,17 @@ jobs:
               --title "Code-Prüfer ${VERSION}" \
               --notes-file notes.md
           fi
-          echo "Entwurfs-Release $tag angelegt (Tag auf $GITHUB_SHA) – zum Veröffentlichen in GitHub auf 'Publish release' klicken." >> "$GITHUB_STEP_SUMMARY"
+          # Die URLs in latest.json setzen genau diese Asset-Namen voraus.
+          missing=0
+          assets="$(gh release view "$tag" --json assets -q '.assets[].name')"
+          for f in "${files[@]}"; do
+            if ! grep -Fxq -- "$(basename "$f")" <<< "$assets"; then
+              echo "::error::Asset $(basename "$f") fehlt im Release (GitHub hat den Namen geändert?)."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then exit 1; fi
+          echo "Entwurfs-Release $tag angelegt (Tag auf $GITHUB_SHA) – zum Veröffentlichen in GitHub auf 'Publish release' klicken (\"Set as the latest release\" angehakt lassen, sonst findet der App-Updater es nicht)." >> "$GITHUB_STEP_SUMMARY"
 
   # Abgenommenen Stand nach main bringen – nur als Pull Request, nie direkt.
   # Voraussetzung: Settings -> Actions -> General -> "Allow GitHub Actions to

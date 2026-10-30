@@ -194,7 +194,7 @@ Engine gestoppt bzw. Start fehlgeschlagen, Engine wird gestartet,
 Je Hinweis eine `.note`-Zeile in 13 px über volle Breite, darunter eine
 leise Haarlinie; ohne Hinweis entfällt die Zeile ganz.
 
-### Dialoge (Einstellungen, KI-Modell)
+### Dialoge (Einstellungen, KI-Modell, Update)
 Einzige erhöhte Fläche: `overlay`, Haarlinie, Radius 8 px,
 `--shadow-overlay`, Hintergrund abgedunkelt (`--color-backdrop`).
 - Gemeinsame Komponente `Modal` (`src/components/Modal.tsx`):
@@ -205,11 +205,13 @@ Einzige erhöhte Fläche: `overlay`, Haarlinie, Radius 8 px,
   zum Zahnrad).
 - Kopf (Titel + „Schließen“) steht fest, der Inhalt (`.modal-body`) scrollt
   im Dialog; die Seite dahinter scrollt nicht mit.
-- Breite: Einstellungen 600 px, KI-Modell 760 px, oben 48 px Abstand.
+- Breite: Einstellungen und Update 600 px, KI-Modell 760 px, oben 48 px Abstand.
   Unter 800 px Fensterbreite: Sheet über die volle Breite, unten
   angedockt, nur oben gerundet.
 - Nie zwei Dialoge übereinander: „KI-Modell verwalten …“ schließt die
-  Einstellungen und öffnet den KI-Dialog.
+  Einstellungen und öffnet den KI-Dialog; findet „Jetzt nach Updates suchen“ ein
+  Update, ersetzt der Update-Dialog die Einstellungen. Ein automatisch gefundenes
+  Update wartet, bis kein Dialog offen ist und keine Prüfung/KI läuft.
 
 **Einstellungen** – Abschnitte mit Überschrift (14 px, 600), getrennt
 durch leise Haarlinien; Zeile = Beschriftung links, Bedienelement rechts:
@@ -219,6 +221,23 @@ durch leise Haarlinien; Zeile = Beschriftung links, Bedienelement rechts:
    Bedarf, „Images aktualisieren“ mit Fortschritt/Ergebnis, Download-Links.
 3. *KI-Modell*: Punkt + gewähltes Modell bzw. „kein Modell eingerichtet“,
    „KI-Modell verwalten …“.
+4. *Updates*: „Installierte Version“, „Automatisch suchen“ Täglich · Wöchentlich ·
+   Nie (Segment-Umschalter wie beim Farbschema), „Zuletzt gesucht“ (Datum, Uhrzeit
+   bzw. „noch nie“), Hinweis, „Jetzt nach Updates suchen“ mit Ergebnis als `.note`
+   (ok: „Keine neue Version verfügbar …“, error: Meldung). Ohne Update-Schlüssel nur
+   grauer Punkt + „Updates in dieser Version nicht verfügbar“; portable Version: grauer
+   Punkt + Link zur Release-Seite.
+
+**Update verfügbar** – Titel „Update verfügbar: Version X (installiert: Y)“,
+Abschnitt „Neu in Version X“ mit den Versionshinweisen als reiner Text
+(`.update-notes`: `surface`, leise Haarlinie, Radius 6 px, `pre-wrap`, max. 240 px
+hoch, scrollt, per Tab fokussierbar), gedämpfter Hinweis (Signaturprüfung, Neustart,
+ungespeicherte Eingaben gehen verloren). Aktionen rechtsbündig: „Später“ (sekundär)
+und „Jetzt aktualisieren“ (primär; im Dialog die einzige Hauptaktion). Während des
+Updates: Fortschrittszeile wie im KI-Dialog („Wird heruntergeladen … 45 % (11,8 MB
+von 26,1 MB)“ + `progress`), „Schließen“/„Später“/Esc gesperrt. Fehler als
+`.note.error`, Hauptbutton wird „Erneut versuchen“. Läuft noch eine Prüfung/KI, steht
+darüber eine `.note.warn` und „Jetzt aktualisieren“ ist gesperrt.
 
 ## 7. Layout
 

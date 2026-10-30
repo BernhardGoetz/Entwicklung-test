@@ -17,7 +17,7 @@ Einrichten gegenprüfen.
 
 | Datei | Herkunft | Signatur |
 |---|---|---|
-| `Code-Prüfer_<version>_x64-setup.exe` | NSIS-Installer, im Workflow gebaut | SignPath |
+| `Code-Pruefer_<version>_x64-setup.exe` (Release-Asset; lokal gebaut `Code-Prüfer_…`) | NSIS-Installer, im Workflow gebaut | SignPath |
 | `code-pruefer.exe` | die App, im Workflow gebaut | SignPath |
 | `uninstall.exe` | von makensis aus `src-tauri/windows/installer.nsi` erzeugt | SignPath |
 | `llama/llama-server.exe`, `llama/*.dll` (ggml, llama, mtmd, libomp) | unverändert aus dem llama.cpp-Release | **nur mit Erlaubnis** (s. u.) |
@@ -113,8 +113,11 @@ Vorgehen:
   werden. Den Installer hält es zurück, solange überhaupt etwas gesammelt wird.
   **[geprüft lokal]**
 - `--no-binary-patching`: Sonst schreibt Tauri vor dem Signieren den Bundle-Typ in
-  `code-pruefer.exe` (nur für den Tauri-Updater nötig, den die App nicht nutzt). Damit
-  bliebe die Exe nicht bitgleich. **[geprüft: tauri-cli 2.12.4 / tauri-bundler 2.10.4]**
+  `code-pruefer.exe`. Damit bliebe die Exe nicht bitgleich. Der App-Updater braucht die
+  Markierung nicht ([`UPDATER.md`](UPDATER.md)).
+- Die **Updater-Signatur** (minisign, nicht Authenticode) entsteht erst nach der
+  letzten SignPath-Runde im Job `updater-sign`, über den fertigen Installer
+  ([`UPDATER.md`](UPDATER.md)). **[geprüft: tauri-cli 2.12.4 / tauri-bundler 2.10.4]**
 - Tauri 2.10.4 ruft den `signCommand` auf für: die Haupt-Exe, die exe/dll unter den
   Ressourcen (sofern sie nicht schon gültig signiert sind, `signtool verify /pa`), die
   NSIS-Plugins aus `NSISdl.dll`, `StartMenu.dll`, `System.dll`, `nsDialogs.dll` und
@@ -247,7 +250,7 @@ kann gelöscht werden.
 - PowerShell:
 
   ```powershell
-  Get-AuthenticodeSignature .\Code-Prüfer_0.2.0_x64-setup.exe | Format-List *
+  Get-AuthenticodeSignature .\Code-Pruefer_0.2.0_x64-setup.exe | Format-List *
   Get-ChildItem "$env:LOCALAPPDATA\Code-Prüfer" -Recurse -Include *.exe,*.dll |
     Get-AuthenticodeSignature | Format-Table Status, Path, @{n='Signer';e={$_.SignerCertificate.Subject}}
   ```

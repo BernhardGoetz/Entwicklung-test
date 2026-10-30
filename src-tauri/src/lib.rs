@@ -1,6 +1,7 @@
 //! Code-Prüfer: Tauri backend.
 
 pub mod ai;
+pub mod app_update;
 pub mod docker_detect;
 pub mod docs;
 pub mod engine;
@@ -8,7 +9,7 @@ pub mod picker;
 pub mod proc_guard;
 pub mod runner;
 
-use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewWindow};
+use tauri::{ipc::Channel, AppHandle, Emitter, Manager, RunEvent, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
 use runner::{docker, images, languages, RunReport, RunRequest, RunnerError};
@@ -296,7 +297,47 @@ async fn cancel_ai() {
     ai::llama::shutdown().await;
 }
 
-/// Stops the AI (llama-server) and removes own containers (on exit).
+#[tauri::command]
+fn update_info(app: AppHandle) -> app_update::UpdateInfo {
+    app_update::info(&app)
+}
+
+#[tauri::command]
+fn set_update_interval(
+    app: AppHandle,
+    interval: app_update::Interval,
+) -> Result<app_update::UpdateInfo, String> {
+    app_update::set_interval(&app, interval)
+}
+
+/// `manual`: „Jetzt nach Updates suchen“ (German error message); otherwise
+/// the automatic check, which only asks GitHub when it is due and never
+/// reports errors (they are only logged).
+#[tauri::command]
+async fn check_for_update(
+    app: AppHandle,
+    manual: bool,
+) -> Result<Option<app_update::UpdateOffer>, String> {
+    match app_update::check(&app, manual).await {
+        Err(e) if !manual => {
+            eprintln!("updater: automatische Suche fehlgeschlagen: {e}");
+            Ok(None)
+        }
+        other => other,
+    }
+}
+
+/// „Jetzt aktualisieren“: download (progress), verify, install, restart.
+#[tauri::command]
+async fn install_update(
+    app: AppHandle,
+    on_progress: Channel<app_update::InstallProgress>,
+) -> Result<(), String> {
+    app_update::download_and_install(&app, &on_progress, shutdown_background).await
+}
+
+/// Stops the AI (llama-server) and removes own containers: on exit and
+/// before an update (the installer replaces llama-server.exe).
 async fn shutdown_background() {
     ai::cancel_all();
     let cleanup = async {
@@ -310,11 +351,21 @@ async fn shutdown_background() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let context = tauri::generate_context!();
+    // Only builds with an updater public key (release overlay
+    // tauri.updater.conf.json) register the plugin; without one its
+    // configuration is invalid and the app would not start.
+    let updater = app_update::configured(context.config());
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .plugin(tauri_plugin_dialog::init());
+    if updater {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+    builder
+        .setup(move |app| {
             if let Ok(dir) = app.path().app_config_dir() {
+                app_update::init(dir.clone(), updater);
                 engine::init(dir.clone());
                 if let Ok(data) = app.path().app_data_dir() {
                     ai::models::init(dir, data);
@@ -354,9 +405,13 @@ pub fn run() {
             generate_tests,
             warm_up_ai,
             suggest_ocr_fixes,
-            cancel_ai
+            cancel_ai,
+            update_info,
+            set_update_interval,
+            check_for_update,
+            install_update
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("Fehler beim Starten der Anwendung")
         .run(|_app, event| {
             // Closing the app during a run must not leave its container (or
@@ -372,7 +427,7 @@ mod tests {
     /// The frontend may only open the URLs the capability allows
     /// (`opener:allow-open-url` instead of `opener:default`).
     #[test]
-    fn opener_capability_allows_exactly_the_download_pages() {
+    fn opener_capability_allows_exactly_the_download_and_release_pages() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let raw = std::fs::read_to_string(root.join("capabilities/default.json")).unwrap();
         let cap: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -396,6 +451,8 @@ mod tests {
             .split('"')
             .filter(|s| s.starts_with("https://"))
             .collect();
+        // The settings link the releases page (portable version, updates).
+        used.push(crate::app_update::RELEASES_URL);
         used.sort();
         assert_eq!(allowed, used);
     }
